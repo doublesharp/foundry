@@ -308,7 +308,10 @@ struct StatementCollector<'a> {
     source_map: &'a SourceMap,
     updates: Vec<SourceUpdate>,
     probes: Vec<InstrumentedCoverageProbe>,
-    next_probe: u64,
+    /// Monotonic counter mixed into every tag so each probe gets a unique tag regardless of its
+    /// source position (several probes can share a byte offset, e.g. a require's pre/post or a
+    /// ternary's two condition tags).
+    next_tag: u64,
     next_branch: u32,
     contract_name: Box<str>,
     probe_mode: ProbeMode,
@@ -328,7 +331,7 @@ impl<'a> StatementCollector<'a> {
             source_map,
             updates: Vec::new(),
             probes: Vec::new(),
-            next_probe: 0,
+            next_tag: 0,
             next_branch: 0,
             contract_name: "".into(),
             probe_mode: ProbeMode::Direct,
@@ -404,6 +407,54 @@ impl<'a> StatementCollector<'a> {
         self.record_probe(kind, stmt.span, range, tag);
     }
 
+    /// Wraps a brace-less `require` body in `{ <body-probe> <pre> require(..); <post> }`, with the
+    /// body-entry probe (`kind`) and the require's pre/post branch probes all fused into the
+    /// synthesized block's braces. This keeps the braces attached (so an enclosing `if`/loop binds
+    /// to the block, not to a detached probe) while still measuring both the body execution and
+    /// the require's true/false paths.
+    fn wrap_require_body(
+        &mut self,
+        stmt: &'_ ast::Stmt<'_>,
+        kind: InstrumentedCoverageProbeKind,
+        trailing: Option<String>,
+    ) {
+        let range = self.trim_statement_span(stmt.span);
+        if range.is_empty() {
+            return;
+        }
+        let full_range = self.source_map.span_to_source(stmt.span).unwrap().data;
+        let branch_id = self.next_branch_id();
+
+        // Body-entry probe and the require pre-probe both go just inside the opening brace.
+        let body_tag = self.make_tag(range.start);
+        let pre_tag = self.make_tag(range.start);
+        self.updates.push(SourceUpdate::open(
+            full_range.start,
+            format!("{{ {}{}", self.probe_text(body_tag), self.probe_text(pre_tag)),
+        ));
+        // Require post-probe and the closing brace (plus any trailing `else`).
+        let post_tag = self.make_tag(range.end);
+        let close = match trailing {
+            Some(trailing) => format!(" {} }}{trailing}", self.probe_text(post_tag)),
+            None => format!(" {} }}", self.probe_text(post_tag)),
+        };
+        self.updates.push(SourceUpdate::close(full_range.end, close));
+
+        self.record_probe(kind, stmt.span, range.clone(), body_tag);
+        self.record_probe(
+            InstrumentedCoverageProbeKind::RequirePre { branch_id },
+            stmt.span,
+            range.clone(),
+            pre_tag,
+        );
+        self.record_probe(
+            InstrumentedCoverageProbeKind::RequirePost { branch_id },
+            stmt.span,
+            range,
+            post_tag,
+        );
+    }
+
     fn push_block_entry_probe(
         &mut self,
         block: &ast::Block<'_>,
@@ -469,7 +520,6 @@ impl<'a> StatementCollector<'a> {
             bytes: range.start as u32..range.end as u32,
             lines,
         });
-        self.next_probe += 1;
     }
 
     fn probe_text(&self, tag: B256) -> String {
@@ -488,9 +538,10 @@ impl<'a> StatementCollector<'a> {
     /// long enough to forward it to the sentinel via `staticcall`. The wrapping `{ }` scopes the
     /// temporary so it cannot collide with user variables or leak into later statements.
     fn yul_probe_text(&self, tag: B256) -> String {
-        let slot = self.next_probe;
+        // The probe lives in its own Yul block, so `_cov` is scoped to it and cannot collide with
+        // user variables or other probes.
         format!(
-            "{{ let _cov{slot} := mload(0x00) mstore(0x00, {tag}) pop(staticcall(gas(), 0xc0bEc0BEc0BeC0bEC0beC0bEC0bEC0beC0beC0BE, 0x00, 0x20, 0x00, 0x00)) mstore(0x00, _cov{slot}) }} "
+            "{{ let _cov := mload(0x00) mstore(0x00, {tag}) pop(staticcall(gas(), 0xc0bEc0BEc0BeC0bEC0beC0bEC0bEC0beC0beC0BE, 0x00, 0x20, 0x00, 0x00)) mstore(0x00, _cov) }} "
         )
     }
 
@@ -512,14 +563,11 @@ impl<'a> StatementCollector<'a> {
         first.line_index as u32 + 1..last.line_index as u32 + 2
     }
 
-    fn make_tag(&self, start: usize) -> B256 {
-        let payload = format!(
-            "foundry-coverage:{}:{}:{}:{}",
-            self.version,
-            self.path.display(),
-            start,
-            self.next_probe
-        );
+    fn make_tag(&mut self, start: usize) -> B256 {
+        let seq = self.next_tag;
+        self.next_tag += 1;
+        let payload =
+            format!("foundry-coverage:{}:{}:{}:{}", self.version, self.path.display(), start, seq);
         keccak256(payload)
     }
 
@@ -564,11 +612,16 @@ impl<'a> StatementCollector<'a> {
                 self.wrap_and_probe(stmt, kind, trailing);
                 self.visit_stmt(stmt)
             }
+            _ if Self::is_require_stmt(stmt) => {
+                // A brace-less `require` body needs its own block plus the require pre/post
+                // branch probes placed *inside* that block. Emitting the require probes as
+                // separate insertions (as `push_require_branch` does) would detach the
+                // synthesized brace, so wrap and probe it in one fused step.
+                self.wrap_require_body(stmt, kind, trailing);
+                ControlFlow::Continue(())
+            }
             _ => {
                 self.wrap_and_probe(stmt, kind, trailing);
-                if Self::is_require_stmt(stmt) {
-                    self.visit_stmt(stmt)?;
-                }
                 ControlFlow::Continue(())
             }
         }
@@ -712,6 +765,17 @@ impl<'a> StatementCollector<'a> {
         let StmtKind::Expr(expr) = &stmt.kind else { return false };
         Self::is_require_expr(expr)
     }
+
+    /// Returns `true` if `stmt` contains executable statements. An empty block (or an empty
+    /// `assembly`/`unchecked` block) contains none. Mirrors the native analyzer so empty `if`
+    /// bodies do not produce phantom branches.
+    fn stmt_has_statements(stmt: &ast::Stmt<'_>) -> bool {
+        match &stmt.kind {
+            StmtKind::Block(block) | StmtKind::UncheckedBlock(block) => !block.stmts.is_empty(),
+            StmtKind::Assembly(assembly) => !assembly.block.stmts.is_empty(),
+            _ => true,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -789,8 +853,14 @@ impl<'ast> ast::Visit<'ast> for StatementCollector<'_> {
                         body,
                         InstrumentedCoverageProbeKind::Function { name: Self::function_name(func) },
                     );
+                    // Visit only the body, not the function header. Expressions in modifier
+                    // invocations, base-constructor arguments, and return types are not
+                    // control-flow in the function and must not be instrumented as branches
+                    // (this matches the native analyzer and keeps branch denominators stable).
+                    for stmt in body.stmts.iter() {
+                        self.visit_stmt(stmt)?;
+                    }
                 }
-                self.walk_item(item)?;
                 self.probe_mode = previous_probe_mode;
             }
             _ => {}
@@ -840,6 +910,16 @@ impl<'ast> ast::Visit<'ast> for StatementCollector<'_> {
             }
             StmtKind::If(condition, then_stmt, else_stmt) => {
                 self.visit_expr(condition)?;
+
+                // Only treat this as a branch if a body has executable statements, matching the
+                // native analyzer; an `if (b) {}` with empty bodies yields no branch. Empty bodies
+                // contain nothing to instrument, so there is nothing further to visit.
+                let has_body = Self::stmt_has_statements(then_stmt)
+                    || else_stmt.as_ref().is_some_and(|s| Self::stmt_has_statements(s));
+                if !has_body {
+                    return ControlFlow::Continue(());
+                }
+
                 let branch_id = self.next_branch_id();
                 // The implicit else (`path_id: 1`) for a bare `if` is fused onto the then-body's
                 // closing brace as a single insertion, so it binds to this `if` and orders
@@ -1321,6 +1401,82 @@ contract C {
             count_kind(&probes, |k| matches!(k, InstrumentedCoverageProbeKind::Function { .. })),
             2
         );
+    }
+
+    #[test]
+    fn header_expressions_are_not_instrumented_as_branches() {
+        // A logical expression in a modifier invocation argument is part of the function header,
+        // not its body, and must not be counted as a branch.
+        let (out, probes) = instrument(
+            r#"
+contract C {
+    modifier m(bool ok) { require(ok); _; }
+    function f(bool a, bool b) external m(a || b) returns (uint256) {
+        return 1;
+    }
+}
+"#,
+        );
+        assert_reparses(&out);
+        // Only the modifier's own `require` branch; no branch from the `a || b` in `m(a || b)`.
+        assert_eq!(
+            count_kind(&probes, |k| matches!(k, InstrumentedCoverageProbeKind::Branch { .. })),
+            0
+        );
+        assert!(!out.contains("sendHitReturn"), "header expression must not be wrapped:\n{out}");
+    }
+
+    #[test]
+    fn empty_if_body_produces_no_branch() {
+        // `if (b) {}` with empty bodies must not produce phantom branches (matches the native
+        // analyzer), but a non-empty body still does.
+        let (out, probes) = instrument(
+            r#"
+contract C {
+    function f(bool b) external pure returns (uint256 r) {
+        if (b) {}
+        if (b) { r = 1; }
+    }
+}
+"#,
+        );
+        assert_reparses(&out);
+        // Only the second `if` (non-empty) contributes branches: then + implicit else = 2.
+        assert_eq!(
+            count_kind(&probes, |k| matches!(k, InstrumentedCoverageProbeKind::Branch { .. })),
+            2
+        );
+    }
+
+    #[test]
+    fn braceless_require_body_reparses_for_every_control_form() {
+        // A `require` as the brace-less body of a control statement must wrap into a block with
+        // the require probes *inside* it, so the braces stay attached and the construct still
+        // compiles (regression: the synthesized braces used to detach, dangling any `else`).
+        let cases = [
+            "if (a) require(x > 0, \"e\");",
+            "if (a) require(x > 0, \"e\"); else { x = 1; }",
+            "if (a) {} else require(x > 0, \"e\");",
+            "while (x > 0) require(x > 0, \"e\");",
+            "for (uint256 i; i < x; i++) require(x > 0, \"e\");",
+            "do require(x > 0, \"e\"); while (x > 0);",
+        ];
+        for body in cases {
+            let src = format!(
+                "contract C {{ function f(bool a, uint256 x) external pure {{ {body} }} }}"
+            );
+            let (out, probes) = instrument(&src);
+            assert_reparses(&out);
+            // The require's pre/post branch probes are still recorded.
+            assert_eq!(
+                count_kind(&probes, |k| matches!(
+                    k,
+                    InstrumentedCoverageProbeKind::RequirePre { .. }
+                )),
+                1,
+                "missing require branch for: {body}"
+            );
+        }
     }
 
     #[test]
