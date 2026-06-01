@@ -30,9 +30,13 @@ use std::{
 
 pub mod analysis;
 pub mod anchors;
+pub mod instrumentation;
 
 mod inspector;
-pub use inspector::LineCoverageCollector;
+pub use inspector::{
+    FOUNDRY_COVERAGE_ADDRESS, InstrumentedCoverageCollector, InstrumentedHitMaps,
+    LineCoverageCollector,
+};
 
 /// A coverage report.
 ///

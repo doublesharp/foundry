@@ -1,10 +1,17 @@
 use crate::{CallData, HitMap, HitMaps};
-use alloy_primitives::B256;
+use alloy_primitives::{Address, B256, Bytes, address, map::B256HashMap};
 use revm::{
     Inspector,
-    interpreter::{CreateInputs, CreateOutcome, Interpreter, interpreter_types::Jumps},
+    context::{ContextTr, JournalTr},
+    interpreter::{
+        CallInputs, CallOutcome, CreateInputs, CreateOutcome, Gas, InstructionResult, Interpreter,
+        InterpreterResult, interpreter_types::Jumps,
+    },
 };
 use std::ptr::NonNull;
+
+/// Address used by source instrumentation to report coverage hits.
+pub const FOUNDRY_COVERAGE_ADDRESS: Address = address!("c0bEc0BEc0BeC0bEC0beC0bEC0bEC0beC0beC0BE");
 
 /// Inspector implementation for collecting coverage information.
 #[derive(Clone, Debug)]
@@ -101,5 +108,126 @@ impl LineCoverageCollector {
             .entry(hash)
             .or_insert_with(|| HitMap::new(interpreter.bytecode.original_bytes()))
             .into();
+    }
+}
+
+/// Hit counts keyed by instrumented coverage tag.
+#[derive(Clone, Debug, Default)]
+pub struct InstrumentedHitMaps(pub B256HashMap<u64>);
+
+impl InstrumentedHitMaps {
+    /// Merge `other` into `target`.
+    pub fn merge_opt(target: &mut Option<Self>, other: Option<Self>) {
+        let Some(other) = other else { return };
+        target.get_or_insert_default().merge(other);
+    }
+
+    /// Merge `other` into this map.
+    pub fn merge(&mut self, other: Self) {
+        for (tag, hits) in other.0 {
+            *self.0.entry(tag).or_default() += hits;
+        }
+    }
+
+    /// Merge borrowed hits into this map.
+    pub fn merge_ref(&mut self, other: &Self) {
+        for (tag, hits) in &other.0 {
+            *self.0.entry(*tag).or_default() += *hits;
+        }
+    }
+
+    fn hit(&mut self, tag: B256) {
+        *self.0.entry(tag).or_default() += 1;
+    }
+}
+
+/// Inspector implementation for source-instrumented coverage calls.
+#[derive(Clone, Debug, Default)]
+pub struct InstrumentedCoverageCollector {
+    hits: InstrumentedHitMaps,
+    frame_return_data: Vec<Bytes>,
+}
+
+impl InstrumentedCoverageCollector {
+    /// Finish collecting instrumented coverage information.
+    pub fn finish(self) -> InstrumentedHitMaps {
+        self.hits
+    }
+
+    fn is_coverage_call(inputs: &CallInputs) -> bool {
+        inputs.bytecode_address == FOUNDRY_COVERAGE_ADDRESS
+    }
+
+    fn frame_depth<CTX: ContextTr>(context: &CTX) -> usize {
+        context.journal().depth()
+    }
+
+    fn frame_return_data(&self, depth: usize) -> Bytes {
+        self.frame_return_data.get(depth).cloned().unwrap_or_default()
+    }
+
+    fn clear_frame_return_data(&mut self, depth: usize) {
+        if self.frame_return_data.len() <= depth {
+            self.frame_return_data.resize_with(depth + 1, Bytes::new);
+        }
+        self.frame_return_data[depth].clear();
+    }
+
+    fn set_frame_return_data(&mut self, depth: usize, output: Bytes) {
+        if self.frame_return_data.len() <= depth {
+            self.frame_return_data.resize_with(depth + 1, Bytes::new);
+        }
+        self.frame_return_data[depth] = output;
+    }
+}
+
+impl<CTX: ContextTr> Inspector<CTX> for InstrumentedCoverageCollector {
+    fn initialize_interp(&mut self, _interpreter: &mut Interpreter, context: &mut CTX) {
+        self.clear_frame_return_data(Self::frame_depth(context));
+    }
+
+    fn call(&mut self, context: &mut CTX, inputs: &mut CallInputs) -> Option<CallOutcome> {
+        if !Self::is_coverage_call(inputs) {
+            return None;
+        }
+
+        let input = inputs.input.bytes(context);
+        if input.len() >= 36 {
+            self.hits.hit(B256::from_slice(&input[4..36]));
+        } else if input.len() >= 32 {
+            self.hits.hit(B256::from_slice(&input[..32]));
+        }
+
+        Some(CallOutcome {
+            result: InterpreterResult {
+                result: InstructionResult::Return,
+                output: self.frame_return_data(Self::frame_depth(context)),
+                gas: Gas::new(inputs.gas_limit),
+            },
+            memory_offset: inputs.return_memory_offset.clone(),
+            was_precompile_called: true,
+            precompile_call_logs: vec![],
+            charged_new_account_state_gas: false,
+        })
+    }
+
+    fn call_end(&mut self, _context: &mut CTX, inputs: &CallInputs, outcome: &mut CallOutcome) {
+        if !Self::is_coverage_call(inputs) {
+            self.set_frame_return_data(Self::frame_depth(_context), outcome.result.output.clone());
+        }
+    }
+
+    fn create_end(
+        &mut self,
+        _context: &mut CTX,
+        _inputs: &CreateInputs,
+        outcome: &mut CreateOutcome,
+    ) {
+        let output = if outcome.result.result == InstructionResult::Revert {
+            outcome.result.output.clone()
+        } else {
+            Bytes::new()
+        };
+        self.set_frame_return_data(Self::frame_depth(_context), output);
     }
 }
