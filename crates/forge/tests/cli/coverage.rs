@@ -4670,3 +4670,195 @@ end_of_record
 
 "#]]);
 });
+
+// A ternary nested inside another ternary yields two independent branches (four outcomes),
+// and the rewrite preserves evaluation so the returned values stay correct.
+forgetest!(instrumented_nested_ternary, |prj, cmd| {
+    prj.add_source(
+        "Target.sol",
+        r#"
+contract Target {
+    function classify(uint256 x) external pure returns (uint256) {
+        return x == 0 ? 0 : (x < 10 ? 1 : 2);
+    }
+}
+"#,
+    );
+    prj.add_test(
+        "TargetTest.sol",
+        r#"
+import {Target} from "../src/Target.sol";
+
+contract TargetTest {
+    Target t = new Target();
+
+    function testAllOutcomes() external view {
+        require(t.classify(0) == 0);
+        require(t.classify(5) == 1);
+        require(t.classify(50) == 2);
+    }
+}
+"#,
+    );
+
+    cmd.arg("coverage")
+        .args(["--instrumented", "--exclude-tests", "--mt", "testAllOutcomes"])
+        .assert_success()
+        .stdout_eq(str![[r#"
+[COMPILING_FILES] with [SOLC_VERSION]
+[SOLC_VERSION] [ELAPSED]
+Compiler run successful!
+Analysing contracts...
+Running tests...
+
+Ran 1 test for test/TargetTest.sol:TargetTest
+[PASS] testAllOutcomes() ([GAS])
+Suite result: ok. 1 passed; 0 failed; 0 skipped; [ELAPSED]
+
+Ran 1 test suite [ELAPSED]: 1 tests passed, 0 failed, 0 skipped (1 total tests)
+
+╭----------------+---------------+---------------+---------------+---------------╮
+| File           | % Lines       | % Statements  | % Branches    | % Funcs       |
++================================================================================+
+| src/Target.sol | 100.00% (2/2) | 100.00% (1/1) | 100.00% (4/4) | 100.00% (1/1) |
+|----------------+---------------+---------------+---------------+---------------|
+| Total          | 100.00% (2/2) | 100.00% (1/1) | 100.00% (4/4) | 100.00% (1/1) |
+╰----------------+---------------+---------------+---------------+---------------╯
+
+"#]]);
+});
+
+// Multiple modifiers on one function: each modifier body is instrumented independently, so
+// each guard's branch is tracked separately.
+forgetest!(instrumented_multiple_modifiers, |prj, cmd| {
+    prj.add_source(
+        "Target.sol",
+        r#"
+contract Target {
+    modifier nonZero(uint256 x) {
+        require(x != 0, "zero");
+        _;
+    }
+
+    modifier underCap(uint256 x) {
+        require(x < 100, "too big");
+        _;
+    }
+
+    function f(uint256 x) external nonZero(x) underCap(x) returns (uint256) {
+        return x;
+    }
+}
+"#,
+    );
+    prj.add_test(
+        "TargetTest.sol",
+        r#"
+import {Target} from "../src/Target.sol";
+
+interface Vm {
+    function expectRevert(bytes calldata revertData) external;
+}
+
+contract TargetTest {
+    Vm constant vm = Vm(address(uint160(uint256(keccak256("hevm cheat code")))));
+    Target t = new Target();
+
+    function testAllGuardPaths() external {
+        require(t.f(5) == 5);
+        vm.expectRevert(bytes("zero"));
+        t.f(0);
+        vm.expectRevert(bytes("too big"));
+        t.f(200);
+    }
+}
+"#,
+    );
+
+    cmd.arg("coverage")
+        .args(["--instrumented", "--exclude-tests", "--mt", "testAllGuardPaths"])
+        .assert_success()
+        .stdout_eq(str![[r#"
+[COMPILING_FILES] with [SOLC_VERSION]
+[SOLC_VERSION] [ELAPSED]
+Compiler run successful with warnings:
+Warning (2018): Function state mutability can be restricted to view
+  [FILE]:15:5:
+   |
+15 |     function f(uint256 x) external nonZ ... EC0beC0beC0BE, 0x00, 0x20, 0, 0)) }
+   |     ^ (Relevant source part starts here and spans across multiple lines).
+
+Analysing contracts...
+Running tests...
+
+Ran 1 test for test/TargetTest.sol:TargetTest
+[PASS] testAllGuardPaths() ([GAS])
+Suite result: ok. 1 passed; 0 failed; 0 skipped; [ELAPSED]
+
+Ran 1 test suite [ELAPSED]: 1 tests passed, 0 failed, 0 skipped (1 total tests)
+
+╭----------------+---------------+---------------+---------------+---------------╮
+| File           | % Lines       | % Statements  | % Branches    | % Funcs       |
++================================================================================+
+| src/Target.sol | 100.00% (6/6) | 100.00% (3/3) | 100.00% (4/4) | 100.00% (3/3) |
+|----------------+---------------+---------------+---------------+---------------|
+| Total          | 100.00% (6/6) | 100.00% (3/3) | 100.00% (4/4) | 100.00% (3/3) |
+╰----------------+---------------+---------------+---------------+---------------╯
+
+"#]]);
+});
+
+// `do { .. } while` runs its body at least once; instrument it as a statement-bearing loop
+// (not a branch) and confirm coverage with a single-statement body too.
+forgetest!(instrumented_do_while_single_statement, |prj, cmd| {
+    prj.add_source(
+        "Target.sol",
+        r#"
+contract Target {
+    function countdown(uint256 n) external pure returns (uint256 steps) {
+        do steps++; while (steps < n);
+    }
+}
+"#,
+    );
+    prj.add_test(
+        "TargetTest.sol",
+        r#"
+import {Target} from "../src/Target.sol";
+
+contract TargetTest {
+    Target t = new Target();
+
+    function testRuns() external view {
+        require(t.countdown(3) == 3);
+    }
+}
+"#,
+    );
+
+    cmd.arg("coverage")
+        .args(["--instrumented", "--exclude-tests", "--mt", "testRuns"])
+        .assert_success()
+        .stdout_eq(str![[r#"
+[COMPILING_FILES] with [SOLC_VERSION]
+[SOLC_VERSION] [ELAPSED]
+Compiler run successful!
+Analysing contracts...
+Running tests...
+
+Ran 1 test for test/TargetTest.sol:TargetTest
+[PASS] testRuns() ([GAS])
+Suite result: ok. 1 passed; 0 failed; 0 skipped; [ELAPSED]
+
+Ran 1 test suite [ELAPSED]: 1 tests passed, 0 failed, 0 skipped (1 total tests)
+
+╭----------------+---------------+---------------+---------------+---------------╮
+| File           | % Lines       | % Statements  | % Branches    | % Funcs       |
++================================================================================+
+| src/Target.sol | 100.00% (2/2) | 100.00% (1/1) | 100.00% (0/0) | 100.00% (1/1) |
+|----------------+---------------+---------------+---------------+---------------|
+| Total          | 100.00% (2/2) | 100.00% (1/1) | 100.00% (0/0) | 100.00% (1/1) |
+╰----------------+---------------+---------------+---------------+---------------╯
+
+"#]]);
+});

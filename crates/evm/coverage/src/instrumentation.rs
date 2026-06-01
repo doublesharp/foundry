@@ -111,7 +111,7 @@ pub struct CoverageInstrumentationPreprocessor {
 }
 
 impl CoverageInstrumentationPreprocessor {
-    pub fn new(
+    pub const fn new(
         metadata: InstrumentedCoverageMetadataRef,
         include_libs: bool,
         exclude_tests: bool,
@@ -136,7 +136,7 @@ impl CoverageInstrumentationPreprocessor {
             let mut pcx = compiler.parse();
             let mut candidate_paths = Vec::new();
 
-            for (path, source) in input.input.sources.iter() {
+            for (path, source) in &input.input.sources {
                 if let Ok(src_file) = compiler
                     .sess()
                     .source_map()
@@ -199,7 +199,7 @@ impl CoverageInstrumentationPreprocessor {
         if path == Path::new(COVERAGE_LIBRARY_PATH) {
             return false;
         }
-        if !path.extension().and_then(|s| s.to_str()).is_some_and(|ext| ext == "sol") {
+        if path.extension().and_then(|s| s.to_str()).is_none_or(|ext| ext != "sol") {
             return false;
         }
         if !self.include_libs && paths.has_library_ancestor(path) {
@@ -552,7 +552,7 @@ impl<'a> StatementCollector<'a> {
         }
     }
 
-    fn should_instrument_function(func: &ast::ItemFunction<'_>) -> bool {
+    const fn should_instrument_function(func: &ast::ItemFunction<'_>) -> bool {
         !matches!(func.kind, FunctionKind::Receive) && func.body.is_some()
     }
 
@@ -802,7 +802,7 @@ impl<'ast> ast::Visit<'ast> for StatementCollector<'_> {
                 ControlFlow::Continue(())
             }
             StmtKind::Try(try_) => {
-                self.visit_expr(&try_.expr)?;
+                self.visit_expr(try_.expr)?;
                 let branch_id = self.next_branch_id();
                 for (path_id, clause) in try_.clauses.iter().enumerate() {
                     self.push_block_entry_probe(
