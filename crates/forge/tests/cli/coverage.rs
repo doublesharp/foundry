@@ -4921,3 +4921,166 @@ Ran 1 test suite [ELAPSED]: 1 tests passed, 0 failed, 0 skipped (1 total tests)
 
 "#]]);
 });
+
+// viaIR matrix: one contract exercising every instrumented construct (if/else-if, bare if,
+// loops, ternary, ||, modifier guard, assembly, require), with a test that covers every
+// reachable path. Coverage must be identical and fully accurate whether the optimizer/viaIR are
+// off (default) or on (`--ir-minimum`), which is the property the instrumented mode exists to
+// provide. This proves the source rewrites survive viaIR codegen for each construct, not just
+// that they parse.
+forgetest!(instrumented_viair_all_constructs, |prj, cmd| {
+    prj.add_source(
+        "AllConstructs.sol",
+        r#"
+contract AllConstructs {
+    uint256 public state;
+
+    modifier nonZero(uint256 x) {
+        require(x != 0, "zero");
+        _;
+    }
+
+    constructor(uint256 v) {
+        state = v;
+    }
+
+    function ifElseIf(uint256 x) external pure returns (uint256) {
+        if (x == 0) {
+            return 1;
+        } else if (x == 1) {
+            return 2;
+        }
+        return 3;
+    }
+
+    function bareIf(uint256 x) external pure returns (uint256 r) {
+        r = 10;
+        if (x > 5) r = 20;
+    }
+
+    function loops(uint256 n) external pure returns (uint256 sum) {
+        for (uint256 i = 0; i < n; i++) sum += i;
+        while (sum < 100) sum += 1;
+        do { sum += 1; } while (sum < 110);
+    }
+
+    function ternary(bool a) external pure returns (uint256) {
+        return a ? 1 : 2;
+    }
+
+    function logical(bool a, bool b) external pure returns (bool) {
+        return a || b;
+    }
+
+    function guarded(uint256 x) external nonZero(x) returns (uint256) {
+        state = x;
+        return x;
+    }
+
+    function asmFn(uint256 x) external pure returns (uint256 r) {
+        assembly {
+            r := add(x, 1)
+        }
+    }
+
+    function req(uint256 x) external pure returns (uint256) {
+        require(x > 0, "nonpositive");
+        return x;
+    }
+}
+"#,
+    );
+    prj.add_test(
+        "AllConstructsTest.sol",
+        r#"
+import {AllConstructs} from "../src/AllConstructs.sol";
+
+interface Vm {
+    function expectRevert(bytes calldata revertData) external;
+}
+
+contract AllConstructsTest {
+    Vm constant vm = Vm(address(uint160(uint256(keccak256("hevm cheat code")))));
+    AllConstructs c = new AllConstructs(1);
+
+    function test_all() external {
+        c.ifElseIf(0);
+        c.ifElseIf(1);
+        c.ifElseIf(2);
+        c.bareIf(1);
+        c.bareIf(10);
+        c.loops(3);
+        c.ternary(true);
+        c.ternary(false);
+        // Both `||` operands: left-true (short-circuits) and left-false then right.
+        c.logical(true, false);
+        c.logical(false, true);
+        // Both modifier guard paths.
+        c.guarded(5);
+        vm.expectRevert(bytes("zero"));
+        c.guarded(0);
+        c.asmFn(1);
+        // Both require paths.
+        c.req(1);
+        vm.expectRevert(bytes("nonpositive"));
+        c.req(0);
+    }
+}
+"#,
+    );
+
+    // Default mode: optimizer and viaIR disabled by coverage.
+    cmd.arg("coverage")
+        .args(["--instrumented", "--exclude-tests", "--mt", "test_all"])
+        .assert_success()
+        .stdout_eq(str![[r#"
+[COMPILING_FILES] with [SOLC_VERSION]
+[SOLC_VERSION] [ELAPSED]
+Compiler run successful!
+Analysing contracts...
+Running tests...
+
+Ran 1 test for test/AllConstructsTest.sol:AllConstructsTest
+[PASS] test_all() ([GAS])
+Suite result: ok. 1 passed; 0 failed; 0 skipped; [ELAPSED]
+
+Ran 1 test suite [ELAPSED]: 1 tests passed, 0 failed, 0 skipped (1 total tests)
+
+╭-----------------------+-----------------+-----------------+-----------------+-----------------╮
+| File                  | % Lines         | % Statements    | % Branches      | % Funcs         |
++===============================================================================================+
+| src/AllConstructs.sol | 100.00% (29/29) | 100.00% (17/17) | 100.00% (14/14) | 100.00% (10/10) |
+|-----------------------+-----------------+-----------------+-----------------+-----------------|
+| Total                 | 100.00% (29/29) | 100.00% (17/17) | 100.00% (14/14) | 100.00% (10/10) |
+╰-----------------------+-----------------+-----------------+-----------------+-----------------╯
+
+"#]]);
+
+    // `--ir-minimum`: the same sources compiled through viaIR must report identical coverage.
+    cmd.forge_fuse()
+        .arg("coverage")
+        .args(["--instrumented", "--ir-minimum", "--exclude-tests", "--mt", "test_all"])
+        .assert_success()
+        .stdout_eq(str![[r#"
+[COMPILING_FILES] with [SOLC_VERSION]
+[SOLC_VERSION] [ELAPSED]
+Compiler run successful!
+Analysing contracts...
+Running tests...
+
+Ran 1 test for test/AllConstructsTest.sol:AllConstructsTest
+[PASS] test_all() ([GAS])
+Suite result: ok. 1 passed; 0 failed; 0 skipped; [ELAPSED]
+
+Ran 1 test suite [ELAPSED]: 1 tests passed, 0 failed, 0 skipped (1 total tests)
+
+╭-----------------------+-----------------+-----------------+-----------------+-----------------╮
+| File                  | % Lines         | % Statements    | % Branches      | % Funcs         |
++===============================================================================================+
+| src/AllConstructs.sol | 100.00% (29/29) | 100.00% (17/17) | 100.00% (14/14) | 100.00% (10/10) |
+|-----------------------+-----------------+-----------------+-----------------+-----------------|
+| Total                 | 100.00% (29/29) | 100.00% (17/17) | 100.00% (14/14) | 100.00% (10/10) |
+╰-----------------------+-----------------+-----------------+-----------------+-----------------╯
+
+"#]]);
+});
