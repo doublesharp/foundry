@@ -1015,4 +1015,34 @@ contract C {
             0
         );
     }
+
+    #[test]
+    fn modifier_require_guard_is_a_branch() {
+        let (out, probes) = instrument(
+            r#"
+contract C {
+    modifier onlyPositive(uint256 x) {
+        require(x > 0, "nonpositive");
+        _;
+    }
+
+    function f(uint256 x) external onlyPositive(x) returns (uint256) {
+        return x;
+    }
+}
+"#,
+        );
+        assert_reparses(&out);
+        // The modifier body is instrumented like any function body, so its `require` guard
+        // contributes require pre/post branch probes.
+        assert_eq!(
+            count_kind(&probes, |k| matches!(k, InstrumentedCoverageProbeKind::RequirePre { .. })),
+            1
+        );
+        // The modifier itself and the function are both recorded as functions.
+        assert_eq!(
+            count_kind(&probes, |k| matches!(k, InstrumentedCoverageProbeKind::Function { .. })),
+            2
+        );
+    }
 }

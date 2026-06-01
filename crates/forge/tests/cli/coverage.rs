@@ -4286,3 +4286,386 @@ Ran 1 test suite [ELAPSED]: 1 tests passed, 0 failed, 0 skipped (1 total tests)
 
 "#]]);
 });
+
+// A modifier body is instrumented like any function body, so a `require` guard inside it is
+// counted as a branch. Exercising only the passing path leaves the guard's false branch
+// uncovered (50%); exercising both reaches full coverage.
+forgetest!(instrumented_modifier_guard_branches, |prj, cmd| {
+    prj.add_source(
+        "Target.sol",
+        r#"
+contract Target {
+    modifier onlyPositive(uint256 x) {
+        require(x > 0, "nonpositive");
+        _;
+    }
+
+    function f(uint256 x) external onlyPositive(x) returns (uint256) {
+        return x;
+    }
+}
+"#,
+    );
+    prj.add_test(
+        "TargetTest.sol",
+        r#"
+import {Target} from "../src/Target.sol";
+
+interface Vm {
+    function expectRevert(bytes calldata revertData) external;
+}
+
+contract TargetTest {
+    Vm constant vm = Vm(address(uint160(uint256(keccak256("hevm cheat code")))));
+    Target t = new Target();
+
+    function testPassingOnly() external {
+        require(t.f(1) == 1);
+    }
+
+    function testBothGuardPaths() external {
+        require(t.f(1) == 1);
+        vm.expectRevert(bytes("nonpositive"));
+        t.f(0);
+    }
+}
+"#,
+    );
+
+    // Passing path only: the guard's false branch is uncovered.
+    cmd.arg("coverage")
+        .args(["--instrumented", "--exclude-tests", "--mt", "testPassingOnly"])
+        .assert_success()
+        .stdout_eq(str![[r#"
+[COMPILING_FILES] with [SOLC_VERSION]
+[SOLC_VERSION] [ELAPSED]
+Compiler run successful with warnings:
+Warning (2018): Function state mutability can be restricted to view
+  [FILE]:10:5:
+   |
+10 |     function f(uint256 x) external only ... EC0beC0beC0BE, 0x00, 0x20, 0, 0)) }
+   |     ^ (Relevant source part starts here and spans across multiple lines).
+
+Analysing contracts...
+Running tests...
+
+Ran 1 test for test/TargetTest.sol:TargetTest
+[PASS] testPassingOnly() ([GAS])
+Suite result: ok. 1 passed; 0 failed; 0 skipped; [ELAPSED]
+
+Ran 1 test suite [ELAPSED]: 1 tests passed, 0 failed, 0 skipped (1 total tests)
+
+╭----------------+---------------+---------------+--------------+---------------╮
+| File           | % Lines       | % Statements  | % Branches   | % Funcs       |
++===============================================================================+
+| src/Target.sol | 100.00% (4/4) | 100.00% (2/2) | 50.00% (1/2) | 100.00% (2/2) |
+|----------------+---------------+---------------+--------------+---------------|
+| Total          | 100.00% (4/4) | 100.00% (2/2) | 50.00% (1/2) | 100.00% (2/2) |
+╰----------------+---------------+---------------+--------------+---------------╯
+
+"#]]);
+
+    // Both guard paths exercised.
+    cmd.forge_fuse()
+        .arg("coverage")
+        .args(["--instrumented", "--exclude-tests", "--mt", "testBothGuardPaths"])
+        .assert_success()
+        .stdout_eq(str![[r#"
+[COMPILING_FILES] with [SOLC_VERSION]
+[SOLC_VERSION] [ELAPSED]
+Compiler run successful with warnings:
+Warning (2018): Function state mutability can be restricted to view
+  [FILE]:10:5:
+   |
+10 |     function f(uint256 x) external only ... EC0beC0beC0BE, 0x00, 0x20, 0, 0)) }
+   |     ^ (Relevant source part starts here and spans across multiple lines).
+
+Analysing contracts...
+Running tests...
+
+Ran 1 test for test/TargetTest.sol:TargetTest
+[PASS] testBothGuardPaths() ([GAS])
+Suite result: ok. 1 passed; 0 failed; 0 skipped; [ELAPSED]
+
+Ran 1 test suite [ELAPSED]: 1 tests passed, 0 failed, 0 skipped (1 total tests)
+
+╭----------------+---------------+---------------+---------------+---------------╮
+| File           | % Lines       | % Statements  | % Branches    | % Funcs       |
++================================================================================+
+| src/Target.sol | 100.00% (4/4) | 100.00% (2/2) | 100.00% (2/2) | 100.00% (2/2) |
+|----------------+---------------+---------------+---------------+---------------|
+| Total          | 100.00% (4/4) | 100.00% (2/2) | 100.00% (2/2) | 100.00% (2/2) |
+╰----------------+---------------+---------------+---------------+---------------╯
+
+"#]]);
+});
+
+// Instrumented coverage is independent of the optimizer / IR pipeline: it instruments source
+// before compilation rather than reading source maps. This fixture compiles the SAME contract
+// three ways (default, `--ir-minimum`, and a profile with the optimizer + viaIR enabled) and
+// asserts identical, fully-accurate coverage each time -- the property that motivates the mode.
+forgetest!(instrumented_independent_of_optimizer, |prj, cmd| {
+    prj.add_source(
+        "Target.sol",
+        r#"
+contract Target {
+    function classify(uint256 x) external pure returns (uint256) {
+        if (x == 0) {
+            return 1;
+        }
+        return x > 10 ? 2 : 3;
+    }
+}
+"#,
+    );
+    prj.add_test(
+        "TargetTest.sol",
+        r#"
+import {Target} from "../src/Target.sol";
+
+contract TargetTest {
+    Target t = new Target();
+
+    function testAllPaths() external view {
+        require(t.classify(0) == 1);
+        require(t.classify(11) == 2);
+        require(t.classify(5) == 3);
+    }
+}
+"#,
+    );
+
+    // Default profile (optimizer + viaIR disabled by coverage).
+    cmd.arg("coverage")
+        .args(["--instrumented", "--exclude-tests", "--mt", "testAllPaths"])
+        .assert_success()
+        .stdout_eq(str![[r#"
+[COMPILING_FILES] with [SOLC_VERSION]
+[SOLC_VERSION] [ELAPSED]
+Compiler run successful!
+Analysing contracts...
+Running tests...
+
+Ran 1 test for test/TargetTest.sol:TargetTest
+[PASS] testAllPaths() ([GAS])
+Suite result: ok. 1 passed; 0 failed; 0 skipped; [ELAPSED]
+
+Ran 1 test suite [ELAPSED]: 1 tests passed, 0 failed, 0 skipped (1 total tests)
+
+╭----------------+---------------+---------------+---------------+---------------╮
+| File           | % Lines       | % Statements  | % Branches    | % Funcs       |
++================================================================================+
+| src/Target.sol | 100.00% (4/4) | 100.00% (2/2) | 100.00% (3/3) | 100.00% (1/1) |
+|----------------+---------------+---------------+---------------+---------------|
+| Total          | 100.00% (4/4) | 100.00% (2/2) | 100.00% (3/3) | 100.00% (1/1) |
+╰----------------+---------------+---------------+---------------+---------------╯
+
+"#]]);
+
+    // `--ir-minimum`: viaIR with minimal optimization.
+    cmd.forge_fuse()
+        .arg("coverage")
+        .args(["--instrumented", "--ir-minimum", "--exclude-tests", "--mt", "testAllPaths"])
+        .assert_success()
+        .stdout_eq(str![[r#"
+[COMPILING_FILES] with [SOLC_VERSION]
+[SOLC_VERSION] [ELAPSED]
+Compiler run successful!
+Analysing contracts...
+Running tests...
+
+Ran 1 test for test/TargetTest.sol:TargetTest
+[PASS] testAllPaths() ([GAS])
+Suite result: ok. 1 passed; 0 failed; 0 skipped; [ELAPSED]
+
+Ran 1 test suite [ELAPSED]: 1 tests passed, 0 failed, 0 skipped (1 total tests)
+
+╭----------------+---------------+---------------+---------------+---------------╮
+| File           | % Lines       | % Statements  | % Branches    | % Funcs       |
++================================================================================+
+| src/Target.sol | 100.00% (4/4) | 100.00% (2/2) | 100.00% (3/3) | 100.00% (1/1) |
+|----------------+---------------+---------------+---------------+---------------|
+| Total          | 100.00% (4/4) | 100.00% (2/2) | 100.00% (3/3) | 100.00% (1/1) |
+╰----------------+---------------+---------------+---------------+---------------╯
+
+"#]]);
+
+    // Full optimizer + viaIR via config: coverage must still be accurate.
+    prj.update_config(|config| {
+        config.optimizer = Some(true);
+        config.optimizer_runs = Some(200);
+        config.via_ir = true;
+    });
+    cmd.forge_fuse()
+        .arg("coverage")
+        .args(["--instrumented", "--exclude-tests", "--mt", "testAllPaths"])
+        .assert_success()
+        .stdout_eq(str![[r#"
+[COMPILING_FILES] with [SOLC_VERSION]
+[SOLC_VERSION] [ELAPSED]
+Compiler run successful!
+Analysing contracts...
+Running tests...
+
+Ran 1 test for test/TargetTest.sol:TargetTest
+[PASS] testAllPaths() ([GAS])
+Suite result: ok. 1 passed; 0 failed; 0 skipped; [ELAPSED]
+
+Ran 1 test suite [ELAPSED]: 1 tests passed, 0 failed, 0 skipped (1 total tests)
+
+╭----------------+---------------+---------------+---------------+---------------╮
+| File           | % Lines       | % Statements  | % Branches    | % Funcs       |
++================================================================================+
+| src/Target.sol | 100.00% (4/4) | 100.00% (2/2) | 100.00% (3/3) | 100.00% (1/1) |
+|----------------+---------------+---------------+---------------+---------------|
+| Total          | 100.00% (4/4) | 100.00% (2/2) | 100.00% (3/3) | 100.00% (1/1) |
+╰----------------+---------------+---------------+---------------+---------------╯
+
+"#]]);
+});
+
+// `catch Panic(uint256)` and a trailing `catch (bytes)` clause each become branch outcomes
+// alongside the success clause.
+forgetest!(instrumented_try_catch_panic_and_raw, |prj, cmd| {
+    prj.add_source(
+        "Target.sol",
+        r#"
+contract Callee {
+    function compute(uint256 mode) external pure returns (uint256) {
+        if (mode == 1) {
+            assert(false);
+        }
+        if (mode == 2) {
+            revert("custom");
+        }
+        return 7;
+    }
+}
+
+contract Target {
+    Callee callee = new Callee();
+
+    function run(uint256 mode) external returns (uint256) {
+        try callee.compute(mode) returns (uint256 value) {
+            return value;
+        } catch Panic(uint256) {
+            return 1;
+        } catch (bytes memory) {
+            return 2;
+        }
+    }
+}
+"#,
+    );
+    prj.add_test(
+        "TargetTest.sol",
+        r#"
+import {Target} from "../src/Target.sol";
+
+contract TargetTest {
+    Target t = new Target();
+
+    function testAllClauses() external {
+        require(t.run(0) == 7);
+        require(t.run(1) == 1);
+        require(t.run(2) == 2);
+    }
+}
+"#,
+    );
+
+    cmd.arg("coverage")
+        .args(["--instrumented", "--exclude-tests", "--mt", "testAllClauses"])
+        .assert_success()
+        .stdout_eq(str![[r#"
+[COMPILING_FILES] with [SOLC_VERSION]
+[SOLC_VERSION] [ELAPSED]
+Compiler run successful with warnings:
+Warning (2018): Function state mutability can be restricted to view
+  [FILE]:19:5:
+   |
+19 |     function run(uint256 mode) external ... EC0beC0beC0BE, 0x00, 0x20, 0, 0)) }
+   |     ^ (Relevant source part starts here and spans across multiple lines).
+
+Analysing contracts...
+Running tests...
+
+Ran 1 test for test/TargetTest.sol:TargetTest
+[PASS] testAllClauses() ([GAS])
+Suite result: ok. 1 passed; 0 failed; 0 skipped; [ELAPSED]
+
+Ran 1 test suite [ELAPSED]: 1 tests passed, 0 failed, 0 skipped (1 total tests)
+
+╭----------------+-----------------+---------------+---------------+---------------╮
+| File           | % Lines         | % Statements  | % Branches    | % Funcs       |
++==================================================================================+
+| src/Target.sol | 100.00% (13/13) | 100.00% (6/6) | 100.00% (5/5) | 100.00% (2/2) |
+|----------------+-----------------+---------------+---------------+---------------|
+| Total          | 100.00% (13/13) | 100.00% (6/6) | 100.00% (5/5) | 100.00% (2/2) |
+╰----------------+-----------------+---------------+---------------+---------------╯
+
+"#]]);
+});
+
+// Instrumented coverage feeds the same reporters as the default mode. This fixture checks the
+// LCOV tracefile (line `DA`, function `FN`/`FNDA`, and branch `BRDA`/`BRF`/`BRH` records) so a
+// regression in report wiring -- not just the summary table -- is caught.
+forgetest!(instrumented_lcov_report, |prj, cmd| {
+    prj.add_source(
+        "Target.sol",
+        r#"
+contract Target {
+    function pick(bool flag) external pure returns (uint256) {
+        if (flag) {
+            return 1;
+        }
+        return 2;
+    }
+}
+"#,
+    );
+    prj.add_test(
+        "TargetTest.sol",
+        r#"
+import {Target} from "../src/Target.sol";
+
+contract TargetTest {
+    Target t = new Target();
+
+    function testBothPaths() external view {
+        require(t.pick(true) == 1);
+        require(t.pick(false) == 2);
+    }
+}
+"#,
+    );
+
+    cmd.arg("coverage")
+        .args([
+            "--instrumented",
+            "--exclude-tests",
+            "--mt",
+            "testBothPaths",
+            "--report=lcov",
+            "--report-file",
+        ])
+        .assert_file(str![[r#"
+TN:
+SF:src/Target.sol
+DA:5,2
+FN:5,Target.pick
+FNDA:2,Target.pick
+DA:6,1
+BRDA:6,0,0,1
+DA:7,1
+DA:9,1
+FNF:1
+FNH:1
+LF:4
+LH:4
+BRF:1
+BRH:1
+end_of_record
+
+"#]]);
+});
