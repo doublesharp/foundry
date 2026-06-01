@@ -264,7 +264,19 @@ fn instrument_source<'ast>(
     );
     let mut cursor = 0;
     let mut updates = collector.updates.iter().enumerate().collect::<Vec<_>>();
-    updates.sort_by_key(|(index, update)| (update.range.start, *index));
+    // Order updates sharing a byte offset so nested wrappers brace correctly: closes precede
+    // points precede opens; among closes the innermost (last pushed) emits first; among opens
+    // the outermost (first pushed) emits first. See [`Edge`].
+    updates.sort_by(|(a_idx, a), (b_idx, b)| {
+        a.range
+            .start
+            .cmp(&b.range.start)
+            .then_with(|| edge_rank(a.edge).cmp(&edge_rank(b.edge)))
+            .then_with(|| match a.edge {
+                Edge::Close => b_idx.cmp(a_idx),
+                Edge::Open | Edge::Point => a_idx.cmp(b_idx),
+            })
+    });
     for (_, update) in updates {
         content.push_str(&source[cursor..update.range.start]);
         content.push_str(&update.text);
@@ -275,6 +287,15 @@ fn instrument_source<'ast>(
     content.push_str(COVERAGE_IMPORT);
     content.push('\n');
     Some((content, collector.probes))
+}
+
+/// Sort rank for an [`Edge`] at a shared byte offset: closes first, then points, then opens.
+const fn edge_rank(edge: Edge) -> u8 {
+    match edge {
+        Edge::Close => 0,
+        Edge::Point => 1,
+        Edge::Open => 2,
+    }
 }
 
 #[derive(Debug)]
@@ -326,8 +347,7 @@ impl<'a> StatementCollector<'a> {
         let branch_id = self.next_branch_id();
 
         let pre_tag = self.make_tag(range.start);
-        self.updates
-            .push(SourceUpdate { range: range.start..range.start, text: self.probe_text(pre_tag) });
+        self.updates.push(SourceUpdate::point(range.start, self.probe_text(pre_tag)));
         self.record_probe(
             InstrumentedCoverageProbeKind::RequirePre { branch_id },
             stmt.span,
@@ -336,10 +356,7 @@ impl<'a> StatementCollector<'a> {
         );
 
         let post_tag = self.make_tag(range.end);
-        self.updates.push(SourceUpdate {
-            range: full_range.end..full_range.end,
-            text: self.probe_text(post_tag),
-        });
+        self.updates.push(SourceUpdate::point(full_range.end, self.probe_text(post_tag)));
         self.record_probe(
             InstrumentedCoverageProbeKind::RequirePost { branch_id },
             stmt.span,
@@ -355,23 +372,33 @@ impl<'a> StatementCollector<'a> {
         }
         let tag = self.make_tag(range.start);
         let text = self.probe_text(tag);
-        self.updates.push(SourceUpdate { range: range.start..range.start, text });
+        self.updates.push(SourceUpdate::point(range.start, text));
         self.record_probe(kind, span, range, tag);
     }
 
-    fn wrap_and_probe(&mut self, stmt: &'_ ast::Stmt<'_>, kind: InstrumentedCoverageProbeKind) {
+    /// Wraps a non-block statement in `{ <probe> stmt }` so a probe can be attached without
+    /// changing control flow, e.g. for a single-statement `if`/loop body. `trailing`, if present,
+    /// is appended after the closing brace within the same insertion (used for a synthesized
+    /// ` else { .. }`).
+    fn wrap_and_probe(
+        &mut self,
+        stmt: &'_ ast::Stmt<'_>,
+        kind: InstrumentedCoverageProbeKind,
+        trailing: Option<String>,
+    ) {
         let range = self.trim_statement_span(stmt.span);
         if range.is_empty() {
             return;
         }
         let full_range = self.source_map.span_to_source(stmt.span).unwrap().data;
         let tag = self.make_tag(range.start);
-        self.updates.push(SourceUpdate {
-            range: full_range.start..full_range.start,
-            text: format!("{{ {}", self.probe_text(tag)),
-        });
         self.updates
-            .push(SourceUpdate { range: full_range.end..full_range.end, text: " }".into() });
+            .push(SourceUpdate::open(full_range.start, format!("{{ {}", self.probe_text(tag))));
+        let close = match trailing {
+            Some(trailing) => format!(" }}{trailing}"),
+            None => " }".to_string(),
+        };
+        self.updates.push(SourceUpdate::close(full_range.end, close));
         self.record_probe(kind, stmt.span, range, tag);
     }
 
@@ -390,7 +417,7 @@ impl<'a> StatementCollector<'a> {
         };
         let insert_at = full_range.start + brace_offset + 1;
         let tag = self.make_tag(range.start);
-        self.updates.push(SourceUpdate { range: insert_at..insert_at, text: self.probe_text(tag) });
+        self.updates.push(SourceUpdate::point(insert_at, self.probe_text(tag)));
         self.record_probe(kind, block.span, range, tag);
     }
 
@@ -463,9 +490,26 @@ impl<'a> StatementCollector<'a> {
         stmt: &'ast ast::Stmt<'ast>,
         kind: InstrumentedCoverageProbeKind,
     ) -> ControlFlow<<Self as ast::Visit<'ast>>::BreakValue> {
+        self.visit_control_body_with_trailing(stmt, kind, None)
+    }
+
+    /// Like [`visit_control_body`](Self::visit_control_body), but appends `trailing` text
+    /// (e.g. a synthesized ` else { .. }`) immediately after the body's closing brace as part of
+    /// the same closing insertion. Fusing it into one insert keeps it bound to the enclosing
+    /// statement and correctly ordered against other scopes that close at the same offset.
+    fn visit_control_body_with_trailing<'ast>(
+        &mut self,
+        stmt: &'ast ast::Stmt<'ast>,
+        kind: InstrumentedCoverageProbeKind,
+        trailing: Option<String>,
+    ) -> ControlFlow<<Self as ast::Visit<'ast>>::BreakValue> {
         match &stmt.kind {
             StmtKind::Block(block) | StmtKind::UncheckedBlock(block) => {
                 self.push_block_entry_probe(block, kind);
+                if let Some(trailing) = trailing {
+                    let end = self.source_map.span_to_source(block.span).unwrap().data.end;
+                    self.updates.push(SourceUpdate::close(end, trailing));
+                }
                 self.visit_stmt(stmt)
             }
             StmtKind::DoWhile(..)
@@ -473,11 +517,11 @@ impl<'a> StatementCollector<'a> {
             | StmtKind::If(..)
             | StmtKind::Try(_)
             | StmtKind::While(..) => {
-                self.wrap_and_probe(stmt, kind);
+                self.wrap_and_probe(stmt, kind, trailing);
                 self.visit_stmt(stmt)
             }
             _ => {
-                self.wrap_and_probe(stmt, kind);
+                self.wrap_and_probe(stmt, kind, trailing);
                 if Self::is_require_stmt(stmt) {
                     self.visit_stmt(stmt)?;
                 }
@@ -528,11 +572,11 @@ impl<'a> StatementCollector<'a> {
             return;
         }
         let tag = self.make_tag(range.start);
-        self.updates.push(SourceUpdate {
-            range: range.start..range.start,
-            text: format!("__FoundryCoverage.sendHitReturn({tag}, ("),
-        });
-        self.updates.push(SourceUpdate { range: range.end..range.end, text: "))".into() });
+        self.updates.push(SourceUpdate::open(
+            range.start,
+            format!("__FoundryCoverage.sendHitReturn({tag}, ("),
+        ));
+        self.updates.push(SourceUpdate::close(range.end, "))"));
         self.record_probe(
             InstrumentedCoverageProbeKind::Branch { branch_id, path_id },
             span,
@@ -576,14 +620,14 @@ impl<'a> StatementCollector<'a> {
             let branch_id = self.next_branch_id();
             let true_tag = self.make_tag(range.start);
             let false_tag = self.make_tag(range.end);
-            self.updates.push(SourceUpdate {
-                range: range.start..range.start,
-                text: format!("(__FoundryCoverage.sendHitReturn({true_tag}, ("),
-            });
-            self.updates.push(SourceUpdate {
-                range: range.end..range.end,
-                text: format!(")) || __FoundryCoverage.sendHitReturn({false_tag}, false))"),
-            });
+            self.updates.push(SourceUpdate::open(
+                range.start,
+                format!("(__FoundryCoverage.sendHitReturn({true_tag}, ("),
+            ));
+            self.updates.push(SourceUpdate::close(
+                range.end,
+                format!(")) || __FoundryCoverage.sendHitReturn({false_tag}, false))"),
+            ));
             self.record_probe(
                 InstrumentedCoverageProbeKind::Branch { branch_id, path_id: 0 },
                 cond.span,
@@ -619,6 +663,35 @@ impl<'a> StatementCollector<'a> {
 struct SourceUpdate {
     range: Range<usize>,
     text: String,
+    edge: Edge,
+}
+
+impl SourceUpdate {
+    /// An insertion that opens a scope (e.g. `{` or a wrapping prefix) at `pos`.
+    fn open(pos: usize, text: impl Into<String>) -> Self {
+        Self { range: pos..pos, text: text.into(), edge: Edge::Open }
+    }
+
+    /// An insertion that closes a scope (e.g. `}` or a wrapping suffix) at `pos`.
+    fn close(pos: usize, text: impl Into<String>) -> Self {
+        Self { range: pos..pos, text: text.into(), edge: Edge::Close }
+    }
+
+    /// A standalone insertion (e.g. a statement probe) at `pos` that neither opens nor closes
+    /// a scope.
+    fn point(pos: usize, text: impl Into<String>) -> Self {
+        Self { range: pos..pos, text: text.into(), edge: Edge::Point }
+    }
+}
+
+/// Whether a [`SourceUpdate`] opens a scope, closes one, or is standalone. When several updates
+/// share a byte offset this determines their relative order so nested wrappers brace correctly:
+/// inner closes precede outer closes, outer opens precede inner opens, and closes precede opens.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Edge {
+    Close,
+    Point,
+    Open,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -701,9 +774,24 @@ impl<'ast> ast::Visit<'ast> for StatementCollector<'_> {
             StmtKind::If(condition, then_stmt, else_stmt) => {
                 self.visit_expr(condition)?;
                 let branch_id = self.next_branch_id();
-                self.visit_control_body(
+                // The implicit else (`path_id: 1`) for a bare `if` is fused onto the then-body's
+                // closing brace as a single insertion, so it binds to this `if` and orders
+                // correctly relative to enclosing scopes even for nested brace-less `if`s.
+                let implicit_else = else_stmt.is_none().then(|| {
+                    let then_range = self.source_map.span_to_source(then_stmt.span).unwrap().data;
+                    let tag = self.make_tag(then_range.end);
+                    self.record_probe(
+                        InstrumentedCoverageProbeKind::Branch { branch_id, path_id: 1 },
+                        then_stmt.span,
+                        then_range,
+                        tag,
+                    );
+                    format!(" else {{ {}}}", self.probe_text(tag))
+                });
+                self.visit_control_body_with_trailing(
                     then_stmt,
                     InstrumentedCoverageProbeKind::Branch { branch_id, path_id: 0 },
+                    implicit_else,
                 )?;
                 if let Some(else_stmt) = else_stmt {
                     self.visit_control_body(
@@ -1014,6 +1102,46 @@ contract C {
             count_kind(&probes, |k| matches!(k, InstrumentedCoverageProbeKind::Branch { .. })),
             0
         );
+    }
+
+    #[test]
+    fn bare_if_gets_implicit_else_branch() {
+        let (out, probes) = instrument(
+            r#"
+contract C {
+    function f(bool b) external pure returns (uint256 r) {
+        if (b) {
+            r = 1;
+        }
+    }
+}
+"#,
+        );
+        assert_reparses(&out);
+        // A bare `if` still yields two branch outcomes: then (path 0) and the synthesized
+        // else (path 1).
+        assert_eq!(branch_paths(&probes), vec![(0, 0), (0, 1)]);
+        assert!(out.contains(" else {"), "expected synthesized else in:\n{out}");
+    }
+
+    #[test]
+    fn nested_bare_if_does_not_create_dangling_else() {
+        // The inner `if` is a single-statement then-body of the outer `if`; both are bare.
+        // Each gets its own implicit else without producing `} else {} else {}`.
+        let (out, probes) = instrument(
+            r#"
+contract C {
+    function f(bool a, bool b) external pure returns (uint256 r) {
+        if (a)
+            if (b)
+                r = 1;
+    }
+}
+"#,
+        );
+        assert_reparses(&out);
+        // Two `if`s => two branches, two paths each.
+        assert_eq!(branch_paths(&probes), vec![(0, 0), (0, 1), (1, 0), (1, 1)]);
     }
 
     #[test]
