@@ -2,7 +2,7 @@
 
 use crate::{
     MultiContractRunner, TestFilter,
-    coverage::HitMaps,
+    coverage::{HitMaps, InstrumentedHitMaps},
     fuzz::{BaseCounterExample, FuzzTestResult},
     multi_runner::{
         FuzzMinimizeConfig, FuzzMinimizeMode, FuzzMinimizeObservation, LibraryDeployment,
@@ -3880,7 +3880,11 @@ impl<'a, FEN: FoundryEvmNetwork> FunctionRunner<'a, FEN> {
             result.gas_by_case.push((raw_call_result.gas_used, raw_call_result.stipend));
             result.logs.extend(raw_call_result.logs.clone());
             result.labels.extend(raw_call_result.labels.clone());
-            HitMaps::merge_opt(&mut result.line_coverage, raw_call_result.line_coverage.clone());
+            HitMaps::merge_opt(&mut result.line_coverage, raw_call_result.line_coverage.take());
+            InstrumentedHitMaps::merge_opt(
+                &mut result.instrumented_coverage,
+                raw_call_result.instrumented_coverage.take(),
+            );
 
             let is_success =
                 self.executor.is_raw_call_mut_success(self.address, &mut raw_call_result, false);
@@ -4617,6 +4621,7 @@ impl<'a, FEN: FoundryEvmNetwork> FunctionRunner<'a, FEN> {
         }
         // Merge coverage collected during invariant run with test setup coverage.
         self.result.merge_coverages(invariant_result.line_coverage);
+        self.result.merge_instrumented_coverages(invariant_result.instrumented_coverage);
 
         let mut counterexample = None;
         // Success requires zero predicate breaks *and* zero handler-side assertion bugs.

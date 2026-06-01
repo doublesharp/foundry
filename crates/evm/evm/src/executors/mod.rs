@@ -37,7 +37,7 @@ use foundry_evm_core::{
     },
     utils::StateChangeset,
 };
-use foundry_evm_coverage::HitMaps;
+use foundry_evm_coverage::{HitMaps, InstrumentedHitMaps};
 use foundry_evm_fuzz::ObservedCall;
 use foundry_evm_networks::NetworkConfigs;
 use foundry_evm_traces::{SparsedTraceArena, TraceRequirements};
@@ -1424,6 +1424,8 @@ pub struct RawCallResult<FEN: FoundryEvmNetwork = EthEvmNetwork> {
     pub debug_bytecodes: AddressHashMap<Bytes>,
     /// The line coverage info collected during the call
     pub line_coverage: Option<HitMaps>,
+    /// The instrumented coverage info collected during the call.
+    pub instrumented_coverage: Option<InstrumentedHitMaps>,
     /// The edge coverage info collected during the call
     pub edge_coverage: Option<EdgeCoverage>,
     /// EVM comparison operands collected during the call.
@@ -1475,6 +1477,7 @@ impl<FEN: FoundryEvmNetwork> Default for RawCallResult<FEN> {
             traces: None,
             debug_bytecodes: HashMap::default(),
             line_coverage: None,
+            instrumented_coverage: None,
             edge_coverage: None,
             evm_cmp_values: None,
             observed_calls: Vec::new(),
@@ -1751,6 +1754,7 @@ fn convert_executed_result<FEN: FoundryEvmNetwork, H: IntoInstructionResult>(
         labels,
         traces,
         line_coverage,
+        instrumented_coverage,
         edge_coverage,
         evm_cmp_values,
         mut cheatcodes,
@@ -1788,6 +1792,7 @@ fn convert_executed_result<FEN: FoundryEvmNetwork, H: IntoInstructionResult>(
         traces,
         debug_bytecodes,
         line_coverage,
+        instrumented_coverage,
         edge_coverage,
         evm_cmp_values,
         observed_calls,

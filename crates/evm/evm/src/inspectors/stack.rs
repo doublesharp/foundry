@@ -1,7 +1,7 @@
 use super::{
     Cheatcodes, CheatsConfig, ChiselState, CmpOperands, CustomPrintTracer, EdgeCovConfig,
-    EdgeCovInspector, EdgeCoverage, Fuzzer, LineCoverageCollector, LogCollector, RevertDiagnostic,
-    ScriptExecutionInspector, TempoLabels, TracingInspector,
+    EdgeCovInspector, EdgeCoverage, Fuzzer, InstrumentedCoverageCollector, LineCoverageCollector,
+    LogCollector, RevertDiagnostic, ScriptExecutionInspector, TempoLabels, TracingInspector,
 };
 use alloy_primitives::{
     Address, B256, Bytes, Log, TxKind, U256, keccak256,
@@ -24,7 +24,7 @@ use foundry_evm_core::{
     precompiles::P256_VERIFY,
     refresh_chain_journal,
 };
-use foundry_evm_coverage::HitMaps;
+use foundry_evm_coverage::{FOUNDRY_COVERAGE_ADDRESS, HitMaps, InstrumentedHitMaps};
 use foundry_evm_networks::{NetworkConfigs, arbitrum};
 use foundry_evm_traces::{SparsedTraceArena, TraceRequirements};
 use revm::{
@@ -80,6 +80,8 @@ pub struct InspectorStackBuilder<BLOCK: Clone> {
     pub logs: Option<bool>,
     /// Whether line coverage info should be collected.
     pub line_coverage: Option<bool>,
+    /// Whether instrumented coverage info should be collected.
+    pub instrumented_coverage: Option<bool>,
     /// Whether to print all opcode traces into the console. Useful for debugging the EVM.
     pub print: Option<bool>,
     /// The chisel state inspector.
@@ -113,6 +115,7 @@ impl<BLOCK: Clone> Default for InspectorStackBuilder<BLOCK> {
             trace_requirements: TraceRequirements::none(),
             logs: None,
             line_coverage: None,
+            instrumented_coverage: None,
             print: None,
             chisel_state: None,
             enable_isolation: false,
@@ -195,6 +198,13 @@ impl<BLOCK: Clone> InspectorStackBuilder<BLOCK> {
         self
     }
 
+    /// Set whether to collect instrumented coverage information.
+    #[inline]
+    pub const fn instrumented_coverage(mut self, yes: bool) -> Self {
+        self.instrumented_coverage = Some(yes);
+        self
+    }
+
     /// Set whether to enable the trace printer.
     #[inline]
     pub const fn print(mut self, yes: bool) -> Self {
@@ -260,6 +270,7 @@ impl<BLOCK: Clone> InspectorStackBuilder<BLOCK> {
             trace_requirements,
             logs,
             line_coverage,
+            instrumented_coverage,
             print,
             chisel_state,
             enable_isolation,
@@ -293,6 +304,7 @@ impl<BLOCK: Clone> InspectorStackBuilder<BLOCK> {
             stack.set_chisel(chisel_state);
         }
         stack.collect_line_coverage(line_coverage.unwrap_or(false));
+        stack.collect_instrumented_coverage(instrumented_coverage.unwrap_or(false));
         stack.collect_logs(logs);
         stack.print(print.unwrap_or(false));
         stack.tracing_requirements(trace_requirements);
@@ -345,6 +357,7 @@ pub struct InspectorData<FEN: FoundryEvmNetwork> {
     pub labels: AddressHashMap<String>,
     pub traces: Option<SparsedTraceArena>,
     pub line_coverage: Option<HitMaps>,
+    pub instrumented_coverage: Option<InstrumentedHitMaps>,
     pub edge_coverage: Option<EdgeCoverage>,
     pub evm_cmp_values: Option<Vec<CmpOperands>>,
     pub cheatcodes: Option<Box<Cheatcodes<FEN>>>,
@@ -435,6 +448,7 @@ pub struct InspectorStackInner {
     pub chisel_state: Option<Box<ChiselState>>,
     pub edge_coverage: Option<Box<EdgeCovInspector>>,
     pub fuzzer: Option<Box<Fuzzer>>,
+    pub instrumented_coverage: Option<Box<InstrumentedCoverageCollector>>,
     pub line_coverage: Option<Box<LineCoverageCollector>>,
     pub log_collector: Option<Box<LogCollector>>,
     pub printer: Option<Box<CustomPrintTracer>>,
@@ -707,6 +721,12 @@ impl<FEN: FoundryEvmNetwork> InspectorStack<FEN> {
         self.refresh_static_step_dispatch();
     }
 
+    /// Set whether to enable the instrumented coverage collector.
+    #[inline]
+    pub fn collect_instrumented_coverage(&mut self, yes: bool) {
+        self.instrumented_coverage = yes.then(Default::default);
+    }
+
     /// Set whether to enable the edge coverage collector with default config.
     #[inline]
     pub fn collect_edge_coverage(&mut self, yes: bool) {
@@ -840,6 +860,7 @@ impl<FEN: FoundryEvmNetwork> InspectorStack<FEN> {
             inner:
                 InspectorStackInner {
                     chisel_state,
+                    instrumented_coverage,
                     line_coverage,
                     edge_coverage,
                     log_collector,
@@ -890,6 +911,8 @@ impl<FEN: FoundryEvmNetwork> InspectorStack<FEN> {
             },
             traces,
             line_coverage: line_coverage.map(|line_coverage| line_coverage.finish()),
+            instrumented_coverage: instrumented_coverage
+                .map(|instrumented_coverage| instrumented_coverage.finish()),
             edge_coverage,
             evm_cmp_values,
             cheatcodes,
@@ -953,6 +976,13 @@ impl<FEN: FoundryEvmNetwork> InspectorStackRefMut<'_, FEN> {
         inputs: &CallInputs,
         outcome: &mut CallOutcome,
     ) {
+        if inputs.bytecode_address == FOUNDRY_COVERAGE_ADDRESS {
+            if let Some(inspector) = &mut self.instrumented_coverage {
+                inspector.call_end(ecx, inputs, outcome);
+            }
+            return;
+        }
+
         let storage_hook_active =
             self.cheatcodes.as_deref().is_some_and(Cheatcodes::is_storage_hook_active);
         if !storage_hook_active && let Some(fuzzer) = &mut self.fuzzer {
@@ -962,7 +992,13 @@ impl<FEN: FoundryEvmNetwork> InspectorStackRefMut<'_, FEN> {
         let result = outcome.result.result;
         call_inspectors!(
             #[ret]
-            [&mut self.tracer, &mut self.cheatcodes, &mut self.printer, &mut self.revert_diag],
+            [
+                &mut self.instrumented_coverage,
+                &mut self.tracer,
+                &mut self.cheatcodes,
+                &mut self.printer,
+                &mut self.revert_diag
+            ],
             |inspector| {
                 let previous_output = outcome.output().clone();
                 inspector.call_end(ecx, inputs, outcome);
@@ -991,7 +1027,13 @@ impl<FEN: FoundryEvmNetwork> InspectorStackRefMut<'_, FEN> {
         let result = outcome.result.result;
         call_inspectors!(
             #[ret]
-            [&mut self.line_coverage, &mut self.tracer, &mut self.cheatcodes, &mut self.printer],
+            [
+                &mut self.line_coverage,
+                &mut self.instrumented_coverage,
+                &mut self.tracer,
+                &mut self.cheatcodes,
+                &mut self.printer
+            ],
             |inspector| {
                 let previous_output = outcome.output().clone();
                 inspector.create_end(ecx, call, outcome);
@@ -1456,6 +1498,7 @@ impl<FEN: FoundryEvmNetwork> Inspector<FoundryContextFor<'_, FEN>>
 
         call_inspectors!(
             [
+                &mut self.instrumented_coverage,
                 &mut self.line_coverage,
                 &mut self.tracer,
                 &mut self.cheatcodes,
@@ -1666,6 +1709,7 @@ impl<FEN: FoundryEvmNetwork> Inspector<FoundryContextFor<'_, FEN>>
         call_inspectors!(
             #[ret]
             [
+                &mut self.instrumented_coverage,
                 &mut self.log_collector,
                 &mut self.printer,
                 &mut self.revert_diag,

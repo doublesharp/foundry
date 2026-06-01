@@ -456,6 +456,8 @@ pub struct TestRunnerConfig<FEN: FoundryEvmNetwork> {
 
     /// Whether to collect line coverage info
     pub line_coverage: bool,
+    /// Whether to collect source-instrumented coverage info.
+    pub instrumented_coverage: bool,
     /// Whether to collect debug info
     pub debug: bool,
     /// Whether to enable steps tracking in the tracer.
@@ -527,6 +529,7 @@ impl<FEN: FoundryEvmNetwork> TestRunnerConfig<FEN> {
         }
         inspector.tracing_requirements(self.trace_requirements());
         inspector.collect_line_coverage(self.line_coverage);
+        inspector.collect_instrumented_coverage(self.instrumented_coverage);
         inspector.enable_isolation(self.isolation);
         executor.set_spec_id(self.spec_id);
         executor.set_legacy_assertions(self.config.legacy_assertions);
@@ -557,6 +560,7 @@ impl<FEN: FoundryEvmNetwork> TestRunnerConfig<FEN> {
                     .cheatcodes(cheats_config)
                     .trace_requirements(self.trace_requirements())
                     .line_coverage(self.line_coverage)
+                    .instrumented_coverage(self.instrumented_coverage)
                     .enable_isolation(self.isolation)
                     .create2_deployer(self.evm_opts.create2_deployer)
                     .set_analysis(analysis)
@@ -597,6 +601,8 @@ pub struct MultiContractRunnerBuilder {
     pub inline_config: Arc<InlineConfig>,
     /// Whether or not to collect line coverage info
     pub line_coverage: bool,
+    /// Whether or not to collect source-instrumented coverage info.
+    pub instrumented_coverage: bool,
     /// Whether or not to collect debug info
     pub debug: bool,
     /// Whether to enable steps tracking in the tracer.
@@ -642,6 +648,7 @@ impl MultiContractRunnerBuilder {
             fork_chain_id: None,
             fork_hardfork: None,
             line_coverage: false,
+            instrumented_coverage: false,
             debug: false,
             isolation: false,
             decode_internal: Default::default(),
@@ -717,6 +724,11 @@ impl MultiContractRunnerBuilder {
 
     pub const fn set_coverage(mut self, enable: bool) -> Self {
         self.line_coverage = enable;
+        self
+    }
+
+    pub const fn set_instrumented_coverage(mut self, enable: bool) -> Self {
+        self.instrumented_coverage = enable;
         self
     }
 
@@ -939,6 +951,7 @@ impl MultiContractRunnerBuilder {
                 fork_hardfork: self.fork_hardfork,
                 sender: self.sender.unwrap_or(self.config.sender),
                 line_coverage: self.line_coverage,
+                instrumented_coverage: self.instrumented_coverage,
                 debug: self.debug,
                 decode_internal: self.decode_internal,
                 record_all_steps: self.record_all_steps,

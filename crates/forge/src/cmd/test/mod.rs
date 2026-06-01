@@ -511,6 +511,10 @@ pub struct TestArgs {
     #[command(flatten)]
     pub global: GlobalArgs,
 
+    /// Enable source-instrumented coverage collection.
+    #[arg(skip)]
+    pub instrumented_coverage: bool,
+
     /// The contract file you want to test, it's a shortcut for --match-path.
     #[arg(value_hint = ValueHint::FilePath)]
     pub path: Option<GlobMatcher>,
@@ -2146,6 +2150,7 @@ impl TestArgs {
             .enable_isolation(evm_opts.isolate)
             .fail_fast(self.fail_fast)
             .set_coverage(execution.coverage)
+            .set_instrumented_coverage(self.instrumented_coverage)
             .with_multi_network(execution.multi_network)
             .with_showmap(self.showmap_config()?)
             .with_fuzz_only(self.fuzz_only)

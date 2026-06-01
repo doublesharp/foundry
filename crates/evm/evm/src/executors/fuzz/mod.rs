@@ -22,7 +22,7 @@ use foundry_evm_core::{
     decode::{RevertDecoder, SkipReason},
     evm::FoundryEvmNetwork,
 };
-use foundry_evm_coverage::HitMaps;
+use foundry_evm_coverage::{HitMaps, InstrumentedHitMaps};
 use foundry_evm_fuzz::{
     BaseCounterExample, BasicTxDetails, CallDetails, CounterExample, FuzzCase, FuzzError,
     FuzzFixtures, FuzzRunMetadata, FuzzTestResult,
@@ -77,6 +77,8 @@ struct WorkerState<FEN: FoundryEvmNetwork> {
     breakpoints: Option<Breakpoints>,
     /// Coverage collected by this worker
     coverage: Option<HitMaps>,
+    /// Instrumented coverage collected by this worker
+    instrumented_coverage: Option<InstrumentedHitMaps>,
     /// Logs from all cases this worker ran
     logs: Vec<Log>,
     /// Deprecated cheatcodes seen by this worker
@@ -108,6 +110,7 @@ impl<FEN: FoundryEvmNetwork> WorkerState<FEN> {
             debug_bytecodes: HashMap::default(),
             breakpoints: None,
             coverage: None,
+            instrumented_coverage: None,
             logs: Vec::new(),
             deprecated_cheatcodes: HashMap::default(),
             runs: 0,
@@ -504,6 +507,7 @@ impl<FEN: FoundryEvmNetwork> FuzzedExecutor<FEN> {
                 traces: call.traces,
                 debug_bytecodes: call.debug_bytecodes,
                 coverage: call.line_coverage,
+                instrumented_coverage: call.instrumented_coverage,
                 breakpoints,
                 logs: call.logs,
                 deprecated_cheatcodes,
@@ -631,6 +635,10 @@ impl<FEN: FoundryEvmNetwork> FuzzedExecutor<FEN> {
             }
             result.gas_report_traces.extend(worker.traces.into_iter().map(|t| t.arena));
             HitMaps::merge_opt(&mut result.line_coverage, worker.coverage);
+            InstrumentedHitMaps::merge_opt(
+                &mut result.instrumented_coverage,
+                worker.instrumented_coverage,
+            );
             result.deprecated_cheatcodes.extend(worker.deprecated_cheatcodes);
         }
 
@@ -926,6 +934,10 @@ impl<FEN: FoundryEvmNetwork> FuzzedExecutor<FEN> {
                         }
 
                         HitMaps::merge_opt(&mut worker.coverage, case.coverage);
+                        InstrumentedHitMaps::merge_opt(
+                            &mut worker.instrumented_coverage,
+                            case.instrumented_coverage,
+                        );
                         worker.deprecated_cheatcodes = case.deprecated_cheatcodes;
                     }
                     FuzzOutcome::CounterExample(CounterExampleOutcome {

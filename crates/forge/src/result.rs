@@ -13,7 +13,7 @@ use foundry_common::{ContractsByArtifact, get_contract_name, shell};
 use foundry_config::{SymbolicConfig, SymbolicExplorationOrder, SymbolicStorageLayout};
 use foundry_evm::{
     core::{Breakpoints, evm::FoundryEvmNetwork},
-    coverage::HitMaps,
+    coverage::{HitMaps, InstrumentedHitMaps},
     decode::SkipReason,
     executors::{
         RawCallResult,
@@ -1331,6 +1331,10 @@ pub struct TestResult {
     #[serde(skip)]
     pub line_coverage: Option<HitMaps>,
 
+    /// Raw instrumented coverage info.
+    #[serde(skip)]
+    pub instrumented_coverage: Option<InstrumentedHitMaps>,
+
     /// Labeled addresses
     #[serde(rename = "labeled_addresses")] // Backwards compatibility.
     pub labels: AddressHashMap<String>,
@@ -1557,6 +1561,7 @@ macro_rules! extend {
         $a.traces.extend($b.traces.map(|traces| ($trace_kind, traces)));
         $a.debug_bytecodes.extend($b.debug_bytecodes);
         $a.merge_coverages($b.line_coverage);
+        $a.merge_instrumented_coverages($b.instrumented_coverage);
     };
 }
 
@@ -1606,6 +1611,7 @@ impl TestResult {
             debug_bytecodes: setup.debug_bytecodes.clone(),
             line_coverage: setup.coverage.clone(),
             fork_block_number: setup.fork_block_number,
+            instrumented_coverage: setup.instrumented_coverage.clone(),
             ..Default::default()
         }
     }
@@ -1624,6 +1630,7 @@ impl TestResult {
             traces: setup.traces,
             debug_bytecodes: setup.debug_bytecodes,
             line_coverage: setup.coverage,
+            instrumented_coverage: setup.instrumented_coverage,
             labels: setup.labels,
             fork_block_number: setup.fork_block_number,
             ..Default::default()
@@ -1901,6 +1908,11 @@ impl TestResult {
     pub fn merge_coverages(&mut self, other_coverage: Option<HitMaps>) {
         HitMaps::merge_opt(&mut self.line_coverage, other_coverage);
     }
+
+    /// Merges the given instrumented coverage result into `self`.
+    pub fn merge_instrumented_coverages(&mut self, other_coverage: Option<InstrumentedHitMaps>) {
+        InstrumentedHitMaps::merge_opt(&mut self.instrumented_coverage, other_coverage);
+    }
 }
 
 /// Data report by a test.
@@ -2130,6 +2142,8 @@ pub struct TestSetup {
     pub debug_bytecodes: AddressHashMap<Bytes>,
     /// Coverage info during setup.
     pub coverage: Option<HitMaps>,
+    /// Instrumented coverage info during setup.
+    pub instrumented_coverage: Option<InstrumentedHitMaps>,
     /// Addresses of external libraries deployed during setup.
     pub deployed_libs: Vec<Address>,
     /// The active fork's block number after setup, if any.
@@ -2164,6 +2178,10 @@ impl TestSetup {
 
     pub fn merge_coverages(&mut self, other_coverage: Option<HitMaps>) {
         HitMaps::merge_opt(&mut self.coverage, other_coverage);
+    }
+
+    pub fn merge_instrumented_coverages(&mut self, other_coverage: Option<InstrumentedHitMaps>) {
+        InstrumentedHitMaps::merge_opt(&mut self.instrumented_coverage, other_coverage);
     }
 }
 
