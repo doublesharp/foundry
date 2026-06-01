@@ -448,6 +448,9 @@ pub struct InspectorStackInner {
     pub chisel_state: Option<Box<ChiselState>>,
     pub edge_coverage: Option<Box<EdgeCovInspector>>,
     pub fuzzer: Option<Box<Fuzzer>>,
+    /// Collects source-instrumented coverage. Must be listed before `tracer` in the inspector
+    /// call lists so it intercepts (and hides) the sentinel probe call before the tracer would
+    /// record it as a real subcall.
     pub instrumented_coverage: Option<Box<InstrumentedCoverageCollector>>,
     pub line_coverage: Option<Box<LineCoverageCollector>>,
     pub log_collector: Option<Box<LogCollector>>,
@@ -979,6 +982,12 @@ impl<FEN: FoundryEvmNetwork> InspectorStackRefMut<'_, FEN> {
         if inputs.bytecode_address == FOUNDRY_COVERAGE_ADDRESS {
             if let Some(inspector) = &mut self.instrumented_coverage {
                 inspector.call_end(ecx, inputs, outcome);
+            }
+            // The coverage probe must stay invisible to the tracer, so the normal `call_end`
+            // fan-out is skipped. The fuzzer's `call` ran for this frame, so balance it with its
+            // `call_end` to keep its per-call state (e.g. override depth) consistent.
+            if let Some(fuzzer) = &mut self.fuzzer {
+                fuzzer.call_end(ecx, inputs, outcome);
             }
             return;
         }

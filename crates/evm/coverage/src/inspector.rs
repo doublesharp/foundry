@@ -4,8 +4,8 @@ use revm::{
     Inspector,
     context::{ContextTr, JournalTr},
     interpreter::{
-        CallInputs, CallOutcome, CreateInputs, CreateOutcome, Gas, InstructionResult, Interpreter,
-        InterpreterResult, interpreter_types::Jumps,
+        CallInputs, CallOutcome, CallScheme, CreateInputs, CreateOutcome, Gas, InstructionResult,
+        Interpreter, InterpreterResult, interpreter_types::Jumps,
     },
 };
 use std::ptr::NonNull;
@@ -154,8 +154,12 @@ impl InstrumentedCoverageCollector {
         self.hits
     }
 
+    /// Returns `true` if `inputs` is a coverage probe call: a `STATICCALL` to the sentinel
+    /// address. Restricting to `STATICCALL` (which cannot transfer value) avoids hijacking an
+    /// unrelated `CALL`/`DELEGATECALL` that happens to target the sentinel address.
     fn is_coverage_call(inputs: &CallInputs) -> bool {
         inputs.bytecode_address == FOUNDRY_COVERAGE_ADDRESS
+            && inputs.scheme == CallScheme::StaticCall
     }
 
     fn frame_depth<CTX: ContextTr>(context: &CTX) -> usize {
@@ -191,10 +195,9 @@ impl<CTX: ContextTr> Inspector<CTX> for InstrumentedCoverageCollector {
             return None;
         }
 
+        // The probe forwards exactly the 32-byte tag as calldata; anything else is not ours.
         let input = inputs.input.bytes(context);
-        if input.len() >= 36 {
-            self.hits.hit(B256::from_slice(&input[4..36]));
-        } else if input.len() >= 32 {
+        if input.len() == 32 {
             self.hits.hit(B256::from_slice(&input[..32]));
         }
 

@@ -193,7 +193,9 @@ impl CoverageInstrumentationPreprocessor {
                 .insert(PathBuf::from(COVERAGE_LIBRARY_PATH), Source::new(COVERAGE_LIBRARY_SOURCE));
         }
 
-        self.metadata.lock().expect("coverage metadata lock poisoned").probes.extend(probes);
+        // Recover from a poisoned lock rather than aborting the whole build: a panic while
+        // instrumenting one source should not discard coverage for the rest.
+        self.metadata.lock().unwrap_or_else(|e| e.into_inner()).probes.extend(probes);
         Ok(())
     }
 
@@ -425,12 +427,16 @@ impl<'a> StatementCollector<'a> {
         let full_range = self.source_map.span_to_source(stmt.span).unwrap().data;
         let branch_id = self.next_branch_id();
 
-        // Body-entry probe and the require pre-probe both go just inside the opening brace.
-        let body_tag = self.make_tag(range.start);
+        // Emit a distinct body-entry probe only for a branch body (e.g. an `if` then/else path).
+        // For a plain statement body (a loop body), the require's own pre-probe already marks the
+        // statement at the same source range, so a separate statement probe would double-count it.
+        let body_tag = matches!(kind, InstrumentedCoverageProbeKind::Branch { .. })
+            .then(|| self.make_tag(range.start));
         let pre_tag = self.make_tag(range.start);
+        let body_probe = body_tag.map(|tag| self.probe_text(tag)).unwrap_or_default();
         self.updates.push(SourceUpdate::open(
             full_range.start,
-            format!("{{ {}{}", self.probe_text(body_tag), self.probe_text(pre_tag)),
+            format!("{{ {body_probe}{}", self.probe_text(pre_tag)),
         ));
         // Require post-probe and the closing brace (plus any trailing `else`).
         let post_tag = self.make_tag(range.end);
@@ -440,7 +446,9 @@ impl<'a> StatementCollector<'a> {
         };
         self.updates.push(SourceUpdate::close(full_range.end, close));
 
-        self.record_probe(kind, stmt.span, range.clone(), body_tag);
+        if let Some(body_tag) = body_tag {
+            self.record_probe(kind, stmt.span, range.clone(), body_tag);
+        }
         self.record_probe(
             InstrumentedCoverageProbeKind::RequirePre { branch_id },
             stmt.span,
@@ -1065,7 +1073,7 @@ impl<'ast> ast::Visit<'ast> for StatementCollector<'_> {
 pub fn read_metadata(
     metadata: &InstrumentedCoverageMetadataRef,
 ) -> Result<InstrumentedCoverageMetadata> {
-    Ok(metadata.lock().expect("coverage metadata lock poisoned").clone())
+    Ok(metadata.lock().unwrap_or_else(|e| e.into_inner()).clone())
 }
 
 #[cfg(test)]
