@@ -5151,3 +5151,138 @@ Ran 1 test suite [ELAPSED]: 1 tests passed, 0 failed, 0 skipped (1 total tests)
 
 "#]]);
 });
+
+// Adversarial: the coverage probe (a sentinel staticcall) must not disturb the contract's view
+// of RETURNDATASIZE / RETURNDATACOPY. A probed statement is placed between an external call and a
+// returndata read; the decoded values and returndatasize must be exactly what the real call left,
+// including an empty buffer after a call to an account with no code.
+forgetest!(instrumented_preserves_returndata, |prj, cmd| {
+    prj.add_source(
+        "RetData.sol",
+        r#"
+contract Returner {
+    function get() external pure returns (uint256, uint256) {
+        return (111, 222);
+    }
+}
+
+contract RetData {
+    Returner r = new Returner();
+    uint256 public marker;
+
+    function callThenDecode() external returns (uint256 a, uint256 b) {
+        (bool ok, bytes memory data) = address(r).staticcall(abi.encodeWithSignature("get()"));
+        require(ok, "call failed");
+        marker = 7;
+        (a, b) = abi.decode(data, (uint256, uint256));
+    }
+
+    function emptyAccountReturndata() external returns (uint256 size) {
+        (bool ok,) = address(0xdead).staticcall("");
+        require(ok);
+        marker = 9;
+        assembly {
+            size := returndatasize()
+        }
+    }
+}
+"#,
+    );
+    prj.add_test(
+        "RetDataTest.sol",
+        r#"
+import {RetData} from "../src/RetData.sol";
+
+contract RetDataTest {
+    RetData c = new RetData();
+
+    function testReturndataIntact() external {
+        (uint256 a, uint256 b) = c.callThenDecode();
+        require(a == 111 && b == 222, "returndata corrupted by probe");
+        require(c.emptyAccountReturndata() == 0, "stale returndata after empty-account call");
+    }
+}
+"#,
+    );
+
+    cmd.arg("coverage")
+        .args(["--instrumented", "--exclude-tests", "--mt", "testReturndataIntact"])
+        .assert_success()
+        .stdout_eq(str![[r#"
+[COMPILING_FILES] with [SOLC_VERSION]
+[SOLC_VERSION] [ELAPSED]
+Compiler run successful!
+Analysing contracts...
+Running tests...
+
+Ran 1 test for test/RetDataTest.sol:RetDataTest
+[PASS] testReturndataIntact() ([GAS])
+Suite result: ok. 1 passed; 0 failed; 0 skipped; [ELAPSED]
+
+Ran 1 test suite [ELAPSED]: 1 tests passed, 0 failed, 0 skipped (1 total tests)
+
+╭-----------------+-----------------+-----------------+--------------+---------------╮
+| File            | % Lines         | % Statements    | % Branches   | % Funcs       |
++====================================================================================+
+| src/RetData.sol | 100.00% (13/13) | 100.00% (10/10) | 50.00% (2/4) | 100.00% (3/3) |
+|-----------------+-----------------+-----------------+--------------+---------------|
+| Total           | 100.00% (13/13) | 100.00% (10/10) | 50.00% (2/4) | 100.00% (3/3) |
+╰-----------------+-----------------+-----------------+--------------+---------------╯
+
+"#]]);
+});
+
+// Regression: a `require` used as the brace-less body of a control statement must compile under
+// `--instrumented` (previously the synthesized braces detached and the file failed to build) and
+// the guarded `require`'s line must not be double-counted in the LCOV `DA` magnitude.
+forgetest!(instrumented_braceless_require_body, |prj, cmd| {
+    prj.add_source(
+        "Target.sol",
+        r#"
+contract Target {
+    function guardIf(bool a, uint256 x) external pure returns (uint256) {
+        if (a) require(x > 0, "e");
+        return x;
+    }
+
+    function guardLoop(uint256 n) external pure returns (uint256 i) {
+        for (i = 0; i < n; i++) require(i < n, "e");
+    }
+}
+"#,
+    );
+    prj.add_test(
+        "TargetTest.sol",
+        r#"
+import {Target} from "../src/Target.sol";
+
+contract TargetTest {
+    Target t = new Target();
+
+    function testGuards() external view {
+        require(t.guardIf(true, 5) == 5);
+        require(t.guardIf(false, 5) == 5);
+        require(t.guardLoop(2) == 2);
+    }
+}
+"#,
+    );
+
+    // Compiles and runs (the file used to fail to build); coverage is produced.
+    cmd.arg("coverage")
+        .args(["--instrumented", "--exclude-tests", "--mt", "testGuards", "--report=lcov"])
+        .assert_success();
+
+    // The `require` inside the loop (line 11) runs twice; its line must report 2 hits, not 4
+    // (no double count from a redundant body statement probe).
+    let lcov = prj.root().join("lcov.info");
+    let content = std::fs::read_to_string(&lcov).unwrap();
+    assert!(
+        content.contains("DA:11,2"),
+        "expected the loop-guarded require line to report 2 hits, got:\n{content}"
+    );
+    assert!(
+        !content.contains("DA:11,4"),
+        "loop-guarded require line was double-counted, got:\n{content}"
+    );
+});
