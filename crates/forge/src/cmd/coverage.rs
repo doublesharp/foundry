@@ -101,7 +101,12 @@ pub struct CoverageArgs {
     #[arg(long)]
     ir_minimum: bool,
 
-    /// Use source instrumentation for line and statement coverage.
+    /// Collect coverage by instrumenting sources before compilation instead of from source maps.
+    ///
+    /// Probes are injected into the source and recorded at runtime, so line, statement, branch,
+    /// and function coverage stay accurate even when the optimizer or `viaIR` is enabled. Unlike
+    /// the default mode, this respects the project's optimizer and `viaIR` settings rather than
+    /// disabling them, letting coverage reflect the build you actually ship.
     #[arg(long)]
     instrumented: bool,
 
@@ -518,110 +523,7 @@ impl CoverageArgs {
 
         let mut by_version = HashMap::<Version, Vec<(u32, Vec<CoverageItem>)>>::default();
         for ((version, source_id), probes) in &grouped {
-            let mut items = Vec::new();
-            let mut line_ranges = BTreeSet::new();
-            let mut statement_ranges = BTreeSet::new();
-            let mut branch_paths = BTreeSet::new();
-            let mut function_ranges = BTreeSet::new();
-            for probe in probes {
-                if line_ranges.insert((probe.lines.start, probe.lines.end)) {
-                    items.push(CoverageItem {
-                        kind: CoverageItemKind::Line,
-                        loc: SourceLocation {
-                            source_id: *source_id as usize,
-                            contract_name: probe.contract_name.clone().into(),
-                            bytes: probe.bytes.clone(),
-                            lines: probe.lines.clone(),
-                        },
-                        hits: 0,
-                    });
-                }
-                match &probe.kind {
-                    InstrumentedCoverageProbeKind::Statement => {
-                        if statement_ranges.insert((probe.bytes.start, probe.bytes.end)) {
-                            items.push(CoverageItem {
-                                kind: CoverageItemKind::Statement,
-                                loc: SourceLocation {
-                                    source_id: *source_id as usize,
-                                    contract_name: probe.contract_name.clone().into(),
-                                    bytes: probe.bytes.clone(),
-                                    lines: probe.lines.clone(),
-                                },
-                                hits: 0,
-                            });
-                        }
-                    }
-                    InstrumentedCoverageProbeKind::Branch { branch_id, path_id } => {
-                        if branch_paths.insert((*branch_id, *path_id)) {
-                            items.push(CoverageItem {
-                                kind: CoverageItemKind::Branch {
-                                    branch_id: *branch_id,
-                                    path_id: *path_id,
-                                    is_first_opcode: true,
-                                },
-                                loc: SourceLocation {
-                                    source_id: *source_id as usize,
-                                    contract_name: probe.contract_name.clone().into(),
-                                    bytes: probe.bytes.clone(),
-                                    lines: probe.lines.clone(),
-                                },
-                                hits: 0,
-                            });
-                        }
-                    }
-                    InstrumentedCoverageProbeKind::RequirePre { branch_id }
-                    | InstrumentedCoverageProbeKind::RequirePost { branch_id } => {
-                        if matches!(probe.kind, InstrumentedCoverageProbeKind::RequirePre { .. })
-                            && statement_ranges.insert((probe.bytes.start, probe.bytes.end))
-                        {
-                            items.push(CoverageItem {
-                                kind: CoverageItemKind::Statement,
-                                loc: SourceLocation {
-                                    source_id: *source_id as usize,
-                                    contract_name: probe.contract_name.clone().into(),
-                                    bytes: probe.bytes.clone(),
-                                    lines: probe.lines.clone(),
-                                },
-                                hits: 0,
-                            });
-                        }
-
-                        for path_id in [0, 1] {
-                            if branch_paths.insert((*branch_id, path_id)) {
-                                items.push(CoverageItem {
-                                    kind: CoverageItemKind::Branch {
-                                        branch_id: *branch_id,
-                                        path_id,
-                                        is_first_opcode: false,
-                                    },
-                                    loc: SourceLocation {
-                                        source_id: *source_id as usize,
-                                        contract_name: probe.contract_name.clone().into(),
-                                        bytes: probe.bytes.clone(),
-                                        lines: probe.lines.clone(),
-                                    },
-                                    hits: 0,
-                                });
-                            }
-                        }
-                    }
-                    InstrumentedCoverageProbeKind::Function { name } => {
-                        if function_ranges.insert((probe.bytes.start, probe.bytes.end)) {
-                            items.push(CoverageItem {
-                                kind: CoverageItemKind::Function { name: name.clone() },
-                                loc: SourceLocation {
-                                    source_id: *source_id as usize,
-                                    contract_name: probe.contract_name.clone().into(),
-                                    bytes: probe.bytes.clone(),
-                                    lines: probe.lines.clone(),
-                                },
-                                hits: 0,
-                            });
-                        }
-                    }
-                }
-            }
-            items.sort();
+            let items = build_source_items(*source_id, probes);
             by_version.entry(version.clone()).or_default().push((*source_id, items));
         }
 
@@ -926,6 +828,98 @@ struct InstrumentedRequireBranchHits {
 
 #[derive(Clone, Debug, Default)]
 struct InstrumentedCoverageTagIndex(B256HashMap<InstrumentedCoverageItemIds>);
+
+/// Builds a [`CoverageItem`] of `kind` located at `probe`'s source range.
+fn make_item(
+    source_id: u32,
+    probe: &InstrumentedCoverageProbe,
+    kind: CoverageItemKind,
+) -> CoverageItem {
+    CoverageItem {
+        kind,
+        loc: SourceLocation {
+            source_id: source_id as usize,
+            contract_name: probe.contract_name.clone().into(),
+            bytes: probe.bytes.clone(),
+            lines: probe.lines.clone(),
+        },
+        hits: 0,
+    }
+}
+
+/// Converts the probes of a single source into deduplicated [`CoverageItem`]s.
+///
+/// A line item is created once per source line; statements and functions once per source range;
+/// branches once per `(branch_id, path_id)`. A `require` contributes a statement (from its pre
+/// probe) plus the two branch paths it guards.
+fn build_source_items(source_id: u32, probes: &[&InstrumentedCoverageProbe]) -> Vec<CoverageItem> {
+    let mut items = Vec::new();
+    let mut line_ranges = BTreeSet::new();
+    let mut statement_ranges = BTreeSet::new();
+    let mut branch_paths = BTreeSet::new();
+    let mut function_ranges = BTreeSet::new();
+
+    for probe in probes {
+        if line_ranges.insert((probe.lines.start, probe.lines.end)) {
+            items.push(make_item(source_id, probe, CoverageItemKind::Line));
+        }
+        match &probe.kind {
+            InstrumentedCoverageProbeKind::Statement => {
+                if statement_ranges.insert((probe.bytes.start, probe.bytes.end)) {
+                    items.push(make_item(source_id, probe, CoverageItemKind::Statement));
+                }
+            }
+            InstrumentedCoverageProbeKind::Branch { branch_id, path_id } => {
+                if branch_paths.insert((*branch_id, *path_id)) {
+                    items.push(make_item(
+                        source_id,
+                        probe,
+                        CoverageItemKind::Branch {
+                            branch_id: *branch_id,
+                            path_id: *path_id,
+                            is_first_opcode: true,
+                        },
+                    ));
+                }
+            }
+            InstrumentedCoverageProbeKind::RequirePre { branch_id }
+            | InstrumentedCoverageProbeKind::RequirePost { branch_id } => {
+                // Only the pre probe carries the statement; both pre and post map to the same
+                // two branch paths (false = 0, true = 1).
+                if matches!(probe.kind, InstrumentedCoverageProbeKind::RequirePre { .. })
+                    && statement_ranges.insert((probe.bytes.start, probe.bytes.end))
+                {
+                    items.push(make_item(source_id, probe, CoverageItemKind::Statement));
+                }
+                for path_id in [0, 1] {
+                    if branch_paths.insert((*branch_id, path_id)) {
+                        items.push(make_item(
+                            source_id,
+                            probe,
+                            CoverageItemKind::Branch {
+                                branch_id: *branch_id,
+                                path_id,
+                                is_first_opcode: false,
+                            },
+                        ));
+                    }
+                }
+            }
+            InstrumentedCoverageProbeKind::Function { name } => {
+                if function_ranges.insert((probe.bytes.start, probe.bytes.end)) {
+                    items.push(make_item(
+                        source_id,
+                        probe,
+                        CoverageItemKind::Function { name: name.clone() },
+                    ));
+                }
+            }
+        }
+    }
+
+    items.sort();
+    items
+}
 
 fn add_instrumented_hits(
     report: &mut CoverageReport,
