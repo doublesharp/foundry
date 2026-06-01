@@ -646,6 +646,88 @@ contract AContractTest is DSTest {
 | Total             | 100.00% (2/2) | 100.00% (1/1) | 100.00% (2/2) | 100.00% (1/1) |
 ╰-------------------+---------------+---------------+---------------+---------------╯
 
+    "#]]);
+});
+
+forgetest!(instrumented_require_and_assembly, |prj, cmd| {
+    prj.add_source(
+        "AContract.sol",
+        r#"
+contract AContract {
+    function guarded(uint256 value) external pure returns (uint256) {
+        require(value > 1, "small");
+        return value;
+    }
+
+    function addFive(uint256 value) external pure returns (uint256 result) {
+        assembly {
+            result := add(value, 5)
+        }
+    }
+
+    function choose(bool flag) external pure returns (uint256) {
+        return flag ? 1 : 2;
+    }
+
+    function either(bool left, bool right) external pure returns (bool) {
+        return left || right;
+    }
+}
+    "#,
+    );
+
+    prj.add_test(
+        "AContractTest.sol",
+        r#"
+import {AContract} from "../src/AContract.sol";
+
+interface Vm {
+    function expectRevert(bytes calldata revertData) external;
+}
+
+contract AContractTest {
+    Vm constant vm = Vm(address(uint160(uint256(keccak256("hevm cheat code")))));
+    AContract a = new AContract();
+
+    function testRequireHappyPath() external {
+        require(a.guarded(2) == 2);
+    }
+
+    function testRequireRevertPath() external {
+        vm.expectRevert(bytes("small"));
+        a.guarded(1);
+    }
+
+    function testAssemblyStatement() external {
+        require(a.addFive(7) == 12);
+    }
+
+    function testTernaryBothPaths() external {
+        require(a.choose(true) == 1);
+        require(a.choose(false) == 2);
+    }
+
+    function testLogicalOrBothPaths() external {
+        require(a.either(true, false));
+        require(a.either(false, true));
+    }
+}
+    "#,
+    );
+
+    cmd.arg("coverage")
+        .args(["--instrumented", "--ir-minimum", "--exclude-tests"])
+        .assert_success()
+        .stdout_eq(str![[r#"
+...
+╭-------------------+---------------+---------------+---------------+---------------╮
+| File              | % Lines       | % Statements  | % Branches    | % Funcs       |
++===================================================================================+
+| src/AContract.sol | 100.00% (9/9) | 100.00% (5/5) | 100.00% (2/2) | 100.00% (4/4) |
+|-------------------+---------------+---------------+---------------+---------------|
+| Total             | 100.00% (9/9) | 100.00% (5/5) | 100.00% (2/2) | 100.00% (4/4) |
+╰-------------------+---------------+---------------+---------------+---------------╯
+
 "#]]);
 });
 

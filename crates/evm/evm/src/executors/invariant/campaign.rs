@@ -301,10 +301,7 @@ fn fold_outputs(outputs: Vec<InvariantWorkerOutput>) -> Result<InvariantFuzzTest
         }
         gas_report_traces.extend(result.gas_report_traces);
         HitMaps::merge_opt(&mut line_coverage, result.line_coverage);
-        InstrumentedHitMaps::merge_opt(
-            &mut instrumented_coverage,
-            result.instrumented_coverage,
-        );
+        InstrumentedHitMaps::merge_opt(&mut instrumented_coverage, result.instrumented_coverage);
         merge_metrics(&mut metrics, result.metrics);
         merge_optimization(
             &mut optimization_best,

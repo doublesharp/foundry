@@ -1528,8 +1528,7 @@ impl<'a, FEN: FoundryEvmNetwork> InvariantExecutor<'a, FEN> {
                 );
             }
             invariant_test.merge_line_coverage(current_run.line_coverage.take());
-            invariant_test
-                .merge_instrumented_coverage(current_run.instrumented_coverage.take());
+            invariant_test.merge_instrumented_coverage(current_run.instrumented_coverage.take());
             for fuzz_run in &current_run.fuzz_runs {
                 campaign_state.record_call(fuzz_run.gas);
             }
