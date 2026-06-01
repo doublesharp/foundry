@@ -11,7 +11,9 @@ use foundry_compilers::{
 };
 use semver::Version;
 use solar::{
-    ast::{self, BinOpKind, ExprKind, FunctionKind, ItemKind, StateMutability, StmtKind, Visit},
+    ast::{
+        self, BinOpKind, ExprKind, FunctionKind, ItemKind, StateMutability, StmtKind, Visit, yul,
+    },
     data_structures::Never,
     interface::{BytePos, Span},
     parse::interface::SourceMap,
@@ -421,6 +423,35 @@ impl<'a> StatementCollector<'a> {
         self.record_probe(kind, block.span, range, tag);
     }
 
+    /// Inserts a Yul coverage probe immediately before the Yul statement at `span` and records a
+    /// probe of `kind` for it.
+    fn push_yul_stmt_probe(&mut self, span: Span, kind: InstrumentedCoverageProbeKind) {
+        let range = self.source_map.span_to_source(span).unwrap().data;
+        if range.is_empty() {
+            return;
+        }
+        let tag = self.make_tag(range.start);
+        self.updates.push(SourceUpdate::point(range.start, self.yul_probe_text(tag)));
+        self.record_probe(kind, span, range, tag);
+    }
+
+    /// Inserts a Yul coverage probe just inside the opening brace of a Yul block (e.g. an `if`
+    /// body or a `switch` case body) and records a probe of `kind`.
+    fn push_yul_block_entry_probe(
+        &mut self,
+        block: &yul::Block<'_>,
+        kind: InstrumentedCoverageProbeKind,
+    ) {
+        let range = self.source_map.span_to_source(block.span).unwrap().data;
+        let Some(brace_offset) = self.source[range.clone()].find('{') else {
+            return;
+        };
+        let insert_at = range.start + brace_offset + 1;
+        let tag = self.make_tag(range.start);
+        self.updates.push(SourceUpdate::point(insert_at, self.yul_probe_text(tag)));
+        self.record_probe(kind, block.span, range, tag);
+    }
+
     fn record_probe(
         &mut self,
         kind: InstrumentedCoverageProbeKind,
@@ -448,6 +479,19 @@ impl<'a> StatementCollector<'a> {
             ),
             ProbeMode::Library => format!("__FoundryCoverage.sendHit({tag}); "),
         }
+    }
+
+    /// A coverage probe emitted *inside* an `assembly` block, as a self-contained Yul block.
+    ///
+    /// The scratch slot `0x00` is saved into a uniquely-named local and restored afterwards, so
+    /// the surrounding (memory-safe) assembly is unaffected; the probe writes the tag there only
+    /// long enough to forward it to the sentinel via `staticcall`. The wrapping `{ }` scopes the
+    /// temporary so it cannot collide with user variables or leak into later statements.
+    fn yul_probe_text(&self, tag: B256) -> String {
+        let slot = self.next_probe;
+        format!(
+            "{{ let _cov{slot} := mload(0x00) mstore(0x00, {tag}) pop(staticcall(gas(), 0xc0bEc0BEc0BeC0bEC0beC0bEC0bEC0beC0beC0BE, 0x00, 0x20, 0x00, 0x00)) mstore(0x00, _cov{slot}) }} "
+        )
     }
 
     fn trim_statement_span(&self, mut span: Span) -> Range<usize> {
@@ -536,6 +580,17 @@ impl<'a> StatementCollector<'a> {
     ) -> ControlFlow<<Self as ast::Visit<'ast>>::BreakValue> {
         for stmt in block.stmts.iter() {
             self.visit_stmt(stmt)?;
+        }
+        ControlFlow::Continue(())
+    }
+
+    /// Visits each statement of a Yul block so it can be instrumented.
+    fn visit_yul_block<'ast>(
+        &mut self,
+        block: &'ast yul::Block<'ast>,
+    ) -> ControlFlow<<Self as ast::Visit<'ast>>::BreakValue> {
+        for stmt in block.stmts.iter() {
+            self.visit_yul_stmt(stmt)?;
         }
         ControlFlow::Continue(())
     }
@@ -745,8 +800,20 @@ impl<'ast> ast::Visit<'ast> for StatementCollector<'_> {
 
     fn visit_stmt(&mut self, stmt: &'ast ast::Stmt<'ast>) -> ControlFlow<Self::BreakValue> {
         match &stmt.kind {
-            StmtKind::Break | StmtKind::Assembly(_) | StmtKind::Continue => {
+            StmtKind::Break | StmtKind::Continue => {
                 self.push_probe(stmt.span);
+                ControlFlow::Continue(())
+            }
+            StmtKind::Assembly(assembly) => {
+                // Count the `assembly { .. }` block itself as one statement (for the line).
+                self.push_probe(stmt.span);
+                // Descend into the Yul to instrument each inner statement and branch, but only in
+                // `Direct` (non-pure) functions: the Yul probe issues a `staticcall`, which reads
+                // the environment and is therefore rejected inside a `pure` function. In `pure`
+                // and modifier contexts the assembly stays a single statement.
+                if matches!(self.probe_mode, ProbeMode::Direct) {
+                    self.visit_yul_block(&assembly.block)?;
+                }
                 ControlFlow::Continue(())
             }
             StmtKind::DeclSingle(_)
@@ -851,6 +918,66 @@ impl<'ast> ast::Visit<'ast> for StatementCollector<'_> {
             }
             // Not a branch on its own; descend so any nested logical/ternary operands are found.
             _ => self.walk_expr(expr),
+        }
+    }
+
+    fn visit_yul_stmt(&mut self, stmt: &'ast yul::Stmt<'ast>) -> ControlFlow<Self::BreakValue> {
+        use yul::StmtKind as Yul;
+        match &stmt.kind {
+            // Simple statements: count each one and insert a probe before it.
+            Yul::VarDecl(..)
+            | Yul::AssignSingle(..)
+            | Yul::AssignMulti(..)
+            | Yul::Expr(_)
+            | Yul::Leave
+            | Yul::Break
+            | Yul::Continue => {
+                self.push_yul_stmt_probe(stmt.span, InstrumentedCoverageProbeKind::Statement);
+                ControlFlow::Continue(())
+            }
+            // `if cond { body }`: a one-sided branch, probed at the body's entry.
+            Yul::If(_, body) => {
+                let branch_id = self.next_branch_id();
+                self.push_yul_block_entry_probe(
+                    body,
+                    InstrumentedCoverageProbeKind::Branch { branch_id, path_id: 0 },
+                );
+                self.visit_yul_block(body)
+            }
+            // `switch`: each case body (including default) is a branch path.
+            Yul::Switch(switch) => {
+                let branch_id = self.next_branch_id();
+                for (path_id, case) in switch.cases.iter().enumerate() {
+                    self.push_yul_block_entry_probe(
+                        &case.body,
+                        InstrumentedCoverageProbeKind::Branch {
+                            branch_id,
+                            path_id: path_id as u32,
+                        },
+                    );
+                    self.visit_yul_block(&case.body)?;
+                }
+                ControlFlow::Continue(())
+            }
+            // `for { init } cond { step } { body }`: probe the body entry as a statement; recurse
+            // into init/step/body so their inner statements are instrumented too.
+            Yul::For(for_) => {
+                self.visit_yul_block(&for_.init)?;
+                self.push_yul_block_entry_probe(
+                    &for_.body,
+                    InstrumentedCoverageProbeKind::Statement,
+                );
+                self.visit_yul_block(&for_.body)?;
+                self.visit_yul_block(&for_.step)
+            }
+            Yul::FunctionDef(func) => {
+                self.push_yul_block_entry_probe(
+                    &func.body,
+                    InstrumentedCoverageProbeKind::Function { name: func.name.as_str().into() },
+                );
+                self.visit_yul_block(&func.body)
+            }
+            Yul::Block(block) => self.visit_yul_block(block),
         }
     }
 }
@@ -1193,6 +1320,130 @@ contract C {
         assert_eq!(
             count_kind(&probes, |k| matches!(k, InstrumentedCoverageProbeKind::Function { .. })),
             2
+        );
+    }
+
+    #[test]
+    fn instruments_yul_statements() {
+        // A non-`pure` function: the Yul probe's `staticcall` is permitted here.
+        let (out, probes) = instrument(
+            r#"
+contract C {
+    function f(uint256 x) external returns (uint256 r) {
+        assembly {
+            let a := add(x, 5)
+            let b := mul(a, 2)
+            r := add(a, b)
+        }
+    }
+}
+"#,
+        );
+        assert_reparses(&out);
+        // The assembly block is one statement, plus one per Yul statement inside it (3).
+        assert!(
+            count_kind(&probes, |k| matches!(k, InstrumentedCoverageProbeKind::Statement)) >= 4,
+            "expected the assembly block plus its 3 inner statements, got probes: {probes:?}"
+        );
+        assert!(out.contains("staticcall"), "expected a yul probe in:\n{out}");
+    }
+
+    #[test]
+    fn instruments_yul_if_branch() {
+        let (out, probes) = instrument(
+            r#"
+contract C {
+    function f(uint256 x) external returns (uint256 r) {
+        assembly {
+            if gt(x, 10) {
+                r := 1
+            }
+        }
+    }
+}
+"#,
+        );
+        assert_reparses(&out);
+        // A Yul `if` is a one-sided branch.
+        assert_eq!(
+            count_kind(&probes, |k| matches!(k, InstrumentedCoverageProbeKind::Branch { .. })),
+            1
+        );
+    }
+
+    #[test]
+    fn instruments_yul_switch_branches() {
+        let (out, probes) = instrument(
+            r#"
+contract C {
+    function f(uint256 x) external returns (uint256 r) {
+        assembly {
+            switch x
+            case 0 { r := 10 }
+            case 1 { r := 20 }
+            default { r := 30 }
+        }
+    }
+}
+"#,
+        );
+        assert_reparses(&out);
+        // Each case body (including default) is a branch path: 3 total.
+        assert_eq!(
+            count_kind(&probes, |k| matches!(k, InstrumentedCoverageProbeKind::Branch { .. })),
+            3
+        );
+    }
+
+    #[test]
+    fn instruments_yul_for_loop() {
+        let (out, probes) = instrument(
+            r#"
+contract C {
+    function f(uint256 n) external returns (uint256 sum) {
+        assembly {
+            for { let i := 0 } lt(i, n) { i := add(i, 1) } {
+                sum := add(sum, i)
+            }
+        }
+    }
+}
+"#,
+        );
+        assert_reparses(&out);
+        // The for body plus the init (`let i`), step (`i := ...`), and body (`sum := ...`)
+        // statements are all instrumented.
+        assert!(
+            count_kind(&probes, |k| matches!(k, InstrumentedCoverageProbeKind::Statement)) >= 4,
+            "expected for-loop yul statements instrumented, got probes: {probes:?}"
+        );
+    }
+
+    #[test]
+    fn pure_function_assembly_is_not_yul_instrumented() {
+        // A `pure` function cannot host the Yul probe's `staticcall`, so its assembly stays a
+        // single statement and no Yul-level `staticcall` probe is injected.
+        let (out, probes) = instrument(
+            r#"
+contract C {
+    function f(uint256 x) external pure returns (uint256 r) {
+        assembly {
+            let a := add(x, 5)
+            r := mul(a, 2)
+        }
+    }
+}
+"#,
+        );
+        assert_reparses(&out);
+        assert!(
+            !out.contains("staticcall"),
+            "pure function assembly must not get a yul staticcall probe:\n{out}"
+        );
+        // Exactly the function probe, the assembly-block statement, and its line.
+        assert_eq!(
+            count_kind(&probes, |k| matches!(k, InstrumentedCoverageProbeKind::Statement)),
+            1
         );
     }
 }
