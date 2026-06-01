@@ -983,6 +983,28 @@ contract C {
     }
 
     #[test]
+    fn require_with_logical_condition_instruments_both() {
+        // A `require` whose condition is a logical expression keeps its pre/post branch *and*
+        // instruments the inner `||`, and the combined rewrite is still valid Solidity.
+        let (out, probes) = instrument(
+            r#"
+contract C {
+    function f(bool a, bool b) external pure {
+        require(a || b, "fail");
+    }
+}
+"#,
+        );
+        assert_reparses(&out);
+        assert_eq!(
+            count_kind(&probes, |k| matches!(k, InstrumentedCoverageProbeKind::RequirePre { .. })),
+            1
+        );
+        // The inner `||` contributes its two operand branch paths.
+        assert_eq!(branch_paths(&probes), vec![(1, 0), (1, 1)]);
+    }
+
+    #[test]
     fn instruments_if_else_branches() {
         let (out, probes) = instrument(
             r#"
