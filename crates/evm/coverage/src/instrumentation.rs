@@ -11,7 +11,7 @@ use foundry_compilers::{
 };
 use semver::Version;
 use solar::{
-    ast::{self, FunctionKind, ItemKind, StateMutability, StmtKind, Visit},
+    ast::{self, BinOpKind, ExprKind, FunctionKind, ItemKind, StateMutability, StmtKind, Visit},
     data_structures::Never,
     interface::{BytePos, Span},
     parse::interface::SourceMap,
@@ -57,6 +57,13 @@ library __FoundryCoverage {
         _castToPure(_sendHitImplementation)(tag);
     }
 
+    /// Records a hit for `tag` and returns `value` unchanged, so the call can be embedded in a
+    /// boolean expression to measure which side of a branch executed without altering the
+    /// expression's value or its short-circuit evaluation order.
+    function sendHitReturn(uint256 tag, bool value) internal pure returns (bool) {
+        sendHit(tag);
+        return value;
+    }
 }
 "#;
 
@@ -505,6 +512,96 @@ impl<'a> StatementCollector<'a> {
         !matches!(func.kind, FunctionKind::Receive) && func.body.is_some()
     }
 
+    /// Returns the source byte range covered by `span`.
+    fn source_range(&self, span: Span) -> Range<usize> {
+        self.source_map.span_to_source(span).unwrap().data
+    }
+
+    /// Wraps the boolean sub-expression at `span` in a `sendHitReturn(tag, (..))` call so the
+    /// probe fires exactly when the sub-expression is evaluated, while passing its value through
+    /// unchanged. Records a [`Branch`] probe for `(branch_id, path_id)`.
+    ///
+    /// [`Branch`]: InstrumentedCoverageProbeKind::Branch
+    fn wrap_bool_branch(&mut self, span: Span, branch_id: u32, path_id: u32) {
+        let range = self.source_range(span);
+        if range.is_empty() {
+            return;
+        }
+        let tag = self.make_tag(range.start);
+        self.updates.push(SourceUpdate {
+            range: range.start..range.start,
+            text: format!("__FoundryCoverage.sendHitReturn({tag}, ("),
+        });
+        self.updates.push(SourceUpdate { range: range.end..range.end, text: "))".into() });
+        self.record_probe(
+            InstrumentedCoverageProbeKind::Branch { branch_id, path_id },
+            span,
+            range,
+            tag,
+        );
+    }
+
+    /// Instruments a logical `&&`/`||` expression so each operand becomes a branch outcome,
+    /// then recurses so nested logical/ternary operands are also instrumented.
+    fn instrument_logical_branch<'ast>(
+        &mut self,
+        lhs: &'ast ast::Expr<'ast>,
+        rhs: &'ast ast::Expr<'ast>,
+    ) -> ControlFlow<<Self as ast::Visit<'ast>>::BreakValue> {
+        let branch_id = self.next_branch_id();
+        // Path 0 is the always-evaluated left operand; path 1 is the right operand, which is
+        // only evaluated when the left operand does not short-circuit the expression.
+        self.wrap_bool_branch(lhs.span, branch_id, 0);
+        self.wrap_bool_branch(rhs.span, branch_id, 1);
+        self.visit_expr(lhs)?;
+        self.visit_expr(rhs)
+    }
+
+    /// Instruments a ternary `cond ? a : b` so the condition reports both outcomes, then
+    /// recurses into the condition and both arms.
+    ///
+    /// The arms may be of any type, so they are left untouched. Instead the condition is
+    /// rewritten into a short-circuit pair that preserves its truth value:
+    /// `(sendHitReturn(tag0, (cond)) || sendHitReturn(tag1, false))`. When `cond` is true the
+    /// first call fires `tag0` and the OR short-circuits; when `cond` is false the second call
+    /// fires `tag1`. The resulting boolean equals `cond`.
+    fn instrument_ternary_branch<'ast>(
+        &mut self,
+        cond: &'ast ast::Expr<'ast>,
+        then_expr: &'ast ast::Expr<'ast>,
+        else_expr: &'ast ast::Expr<'ast>,
+    ) -> ControlFlow<<Self as ast::Visit<'ast>>::BreakValue> {
+        let range = self.source_range(cond.span);
+        if !range.is_empty() {
+            let branch_id = self.next_branch_id();
+            let true_tag = self.make_tag(range.start);
+            let false_tag = self.make_tag(range.end);
+            self.updates.push(SourceUpdate {
+                range: range.start..range.start,
+                text: format!("(__FoundryCoverage.sendHitReturn({true_tag}, ("),
+            });
+            self.updates.push(SourceUpdate {
+                range: range.end..range.end,
+                text: format!(")) || __FoundryCoverage.sendHitReturn({false_tag}, false))"),
+            });
+            self.record_probe(
+                InstrumentedCoverageProbeKind::Branch { branch_id, path_id: 0 },
+                cond.span,
+                range.clone(),
+                true_tag,
+            );
+            self.record_probe(
+                InstrumentedCoverageProbeKind::Branch { branch_id, path_id: 1 },
+                cond.span,
+                range,
+                false_tag,
+            );
+        }
+        self.visit_expr(cond)?;
+        self.visit_expr(then_expr)?;
+        self.visit_expr(else_expr)
+    }
+
     fn is_require_expr(expr: &ast::Expr<'_>) -> bool {
         let expr = expr.peel_parens();
         let ast::ExprKind::Call(callee, _) = &expr.kind else { return false };
@@ -655,6 +752,19 @@ impl<'ast> ast::Visit<'ast> for StatementCollector<'_> {
             StmtKind::Placeholder => ControlFlow::Continue(()),
         }
     }
+
+    fn visit_expr(&mut self, expr: &'ast ast::Expr<'ast>) -> ControlFlow<Self::BreakValue> {
+        match &expr.kind {
+            ExprKind::Binary(lhs, op, rhs) if matches!(op.kind, BinOpKind::And | BinOpKind::Or) => {
+                self.instrument_logical_branch(lhs, rhs)
+            }
+            ExprKind::Ternary(cond, then_expr, else_expr) => {
+                self.instrument_ternary_branch(cond, then_expr, else_expr)
+            }
+            // Not a branch on its own; descend so any nested logical/ternary operands are found.
+            _ => self.walk_expr(expr),
+        }
+    }
 }
 
 pub fn read_metadata(
@@ -803,6 +913,106 @@ contract C {
         assert_eq!(
             count_kind(&probes, |k| matches!(k, InstrumentedCoverageProbeKind::Branch { .. })),
             2
+        );
+    }
+
+    /// Collects the `(branch_id, path_id)` of every branch probe.
+    fn branch_paths(probes: &[InstrumentedCoverageProbe]) -> Vec<(u32, u32)> {
+        let mut out = probes
+            .iter()
+            .filter_map(|p| match p.kind {
+                InstrumentedCoverageProbeKind::Branch { branch_id, path_id } => {
+                    Some((branch_id, path_id))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        out.sort_unstable();
+        out
+    }
+
+    #[test]
+    fn instruments_logical_or_branches() {
+        let (out, probes) = instrument(
+            r#"
+contract C {
+    function f(bool a, bool b) external pure returns (bool) {
+        return a || b;
+    }
+}
+"#,
+        );
+        assert_reparses(&out);
+        // Two branch outcomes for the single `||`.
+        let branches = branch_paths(&probes);
+        assert_eq!(branches.len(), 2, "expected 2 branch probes, got {branches:?}");
+        assert_eq!(branches, vec![(0, 0), (0, 1)]);
+        // Operands wrapped with the boolean-returning helper.
+        assert!(out.contains("sendHitReturn"), "expected sendHitReturn in:\n{out}");
+    }
+
+    #[test]
+    fn instruments_logical_and_branches() {
+        let (out, probes) = instrument(
+            r#"
+contract C {
+    function f(bool a, bool b) external pure returns (bool) {
+        return a && b;
+    }
+}
+"#,
+        );
+        assert_reparses(&out);
+        assert_eq!(branch_paths(&probes), vec![(0, 0), (0, 1)]);
+    }
+
+    #[test]
+    fn instruments_ternary_branches() {
+        let (out, probes) = instrument(
+            r#"
+contract C {
+    function f(bool b) external pure returns (uint256) {
+        return b ? 1 : 2;
+    }
+}
+"#,
+        );
+        assert_reparses(&out);
+        assert_eq!(branch_paths(&probes), vec![(0, 0), (0, 1)]);
+    }
+
+    #[test]
+    fn instruments_nested_logical_branches() {
+        let (out, probes) = instrument(
+            r#"
+contract C {
+    function f(bool a, bool b, bool c) external pure returns (bool) {
+        return a || (b && c);
+    }
+}
+"#,
+        );
+        assert_reparses(&out);
+        // Two logical operators => two branches, two paths each.
+        assert_eq!(branch_paths(&probes), vec![(0, 0), (0, 1), (1, 0), (1, 1)]);
+    }
+
+    #[test]
+    fn assert_is_not_a_branch() {
+        let (out, probes) = instrument(
+            r#"
+contract C {
+    function f(uint256 x) external pure {
+        assert(x > 0);
+    }
+}
+"#,
+        );
+        assert_reparses(&out);
+        // assert() is a statement, never a branch (matches Forge).
+        assert_eq!(
+            count_kind(&probes, |k| matches!(k, InstrumentedCoverageProbeKind::Branch { .. })),
+            0
         );
     }
 }
