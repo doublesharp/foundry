@@ -4862,3 +4862,62 @@ Ran 1 test suite [ELAPSED]: 1 tests passed, 0 failed, 0 skipped (1 total tests)
 
 "#]]);
 });
+
+// Instrumented hits must propagate through the fuzz runner, not just unit tests. A fuzzed input
+// drives both sides of a branch across runs, yielding full coverage.
+forgetest!(instrumented_fuzz_coverage, |prj, cmd| {
+    prj.add_source(
+        "Target.sol",
+        r#"
+contract Target {
+    function classify(uint256 x) external pure returns (uint256) {
+        if (x % 2 == 0) {
+            return 0;
+        }
+        return 1;
+    }
+}
+"#,
+    );
+    prj.add_test(
+        "TargetTest.sol",
+        r#"
+import {Target} from "../src/Target.sol";
+
+contract TargetTest {
+    Target t = new Target();
+
+    function testFuzz_classify(uint256 x) external view {
+        uint256 r = t.classify(x);
+        require(r == 0 || r == 1);
+    }
+}
+"#,
+    );
+
+    cmd.arg("coverage")
+        .args(["--instrumented", "--exclude-tests", "--mt", "testFuzz_classify"])
+        .assert_success()
+        .stdout_eq(str![[r#"
+[COMPILING_FILES] with [SOLC_VERSION]
+[SOLC_VERSION] [ELAPSED]
+Compiler run successful!
+Analysing contracts...
+Running tests...
+
+Ran 1 test for test/TargetTest.sol:TargetTest
+[PASS] testFuzz_classify(uint256) (runs: 256, [AVG_GAS])
+Suite result: ok. 1 passed; 0 failed; 0 skipped; [ELAPSED]
+
+Ran 1 test suite [ELAPSED]: 1 tests passed, 0 failed, 0 skipped (1 total tests)
+
+╭----------------+---------------+---------------+---------------+---------------╮
+| File           | % Lines       | % Statements  | % Branches    | % Funcs       |
++================================================================================+
+| src/Target.sol | 100.00% (4/4) | 100.00% (2/2) | 100.00% (2/2) | 100.00% (1/1) |
+|----------------+---------------+---------------+---------------+---------------|
+| Total          | 100.00% (4/4) | 100.00% (2/2) | 100.00% (2/2) | 100.00% (1/1) |
+╰----------------+---------------+---------------+---------------+---------------╯
+
+"#]]);
+});
