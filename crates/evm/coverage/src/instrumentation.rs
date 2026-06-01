@@ -662,3 +662,147 @@ pub fn read_metadata(
 ) -> Result<InstrumentedCoverageMetadata> {
     Ok(metadata.lock().expect("coverage metadata lock poisoned").clone())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use solar::{
+        interface::{Session, source_map::FileName},
+        sema::Compiler,
+    };
+
+    /// Parses `source` with solar and runs the coverage instrumenter on it, returning the
+    /// rewritten source and the probes that were recorded.
+    ///
+    /// This exercises the exact same [`instrument_source`] entry point used by the
+    /// preprocessor, so unit tests can assert on rewrites and probe metadata without spinning
+    /// up a full solc compilation.
+    fn instrument(source: &str) -> (String, Vec<InstrumentedCoverageProbe>) {
+        let version = Version::new(0, 8, 25);
+        let path = PathBuf::from("Test.sol");
+        let sess = Session::builder().with_buffer_emitter(Default::default()).build();
+        let mut compiler = Compiler::new(sess);
+        let result = compiler.enter_mut(|compiler| {
+            let src_file = compiler
+                .sess()
+                .source_map()
+                .new_source_file(FileName::from(path.clone()), source.to_owned())
+                .expect("failed to create source file");
+            let mut pcx = compiler.parse();
+            pcx.add_file(src_file);
+            pcx.parse();
+            let gcx = compiler.gcx();
+            let (_, ast_source) = gcx.get_ast_source(&path).expect("missing ast source");
+            let ast = ast_source.ast.as_ref().expect("missing ast");
+            instrument_source(&path, source, &version, gcx.sess.source_map(), ast)
+        });
+        if let Some(Err(diags)) = compiler.sess().emitted_errors() {
+            panic!("input source failed to parse:\n{diags}");
+        }
+        result.expect("instrumentation produced no output")
+    }
+
+    /// Asserts that the instrumented source re-parses without errors, i.e. the rewrite is
+    /// syntactically valid Solidity.
+    #[track_caller]
+    fn assert_reparses(instrumented: &str) {
+        let sess = Session::builder().with_buffer_emitter(Default::default()).build();
+        let mut compiler = Compiler::new(sess);
+        compiler.enter_mut(|compiler| {
+            let source_map = compiler.sess().source_map();
+            // Provide the virtual coverage library so the injected import resolves.
+            let lib_file = source_map
+                .new_source_file(
+                    FileName::from(PathBuf::from(COVERAGE_LIBRARY_PATH)),
+                    COVERAGE_LIBRARY_SOURCE.to_owned(),
+                )
+                .expect("failed to create library source file");
+            let src_file = source_map
+                .new_source_file(
+                    FileName::from(PathBuf::from("Reparse.sol")),
+                    instrumented.to_owned(),
+                )
+                .expect("failed to create source file");
+            let mut pcx = compiler.parse();
+            pcx.add_file(lib_file);
+            pcx.add_file(src_file);
+            pcx.parse();
+        });
+        if let Some(Err(diags)) = compiler.sess().emitted_errors() {
+            panic!("instrumented source failed to re-parse:\n{diags}\n---\n{instrumented}");
+        }
+    }
+
+    fn count_kind(
+        probes: &[InstrumentedCoverageProbe],
+        pred: impl Fn(&InstrumentedCoverageProbeKind) -> bool,
+    ) -> usize {
+        probes.iter().filter(|p| pred(&p.kind)).count()
+    }
+
+    #[test]
+    fn instruments_basic_statement() {
+        let (out, probes) = instrument(
+            r#"
+contract C {
+    function f(uint256 x) external pure returns (uint256) {
+        return x + 1;
+    }
+}
+"#,
+        );
+        assert_reparses(&out);
+        // One function probe and one statement probe (the return).
+        assert_eq!(
+            count_kind(&probes, |k| matches!(k, InstrumentedCoverageProbeKind::Function { .. })),
+            1
+        );
+        assert!(
+            count_kind(&probes, |k| matches!(k, InstrumentedCoverageProbeKind::Statement)) >= 1
+        );
+    }
+
+    #[test]
+    fn instruments_require_branch() {
+        let (out, probes) = instrument(
+            r#"
+contract C {
+    function f(uint256 x) external pure {
+        require(x > 0, "nonzero");
+    }
+}
+"#,
+        );
+        assert_reparses(&out);
+        assert_eq!(
+            count_kind(&probes, |k| matches!(k, InstrumentedCoverageProbeKind::RequirePre { .. })),
+            1
+        );
+        assert_eq!(
+            count_kind(&probes, |k| matches!(k, InstrumentedCoverageProbeKind::RequirePost { .. })),
+            1
+        );
+    }
+
+    #[test]
+    fn instruments_if_else_branches() {
+        let (out, probes) = instrument(
+            r#"
+contract C {
+    function f(bool b) external pure returns (uint256 r) {
+        if (b) {
+            r = 1;
+        } else {
+            r = 2;
+        }
+    }
+}
+"#,
+        );
+        assert_reparses(&out);
+        assert_eq!(
+            count_kind(&probes, |k| matches!(k, InstrumentedCoverageProbeKind::Branch { .. })),
+            2
+        );
+    }
+}
