@@ -5084,3 +5084,70 @@ Ran 1 test suite [ELAPSED]: 1 tests passed, 0 failed, 0 skipped (1 total tests)
 
 "#]]);
 });
+
+// Coverage is measured *inside* inline assembly for non-pure functions: each Yul statement and
+// each Yul `if`/`switch` branch is counted. (A `pure` function cannot host the Yul probe's
+// `staticcall`, so its assembly stays a single statement; that case is covered by the unit tests.)
+forgetest!(instrumented_yul_assembly_coverage, |prj, cmd| {
+    prj.add_source(
+        "Target.sol",
+        r#"
+contract Target {
+    uint256 public stored;
+
+    function compute(uint256 x) external returns (uint256 r) {
+        assembly {
+            let a := add(x, 5)
+            let b := mul(a, 2)
+            if gt(x, 100) {
+                b := add(b, 1)
+            }
+            r := add(a, b)
+            sstore(0, r)
+        }
+    }
+}
+"#,
+    );
+    prj.add_test(
+        "TargetTest.sol",
+        r#"
+import {Target} from "../src/Target.sol";
+
+contract TargetTest {
+    Target t = new Target();
+
+    function testBothYulPaths() external {
+        require(t.compute(10) == 45);
+        require(t.compute(200) == 616);
+    }
+}
+"#,
+    );
+
+    cmd.arg("coverage")
+        .args(["--instrumented", "--exclude-tests", "--mt", "testBothYulPaths"])
+        .assert_success()
+        .stdout_eq(str![[r#"
+[COMPILING_FILES] with [SOLC_VERSION]
+[SOLC_VERSION] [ELAPSED]
+Compiler run successful!
+Analysing contracts...
+Running tests...
+
+Ran 1 test for test/TargetTest.sol:TargetTest
+[PASS] testBothYulPaths() ([GAS])
+Suite result: ok. 1 passed; 0 failed; 0 skipped; [ELAPSED]
+
+Ran 1 test suite [ELAPSED]: 1 tests passed, 0 failed, 0 skipped (1 total tests)
+
+╭----------------+---------------+---------------+---------------+---------------╮
+| File           | % Lines       | % Statements  | % Branches    | % Funcs       |
++================================================================================+
+| src/Target.sol | 100.00% (8/8) | 100.00% (6/6) | 100.00% (1/1) | 100.00% (1/1) |
+|----------------+---------------+---------------+---------------+---------------|
+| Total          | 100.00% (8/8) | 100.00% (6/6) | 100.00% (1/1) | 100.00% (1/1) |
+╰----------------+---------------+---------------+---------------+---------------╯
+
+"#]]);
+});
