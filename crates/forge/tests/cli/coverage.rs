@@ -4671,6 +4671,267 @@ end_of_record
 "#]]);
 });
 
+forgetest!(instrumented_json_report, |prj, cmd| {
+    prj.add_source(
+        "Target.sol",
+        r#"
+contract Target {
+    function pick(bool flag) external pure returns (uint256) {
+        if (flag) {
+            return 1;
+        }
+        return 2;
+    }
+}
+"#,
+    );
+    prj.add_test(
+        "TargetTest.sol",
+        r#"
+import {Target} from "../src/Target.sol";
+
+contract TargetTest {
+    Target t = new Target();
+
+    function testBothPaths() external view {
+        require(t.pick(true) == 1);
+        require(t.pick(false) == 2);
+    }
+}
+"#,
+    );
+
+    cmd.arg("coverage")
+        .args(["--instrumented", "--exclude-tests", "--report=json"])
+        .assert_success();
+
+    let report_path = prj.root().join("coverage-final.json");
+    let report: Value = serde_json::from_str(&fs::read_to_string(&report_path).unwrap()).unwrap();
+    let file = report.get("src/Target.sol").expect("missing target source");
+
+    assert_eq!(file["path"], "src/Target.sol");
+    assert_eq!(file["statementMap"].as_object().unwrap().len(), 2);
+    assert_eq!(file["fnMap"].as_object().unwrap().len(), 1);
+    assert_eq!(file["branchMap"].as_object().unwrap().len(), 1);
+    assert_eq!(file["f"]["0"], 2);
+    assert_eq!(file["b"]["0"], serde_json::json!([1, 1]));
+});
+
+forgetest!(instrumented_ignore_file_directive, |prj, cmd| {
+    prj.add_source(
+        "Ignored.sol",
+        r#"
+// forge coverage ignore file
+contract Ignored {
+    function neverCalled() external pure returns (uint256) {
+        return 1;
+    }
+}
+"#,
+    );
+    prj.add_source(
+        "Target.sol",
+        r#"
+contract Target {
+    function covered() external pure returns (uint256) {
+        return 2;
+    }
+}
+"#,
+    );
+    prj.add_test(
+        "TargetTest.sol",
+        r#"
+import {Target} from "../src/Target.sol";
+
+contract TargetTest {
+    Target t = new Target();
+
+    function testCovered() external view {
+        require(t.covered() == 2);
+    }
+}
+"#,
+    );
+
+    let output = cmd
+        .arg("coverage")
+        .args(["--instrumented", "--exclude-tests"])
+        .assert_success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8_lossy(&output);
+    assert!(!stdout.contains("src/Ignored.sol"), "{stdout}");
+    assert!(stdout.contains("src/Target.sol"), "{stdout}");
+});
+
+forgetest!(instrumented_ignore_next_directive, |prj, cmd| {
+    prj.add_source(
+        "Target.sol",
+        r#"
+contract Target {
+    function covered() external pure returns (uint256) {
+        return 1;
+    }
+
+    // istanbul ignore next
+    function ignored() external pure returns (uint256) {
+        return 2;
+    }
+}
+"#,
+    );
+    prj.add_test(
+        "TargetTest.sol",
+        r#"
+import {Target} from "../src/Target.sol";
+
+contract TargetTest {
+    Target t = new Target();
+
+    function testCovered() external view {
+        require(t.covered() == 1);
+    }
+}
+"#,
+    );
+
+    let output = cmd
+        .arg("coverage")
+        .args(["--instrumented", "--exclude-tests"])
+        .assert_success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8_lossy(&output);
+    assert!(stdout.contains("src/Target.sol"), "{stdout}");
+    assert!(stdout.contains("100.00% (1/1)"), "{stdout}");
+    assert!(!stdout.contains("50.00% (1/2)"), "{stdout}");
+});
+
+forgetest!(instrumented_no_match_coverage_config, |prj, cmd| {
+    prj.update_config(|config| {
+        config.coverage_pattern_inverse = Some(regex::Regex::new("Ignored").unwrap().into());
+    });
+    prj.add_source(
+        "Ignored.sol",
+        r#"
+contract Ignored {
+    function neverCalled() external pure returns (uint256) {
+        return 1;
+    }
+}
+"#,
+    );
+    prj.add_source(
+        "Target.sol",
+        r#"
+contract Target {
+    function covered() external pure returns (uint256) {
+        return 2;
+    }
+}
+"#,
+    );
+    prj.add_test(
+        "TargetTest.sol",
+        r#"
+import {Target} from "../src/Target.sol";
+
+contract TargetTest {
+    Target t = new Target();
+
+    function testCovered() external view {
+        require(t.covered() == 2);
+    }
+}
+"#,
+    );
+
+    let output = cmd
+        .arg("coverage")
+        .args(["--instrumented", "--exclude-tests"])
+        .assert_success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8_lossy(&output);
+    assert!(!stdout.contains("src/Ignored.sol"), "{stdout}");
+    assert!(stdout.contains("src/Target.sol"), "{stdout}");
+});
+
+forgetest!(instrumented_multi_solc, |prj, cmd| {
+    prj.add_source(
+        "Legacy.sol",
+        r#"
+pragma solidity 0.8.4;
+
+contract Legacy {
+    function value() external pure returns (uint256) {
+        return 1;
+    }
+}
+"#,
+    );
+    prj.add_source(
+        "Modern.sol",
+        r#"
+pragma solidity 0.8.33;
+
+contract Modern {
+    function value() external pure returns (uint256) {
+        return 2;
+    }
+}
+"#,
+    );
+    prj.add_test(
+        "LegacyTest.sol",
+        r#"
+pragma solidity 0.8.4;
+
+import {Legacy} from "../src/Legacy.sol";
+
+contract LegacyTest {
+    Legacy legacy = new Legacy();
+
+    function testLegacy() external view {
+        require(legacy.value() == 1);
+    }
+}
+"#,
+    );
+    prj.add_test(
+        "ModernTest.sol",
+        r#"
+pragma solidity 0.8.33;
+
+import {Modern} from "../src/Modern.sol";
+
+contract ModernTest {
+    Modern modern = new Modern();
+
+    function testModern() external view {
+        require(modern.value() == 2);
+    }
+}
+"#,
+    );
+
+    let output = cmd
+        .arg("coverage")
+        .args(["--instrumented", "--exclude-tests"])
+        .assert_success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8_lossy(&output);
+    assert!(stdout.contains("src/Legacy.sol"), "{stdout}");
+    assert!(stdout.contains("src/Modern.sol"), "{stdout}");
+    assert!(stdout.contains("100.00% (4/4)"), "{stdout}");
+});
+
 // A ternary nested inside another ternary yields two independent branches (four outcomes),
 // and the rewrite preserves evaluation so the returned values stay correct.
 forgetest!(instrumented_nested_ternary, |prj, cmd| {
