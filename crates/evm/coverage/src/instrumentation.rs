@@ -4,7 +4,7 @@ use foundry_common::errors::convert_solar_errors;
 use foundry_compilers::{
     Compiler, ProjectPathsConfig, SourceParser,
     artifacts::{SolcLanguage, Source},
-    error,
+    error::{self, SolcError},
     multi::{MultiCompiler, MultiCompilerInput, MultiCompilerLanguage},
     project::Preprocessor,
     solc::{SolcCompiler, SolcVersionedInput},
@@ -134,7 +134,7 @@ impl CoverageInstrumentationPreprocessor {
         let mut compiler =
             foundry_compilers::resolver::parse::SolParser::new(paths.with_language_ref())
                 .into_compiler();
-        let _ = compiler.enter_mut(|compiler| -> solar::interface::Result {
+        let instrumentation_result = compiler.enter_mut(|compiler| -> solar::interface::Result {
             let mut pcx = compiler.parse();
             let mut candidate_paths = Vec::new();
 
@@ -172,8 +172,10 @@ impl CoverageInstrumentationPreprocessor {
         });
 
         if let Err(err) = convert_solar_errors(compiler.dcx()) {
-            warn!(%err, "failed coverage instrumentation");
-            return Ok(());
+            return Err(SolcError::msg(format!("failed coverage instrumentation: {err}")));
+        }
+        if let Err(err) = instrumentation_result {
+            return Err(SolcError::msg(format!("failed coverage instrumentation: {err:?}")));
         }
 
         let mut probes = Vec::new();
