@@ -72,6 +72,20 @@ library __FoundryCoverage {
 const COVERAGE_IMPORT: &str =
     r#"import {__FoundryCoverage} from "__foundry_coverage/InstrumentedCoverage.sol";"#;
 
+const IGNORE_FILE_DIRECTIVES: &[&str] = &[
+    "forge coverage ignore file",
+    "coverage ignore file",
+    "istanbul ignore file",
+    "solidity-coverage ignore file",
+];
+
+const IGNORE_NEXT_DIRECTIVES: &[&str] = &[
+    "forge coverage ignore next",
+    "coverage ignore next",
+    "istanbul ignore next",
+    "solidity-coverage ignore next",
+];
+
 /// Source location attached to an injected coverage tag.
 #[derive(Clone, Debug)]
 pub struct InstrumentedCoverageProbe {
@@ -259,6 +273,10 @@ fn instrument_source<'ast>(
     source_map: &SourceMap,
     ast: &'ast ast::SourceUnit<'ast>,
 ) -> Option<(String, Vec<InstrumentedCoverageProbe>)> {
+    if has_ignore_file_directive(source) {
+        return None;
+    }
+
     let mut collector = StatementCollector::new(path, source, version, source_map);
     let _ = ast::Visit::visit_source_unit(&mut collector, ast);
     if collector.probes.is_empty() {
@@ -293,6 +311,15 @@ fn instrument_source<'ast>(
     content.push_str(COVERAGE_IMPORT);
     content.push('\n');
     Some((content, collector.probes))
+}
+
+fn has_ignore_file_directive(source: &str) -> bool {
+    contains_ignore_directive(source, IGNORE_FILE_DIRECTIVES)
+}
+
+fn contains_ignore_directive(text: &str, directives: &[&str]) -> bool {
+    let text = text.to_ascii_lowercase();
+    directives.iter().any(|directive| text.contains(directive))
 }
 
 /// Sort rank for an [`Edge`] at a shared byte offset: closes first, then points, then opens.
@@ -343,12 +370,15 @@ impl<'a> StatementCollector<'a> {
     }
 
     fn push_probe(&mut self, span: Span) {
+        if self.has_ignore_next(span) {
+            return;
+        }
         self.push_probe_kind(InstrumentedCoverageProbeKind::Statement, span);
     }
 
     fn push_require_branch(&mut self, stmt: &'_ ast::Stmt<'_>) {
         let range = self.trim_statement_span(stmt.span);
-        if range.is_empty() {
+        if range.is_empty() || self.has_ignore_next(stmt.span) {
             return;
         }
 
@@ -376,7 +406,7 @@ impl<'a> StatementCollector<'a> {
 
     fn push_probe_kind(&mut self, kind: InstrumentedCoverageProbeKind, span: Span) {
         let range = self.trim_statement_span(span);
-        if range.is_empty() {
+        if range.is_empty() || self.has_ignore_next(span) {
             return;
         }
         let tag = self.make_tag(range.start);
@@ -396,7 +426,7 @@ impl<'a> StatementCollector<'a> {
         trailing: Option<String>,
     ) {
         let range = self.trim_statement_span(stmt.span);
-        if range.is_empty() {
+        if range.is_empty() || self.has_ignore_next(stmt.span) {
             return;
         }
         let full_range = self.source_map.span_to_source(stmt.span).unwrap().data;
@@ -423,7 +453,7 @@ impl<'a> StatementCollector<'a> {
         trailing: Option<String>,
     ) {
         let range = self.trim_statement_span(stmt.span);
-        if range.is_empty() {
+        if range.is_empty() || self.has_ignore_next(stmt.span) {
             return;
         }
         let full_range = self.source_map.span_to_source(stmt.span).unwrap().data;
@@ -471,7 +501,7 @@ impl<'a> StatementCollector<'a> {
         kind: InstrumentedCoverageProbeKind,
     ) {
         let range = self.trim_statement_span(block.span);
-        if range.is_empty() {
+        if range.is_empty() || self.has_ignore_next(block.span) {
             return;
         }
         let full_range = self.source_map.span_to_source(block.span).unwrap().data;
@@ -488,7 +518,7 @@ impl<'a> StatementCollector<'a> {
     /// probe of `kind` for it.
     fn push_yul_stmt_probe(&mut self, span: Span, kind: InstrumentedCoverageProbeKind) {
         let range = self.source_map.span_to_source(span).unwrap().data;
-        if range.is_empty() {
+        if range.is_empty() || self.has_ignore_next(span) {
             return;
         }
         let tag = self.make_tag(range.start);
@@ -504,6 +534,9 @@ impl<'a> StatementCollector<'a> {
         kind: InstrumentedCoverageProbeKind,
     ) {
         let range = self.source_map.span_to_source(block.span).unwrap().data;
+        if self.has_ignore_next(block.span) {
+            return;
+        }
         let Some(brace_offset) = self.source[range.clone()].find('{') else {
             return;
         };
@@ -571,6 +604,24 @@ impl<'a> StatementCollector<'a> {
         let first = lines.first().unwrap();
         let last = lines.last().unwrap();
         first.line_index as u32 + 1..last.line_index as u32 + 2
+    }
+
+    fn has_ignore_next(&self, span: Span) -> bool {
+        let range = self.source_map.span_to_source(span).unwrap().data;
+        self.has_ignore_directive_before(range.start, IGNORE_NEXT_DIRECTIVES)
+    }
+
+    fn has_ignore_directive_before(&self, start: usize, directives: &[&str]) -> bool {
+        let Some(before) = self.source.get(..start) else { return false };
+        let line_start = before.rfind('\n').map_or(0, |idx| idx + 1);
+        let same_line_prefix = &self.source[line_start..start];
+        if contains_ignore_directive(same_line_prefix, directives) {
+            return true;
+        }
+
+        let previous = before[..line_start].trim_end_matches(|c| matches!(c, '\r' | '\n'));
+        let previous_line_start = previous.rfind('\n').map_or(0, |idx| idx + 1);
+        contains_ignore_directive(&previous[previous_line_start..], directives)
     }
 
     fn make_tag(&mut self, start: usize) -> B256 {
@@ -850,6 +901,9 @@ impl<'ast> ast::Visit<'ast> for StatementCollector<'_> {
                 if !Self::should_instrument_function(func) {
                     return ControlFlow::Continue(());
                 }
+                if self.has_ignore_next(item.span) {
+                    return ControlFlow::Continue(());
+                }
                 let previous_probe_mode = self.probe_mode;
                 self.probe_mode = if func.kind.is_modifier()
                     || matches!(func.header.state_mutability(), StateMutability::Pure)
@@ -879,6 +933,10 @@ impl<'ast> ast::Visit<'ast> for StatementCollector<'_> {
     }
 
     fn visit_stmt(&mut self, stmt: &'ast ast::Stmt<'ast>) -> ControlFlow<Self::BreakValue> {
+        if self.has_ignore_next(stmt.span) {
+            return ControlFlow::Continue(());
+        }
+
         match &stmt.kind {
             StmtKind::Break | StmtKind::Continue => {
                 self.push_probe(stmt.span);
@@ -1013,6 +1071,10 @@ impl<'ast> ast::Visit<'ast> for StatementCollector<'_> {
 
     fn visit_yul_stmt(&mut self, stmt: &'ast yul::Stmt<'ast>) -> ControlFlow<Self::BreakValue> {
         use yul::StmtKind as Yul;
+        if self.has_ignore_next(stmt.span) {
+            return ControlFlow::Continue(());
+        }
+
         match &stmt.kind {
             // Simple statements: count each one and insert a probe before it.
             Yul::VarDecl(..)
