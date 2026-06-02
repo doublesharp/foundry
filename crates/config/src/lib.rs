@@ -9139,7 +9139,7 @@ mod tests {
                 "foundry.toml",
                 r#"
                 [profile.default.coverage]
-                report = ["summary", "lcov"]
+                report = ["summary", "lcov", "json"]
                 lcov_version = "2.2.0"
                 ir_minimum = true
                 report_file = "out/lcov.info"
@@ -9151,7 +9151,11 @@ mod tests {
             let config = Config::load_with_root(jail.directory()).unwrap();
             assert_eq!(
                 config.coverage.report,
-                vec![CoverageReportKind::Summary, CoverageReportKind::Lcov]
+                vec![
+                    CoverageReportKind::Summary,
+                    CoverageReportKind::Lcov,
+                    CoverageReportKind::Json,
+                ]
             );
             assert_eq!(config.coverage.lcov_version, semver::Version::new(2, 2, 0));
             assert!(config.coverage.ir_minimum);

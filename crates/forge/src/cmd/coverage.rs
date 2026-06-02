@@ -5,7 +5,7 @@ use super::{
 use crate::coverage::{
     BytecodeReporter, ContractId, CoverageAttributionReporter, CoverageItem, CoverageItemKind,
     CoverageReport, CoverageReporter, CoverageSummaryReporter, DebugReporter, InstrumentedHitMaps,
-    ItemAnchor, LcovReporter, ResolvedHitMap, ResolvedHitMaps, SourceLocation,
+    ItemAnchor, JsonReporter, LcovReporter, ResolvedHitMap, ResolvedHitMaps, SourceLocation,
     analysis::{SourceAnalysis, SourceFiles},
     anchors::{find_anchors, find_execution_anchors},
     instrumentation::{
@@ -249,6 +249,12 @@ impl CoverageArgs {
                 CoverageReportKind::Lcov => {
                     let path = self.report_path(root, "lcov.info");
                     Some(Box::new(LcovReporter::new(path, self.lcov_version.clone())))
+                }
+                CoverageReportKind::Json => {
+                    let path = root.join(
+                        self.report_file.as_deref().unwrap_or("coverage-final.json".as_ref()),
+                    );
+                    Some(Box::new(JsonReporter::new(root.to_path_buf(), path)))
                 }
                 CoverageReportKind::Bytecode => Some(Box::new(BytecodeReporter::new(
                     root.to_path_buf(),
