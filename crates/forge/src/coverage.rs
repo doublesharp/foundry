@@ -1,6 +1,7 @@
 //! Coverage reports.
 
 use crate::result::{TestKind, TestOutcome, TestResult, TestStatus};
+pub(crate) mod instrumented;
 use alloy_primitives::map::{HashMap, HashSet};
 use comfy_table::{
     Attribute, Cell, Color, Row, Table,
