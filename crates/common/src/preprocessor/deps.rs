@@ -29,6 +29,8 @@ pub(crate) struct PreprocessorDependencies {
     pub preprocessed_contracts: BTreeMap<ContractId, Vec<BytecodeDependency>>,
     // Referenced contract ids.
     pub referenced_contracts: HashSet<ContractId>,
+    // Contract ids whose rewritten new-expressions require deploy helpers.
+    pub deploy_helpers: HashSet<ContractId>,
 }
 
 impl PreprocessorDependencies {
@@ -159,7 +161,23 @@ impl PreprocessorDependencies {
             referenced_contracts.extend(dependencies.iter().map(|dep| dep.referenced_contract));
         }
 
-        Self { preprocessed_contracts, referenced_contracts }
+        let deploy_helpers = preprocessed_contracts
+            .values()
+            .flatten()
+            .filter_map(|dependency| {
+                if matches!(&dependency.kind, BytecodeDependencyKind::New { .. }) {
+                    let contract = gcx.hir.contract(dependency.referenced_contract);
+                    contract
+                        .ctor
+                        .filter(|ctor_id| !gcx.hir.function(*ctor_id).parameters.is_empty())
+                        .map(|_| dependency.referenced_contract)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        Self { preprocessed_contracts, referenced_contracts, deploy_helpers }
     }
 }
 
@@ -279,6 +297,16 @@ impl<'gcx, 'src> BytecodeDependencyCollector<'gcx, 'src> {
         let FileName::Real(path) = &source.file.name else {
             return;
         };
+
+        if matches!(&dependency.kind, BytecodeDependencyKind::New { .. })
+            && contract.layout.is_some()
+            && contract
+                .ctor
+                .is_some_and(|ctor_id| !self.gcx.hir.function(ctor_id).parameters.is_empty())
+        {
+            trace!("skip new-expression requiring a deploy helper for custom storage layout");
+            return;
+        }
 
         // Remapped imports can have absolute or symlinked paths, while compiler input paths are
         // relative and configured source directories can be canonicalized.

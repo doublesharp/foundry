@@ -2123,6 +2123,51 @@ Compiling 21 files with [..]
 "#]]);
 });
 
+forgetest_init!(preprocess_custom_storage_layout_constructor, |prj, cmd| {
+    prj.update_config(|config| config.dynamic_test_linking = true);
+
+    prj.add_source(
+        "CustomLayout.sol",
+        r#"
+pragma solidity >=0.8.29;
+
+contract CustomLayout layout at 42 {
+    uint256 public number;
+
+    constructor(uint256 value) {
+        number = value;
+    }
+}
+    "#,
+    );
+
+    prj.add_test(
+        "CustomLayout.t.sol",
+        r#"
+pragma solidity >=0.8.29;
+
+import {Test} from "forge-std/Test.sol";
+import {CustomLayout} from "../src/CustomLayout.sol";
+
+contract CustomLayoutTest is Test {
+    function customCreationCode() internal view returns (bytes memory) {
+        return type(CustomLayout).creationCode;
+    }
+
+    function test_custom_layout_constructor() public {
+        bytes memory creationCode = customCreationCode();
+        assertGt(creationCode.length, 0);
+
+        CustomLayout target = new CustomLayout(42);
+        assertEq(target.number(), 42);
+    }
+}
+    "#,
+    );
+
+    cmd.args(["test", "--match-test", "test_custom_layout_constructor"]).assert_success();
+});
+
 // Test preprocessed contracts with decode internal fns.
 forgetest_init!(preprocess_contract_with_decode_internal, |prj, cmd| {
     prj.initialize_default_contracts();
