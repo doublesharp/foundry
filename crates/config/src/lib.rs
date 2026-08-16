@@ -18,8 +18,8 @@ use figment::{
 };
 use filter::GlobMatcher;
 use foundry_compilers::{
-    ArtifactOutput, ConfigurableArtifacts, Graph, Project, ProjectPathsConfig,
-    RestrictionsWithVersion, VyperLanguage,
+    ArtifactOutput, ConfigurableArtifacts, Graph, LocalCompilerOutputCache, Project,
+    ProjectPathsConfig, RestrictionsWithVersion, VyperLanguage,
     artifacts::{
         BytecodeHash, DebuggingSettings, EvmVersion, Libraries, ModelCheckerSettings,
         ModelCheckerTarget, Optimizer, OptimizerDetails, RevertStrings, Settings, SettingsMetadata,
@@ -48,6 +48,7 @@ use std::{
     fs, io,
     path::{Path, PathBuf},
     str::FromStr,
+    sync::Arc,
 };
 
 #[cfg(windows)]
@@ -1381,13 +1382,20 @@ impl Config {
             builder = builder.sparse_output(filter);
         }
 
-        let project = builder.build(self.compiler()?)?;
+        let mut project = builder.build(self.compiler()?)?;
+
+        if cached
+            && !self.force
+            && let Some(cache_dir) = Self::foundry_compiler_cache_dir()
+        {
+            project
+                .compiler
+                .set_compiler_output_cache(Arc::new(LocalCompilerOutputCache::new(cache_dir)));
+        }
 
         // `ProjectBuilder` slashes paths on Windows. Re-encode a contextual remapping's trailing
         // directory boundary with the native separator so a later `Remapping::to_string` does not
         // discard it while converting the context back to slash-separated solc syntax.
-        #[cfg(windows)]
-        let mut project = project;
         #[cfg(windows)]
         for remapping in &mut project.paths.remappings {
             if let Some(context) = &mut remapping.context
@@ -2304,6 +2312,11 @@ impl Config {
     /// Returns the path to foundry rpc cache dir: `~/.foundry/cache/rpc`.
     pub fn foundry_rpc_cache_dir() -> Option<PathBuf> {
         Some(Self::foundry_cache_dir()?.join("rpc"))
+    }
+
+    /// Returns the directory for locally cached raw compiler output: `~/.foundry/cache/compilers`.
+    pub fn foundry_compiler_cache_dir() -> Option<PathBuf> {
+        Some(Self::foundry_cache_dir()?.join("compilers"))
     }
     /// Returns the path to foundry chain's cache dir: `~/.foundry/cache/rpc/<chain>`
     pub fn foundry_chain_cache_dir(chain_id: impl Into<Chain>) -> Option<PathBuf> {

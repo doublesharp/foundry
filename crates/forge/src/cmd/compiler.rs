@@ -210,11 +210,13 @@ fn resolved_compiler_path(
                 .as_ref()
                 .ok_or_else(|| eyre::eyre!("Solidity compiler is not available"))?;
             match solc {
-                SolcCompiler::AutoDetect => Solc::find_svm_installed_version(&compiler.version)?
-                    .map(|solc| solc.solc)
-                    .ok_or_else(|| {
-                        eyre::eyre!("Solidity compiler {} is not installed", compiler.version)
-                    }),
+                SolcCompiler::AutoDetect | SolcCompiler::AutoDetectWithCache(_) => {
+                    Solc::find_svm_installed_version(&compiler.version)?
+                        .map(|solc| solc.solc)
+                        .ok_or_else(|| {
+                            eyre::eyre!("Solidity compiler {} is not installed", compiler.version)
+                        })
+                }
                 SolcCompiler::Specific(solc) => Ok(solc.solc.clone()),
             }
         }
