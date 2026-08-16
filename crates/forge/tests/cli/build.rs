@@ -182,6 +182,54 @@ contract CacheConsumer is Dependency {
     );
 });
 
+#[cfg(unix)]
+forgetest!(filtered_test_no_cache_bypasses_shared_compiler_cache, |prj, cmd| {
+    let home = tempfile::tempdir().unwrap();
+    let wrapper_dir = tempfile::tempdir().unwrap();
+    let invocations = wrapper_dir.path().join("standard-json-invocations");
+    let wrapper = wrapper_dir.path().join("solc-wrapper");
+    let solc = Solc::find_svm_installed_version(&"0.8.35".parse().unwrap()).unwrap().unwrap();
+    write_counting_solc(&wrapper, &solc.solc, &invocations, "identity-one");
+
+    add_shared_cache_project(&prj, &wrapper);
+    prj.add_raw_test(
+        "CacheConsumer.t.sol",
+        r#"// SPDX-License-Identifier: MIT
+pragma solidity 0.8.35;
+
+contract CacheConsumerTest {
+    function testFilteredNoCache() public pure {}
+}
+"#,
+    );
+
+    cmd.env("HOME", home.path());
+    cmd.args(["test", "--match-test", "testFilteredNoCache", "--allow-local-compiler"])
+        .assert_success();
+    assert_eq!(
+        compiler_invocations(&invocations),
+        2,
+        "filtered test prewarm must compile its ABI discovery and final project outputs"
+    );
+
+    prj.clear();
+    cmd.forge_fuse().env("HOME", home.path());
+    cmd.args([
+        "test",
+        "--match-test",
+        "testFilteredNoCache",
+        "--no-cache",
+        "--allow-local-compiler",
+    ])
+    .assert_success();
+    assert_eq!(
+        compiler_invocations(&invocations),
+        4,
+        "filtered ABI discovery and the final --no-cache compilation must both bypass shared output"
+    );
+    assert!(!prj.cache().exists(), "--no-cache must not write the local project cache");
+});
+
 fn git(root: &Path, args: &[&str]) -> String {
     let output = Command::new("git").current_dir(root).args(args).output().unwrap();
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));

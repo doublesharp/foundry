@@ -1385,6 +1385,7 @@ impl Config {
         let mut project = builder.build(self.compiler()?)?;
 
         if cached
+            && self.cache
             && !self.force
             && let Some(cache_dir) = Self::foundry_compiler_cache_dir()
         {
