@@ -8,12 +8,11 @@ use super::{
 use alloy_primitives::map::{B256HashMap, HashMap};
 use eyre::Result;
 use foundry_compilers::{ProjectCompileOutput, ProjectPathsConfig, VYPER_EXTENSIONS};
-use semver::Version;
 use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Clone, Debug)]
 struct InstrumentedCoverageItemIds {
-    version: Version,
+    build_id: String,
     line_item_id: u32,
     statement_item_id: Option<u32>,
     branch_item_id: Option<u32>,
@@ -53,9 +52,10 @@ pub(crate) fn prepare(
     exclude_tests: bool,
 ) -> Result<(CoverageReport, InstrumentedCoverageTagIndex)> {
     let mut report = CoverageReport::default();
-    let mut included_sources = BTreeSet::new();
+    let mut grouped = BTreeMap::<(String, u32), Vec<&InstrumentedCoverageProbe>>::new();
+    let mut seen_sources = BTreeSet::new();
 
-    for (path, source_file, version) in output.output().sources.sources_with_version() {
+    for (path, sources) in &output.output().sources.0 {
         if path
             .extension()
             .and_then(|s| s.to_str())
@@ -64,37 +64,39 @@ pub(crate) fn prepare(
             continue;
         }
 
-        report.add_source(version.clone(), source_file.id as usize, path.clone());
+        for source in sources {
+            let source_file = &source.source_file;
+            if !seen_sources.insert((source.version.clone(), path.clone(), source_file.id)) {
+                continue;
+            }
 
-        if (!include_libs && project_paths.has_library_ancestor(path))
-            || (exclude_tests && project_paths.is_test(path))
-        {
-            continue;
+            report.add_source(source.build_id.clone(), source_file.id as usize, path.clone());
+
+            if (!include_libs && project_paths.has_library_ancestor(path))
+                || (exclude_tests && project_paths.is_test(path))
+            {
+                continue;
+            }
+
+            let probes = instrumentation
+                .probes
+                .iter()
+                .filter(|probe| probe.version == source.version && probe.path == *path)
+                .collect::<Vec<_>>();
+            if !probes.is_empty() {
+                grouped.insert((source.build_id.clone(), source_file.id), probes);
+            }
         }
-
-        included_sources.insert((version.clone(), path.clone(), source_file.id));
     }
 
-    let mut grouped = BTreeMap::<(Version, u32), Vec<&InstrumentedCoverageProbe>>::new();
-    for probe in &instrumentation.probes {
-        let Some(source_id) = report.get_source_id(probe.version.clone(), probe.path.clone())
-        else {
-            continue;
-        };
-        if included_sources.contains(&(probe.version.clone(), probe.path.clone(), source_id as u32))
-        {
-            grouped.entry((probe.version.clone(), source_id as u32)).or_default().push(probe);
-        }
-    }
-
-    let mut by_version = HashMap::<Version, Vec<(u32, Vec<CoverageItem>)>>::default();
-    for ((version, source_id), probes) in &grouped {
+    let mut by_build = HashMap::<String, Vec<(u32, Vec<CoverageItem>)>>::default();
+    for ((build_id, source_id), probes) in &grouped {
         let items = build_source_items(*source_id, probes);
-        by_version.entry(version.clone()).or_default().push((*source_id, items));
+        by_build.entry(build_id.clone()).or_default().push((*source_id, items));
     }
 
     let mut tag_index = InstrumentedCoverageTagIndex::default();
-    for (version, sourced_items) in by_version {
+    for (build_id, sourced_items) in by_build {
         let analysis = SourceAnalysis::from_sourced_items(sourced_items);
         let mut indexed_sources = BTreeSet::new();
         let mut line_item_ids = HashMap::<(u32, u32, u32), u32>::default();
@@ -102,8 +104,8 @@ pub(crate) fn prepare(
         let mut branch_item_ids = HashMap::<(u32, u32, u32), u32>::default();
         let mut function_item_ids = HashMap::<(u32, u32, u32), u32>::default();
 
-        for ((probe_version, source_id), probes) in &grouped {
-            if *probe_version != version {
+        for ((probe_build_id, source_id), probes) in &grouped {
+            if *probe_build_id != build_id {
                 continue;
             }
             if indexed_sources.insert(*source_id) {
@@ -189,7 +191,7 @@ pub(crate) fn prepare(
                     tag_index.0.insert(
                         probe.tag,
                         InstrumentedCoverageItemIds {
-                            version: version.clone(),
+                            build_id: build_id.clone(),
                             line_item_id,
                             statement_item_id,
                             branch_item_id,
@@ -200,7 +202,7 @@ pub(crate) fn prepare(
                 }
             }
         }
-        report.add_analysis(version, analysis);
+        report.add_analysis(build_id, analysis);
     }
 
     Ok((report, tag_index))
@@ -220,6 +222,7 @@ fn make_item(
             bytes: probe.bytes.clone(),
             lines: probe.lines.clone(),
         },
+        anchor_loc: None,
         hits: 0,
     }
 }
@@ -297,11 +300,11 @@ pub(crate) fn add_hits(
     index: &InstrumentedCoverageTagIndex,
     hits: &InstrumentedHitMaps,
 ) -> Result<()> {
-    let mut require_hits = BTreeMap::<(Version, u32, u32), InstrumentedRequireBranchHits>::new();
+    let mut require_hits = BTreeMap::<(String, u32, u32), InstrumentedRequireBranchHits>::new();
 
     for (tag, hit_count) in &hits.0 {
         let Some(item_ids) = index.0.get(tag) else { continue };
-        let Some(analysis) = report.analyses.get_mut(&item_ids.version) else { continue };
+        let Some(analysis) = report.analyses.get_mut(&item_ids.build_id) else { continue };
         let items = analysis.all_items_mut();
         let hit_count = (*hit_count).min(u32::MAX as u64) as u32;
 
@@ -318,7 +321,7 @@ pub(crate) fn add_hits(
         if let Some(require_branch) = &item_ids.require_branch {
             let entry = require_hits
                 .entry((
-                    item_ids.version.clone(),
+                    item_ids.build_id.clone(),
                     require_branch.false_item_id,
                     require_branch.true_item_id,
                 ))
@@ -346,8 +349,8 @@ pub(crate) fn add_hits(
         }
     }
 
-    for ((version, _, _), hits) in require_hits {
-        let Some(analysis) = report.analyses.get_mut(&version) else { continue };
+    for ((build_id, _, _), hits) in require_hits {
+        let Some(analysis) = report.analyses.get_mut(&build_id) else { continue };
         let items = analysis.all_items_mut();
         if let Some(branch) = items.get_mut(hits.false_item_id as usize) {
             branch.hits = branch.hits.saturating_add(hits.pre.saturating_sub(hits.post));

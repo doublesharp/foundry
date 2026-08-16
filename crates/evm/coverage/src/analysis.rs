@@ -558,7 +558,7 @@ impl SourceAnalysis {
     #[instrument(name = "SourceAnalysis::new", skip_all)]
     pub fn new(data: &SourceFiles, output: &ProjectCompileOutput) -> eyre::Result<Self> {
         let mut resolved_empty_special_functions = Vec::new();
-        let mut sourced_items = output.parser().solc().compiler().enter(|compiler| {
+        let sourced_items = output.parser().solc().compiler().enter(|compiler| {
             resolved_empty_special_functions =
                 resolve_empty_special_functions(compiler.gcx(), data);
             data.sources
