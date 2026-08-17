@@ -26,6 +26,7 @@ use similar_asserts::assert_eq;
 use std::{
     fs,
     path::{Path, PathBuf},
+    process::Command,
     str::FromStr,
     thread,
 };
@@ -307,6 +308,76 @@ include = []
 exclude = []
 
 "#;
+
+#[cfg(feature = "forge-ds")]
+forgetest!(forge_ds_binary_defaults_are_isolated_and_overridable, |prj, cmd| {
+    fn config_paths(
+        cmd: &mut TestCommand,
+        root: &Path,
+        binary: &Path,
+        args: &[&str],
+        env: &[(&str, &str)],
+    ) -> (PathBuf, PathBuf) {
+        let mut process = Command::new(binary);
+        process.current_dir(root).env("NO_COLOR", "1");
+        cmd.set_cmd(process);
+        cmd.envs(env.iter().copied());
+        let output =
+            cmd.args(["config", "--json"]).args(args).assert_success().get_output().stdout.clone();
+        let config = serde_json::from_slice::<Value>(&output).unwrap();
+        (config["out"].as_str().unwrap().into(), config["cache_path"].as_str().unwrap().into())
+    }
+
+    let root = prj.root().to_path_buf();
+    let forge = Path::new(env!("CARGO_BIN_EXE_forge"));
+    let forge_ds = Path::new(env!("CARGO_BIN_EXE_forge-ds"));
+    assert_eq!(config_paths(&mut cmd, &root, forge, &[], &[]), ("out".into(), "cache".into()));
+    assert_eq!(
+        config_paths(&mut cmd, &root, forge_ds, &[], &[]),
+        ("forge-ds-out".into(), "forge-ds-cache".into())
+    );
+
+    fs::remove_dir(prj.root().join("out")).unwrap();
+    fs::create_dir(prj.root().join("artifacts")).unwrap();
+    assert_eq!(
+        config_paths(&mut cmd, &root, forge_ds, &[], &[]),
+        ("artifacts".into(), "forge-ds-cache".into())
+    );
+    fs::remove_dir(prj.root().join("artifacts")).unwrap();
+
+    prj.write_config(Config {
+        out: "toml-out".into(),
+        cache_path: "toml-cache".into(),
+        ..Default::default()
+    });
+    assert_eq!(
+        config_paths(&mut cmd, &root, forge_ds, &[], &[]),
+        ("toml-out".into(), "toml-cache".into())
+    );
+    fs::remove_file(prj.root().join(Config::FILE_NAME)).unwrap();
+
+    assert_eq!(
+        config_paths(
+            &mut cmd,
+            &root,
+            forge_ds,
+            &[],
+            &[("FOUNDRY_OUT", "env-out"), ("FOUNDRY_CACHE_PATH", "env-cache")],
+        ),
+        ("env-out".into(), "env-cache".into())
+    );
+
+    assert_eq!(
+        config_paths(
+            &mut cmd,
+            &root,
+            forge_ds,
+            &["--out", "cli-out", "--cache-path", "cli-cache"],
+            &[],
+        ),
+        ("cli-out".into(), "cli-cache".into())
+    );
+});
 
 // tests all config values that are in use
 forgetest!(can_extract_config_values, |prj, cmd| {

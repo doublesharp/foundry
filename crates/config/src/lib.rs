@@ -48,7 +48,7 @@ use std::{
     fs, io,
     path::{Path, PathBuf},
     str::FromStr,
-    sync::Arc,
+    sync::{Arc, OnceLock},
 };
 
 #[cfg(windows)]
@@ -155,6 +155,31 @@ pub use semver;
 
 #[cfg(not(test))]
 static SELECTED_PROFILE: std::sync::OnceLock<Profile> = std::sync::OnceLock::new();
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ProjectPathDefaults {
+    out: &'static str,
+    cache_path: &'static str,
+}
+
+const STANDARD_PROJECT_PATH_DEFAULTS: ProjectPathDefaults =
+    ProjectPathDefaults { out: "out", cache_path: "cache" };
+static PROJECT_PATH_DEFAULTS: OnceLock<ProjectPathDefaults> = OnceLock::new();
+
+/// Overrides process-local project path defaults before configuration loading.
+///
+/// This is intended for feature-built Foundry binaries. File, environment, and command-line
+/// providers retain their normal higher precedence.
+#[doc(hidden)]
+pub fn set_process_default_paths(out: &'static str, cache_path: &'static str) {
+    let requested = ProjectPathDefaults { out, cache_path };
+    let configured = PROJECT_PATH_DEFAULTS.get_or_init(|| requested);
+    assert_eq!(configured, &requested, "project path defaults were already initialized");
+}
+
+fn project_path_defaults() -> ProjectPathDefaults {
+    PROJECT_PATH_DEFAULTS.get().copied().unwrap_or(STANDARD_PROJECT_PATH_DEFAULTS)
+}
 
 /// Foundry configuration
 ///
@@ -981,8 +1006,11 @@ impl Config {
 
         let root = self.root.as_path();
         let profile = Self::selected_profile();
-        let mut figment = Figment::default()
-            .merge(DappHardhatDirProvider { root, detect_src: self.uses_default_src() });
+        let mut figment = Figment::default().merge(DappHardhatDirProvider {
+            root,
+            detect_src: self.uses_default_src(),
+            default_out: &self.out,
+        });
 
         // merge global foundry.toml file
         if let Some(global_toml) = Self::foundry_dir_toml().filter(|p| p.exists()) {
@@ -2115,8 +2143,13 @@ impl Config {
             // directories are read below, so opt out of it.
             .remappings(Vec::new())
             .build_with_root::<()>(root);
-        let artifacts: PathBuf = paths.artifacts.file_name().unwrap().into();
+        let detected_artifacts: PathBuf = paths.artifacts.file_name().unwrap().into();
         let mut config = Self::default();
+        let artifacts = if detected_artifacts == Path::new(STANDARD_PROJECT_PATH_DEFAULTS.out) {
+            config.out.clone()
+        } else {
+            detected_artifacts
+        };
         if config.uses_default_src() {
             config.src = paths.sources.file_name().unwrap().into();
         }
@@ -2925,21 +2958,22 @@ impl Provider for Config {
 
 impl Default for Config {
     fn default() -> Self {
+        let project_paths = project_path_defaults();
         Self {
             profile: Self::DEFAULT_PROFILE,
             profiles: vec![Self::DEFAULT_PROFILE],
-            fs_permissions: FsPermissions::new([PathPermission::read("out")]),
+            fs_permissions: FsPermissions::new([PathPermission::read(project_paths.out)]),
             isolate: true,
             root: root_default(),
             extends: None,
             src: Self::DEFAULT_SRC.into(),
             test: "test".into(),
             script: "script".into(),
-            out: "out".into(),
+            out: project_paths.out.into(),
             libs: vec!["lib".into()],
             cache: true,
             dynamic_test_linking: true,
-            cache_path: "cache".into(),
+            cache_path: project_paths.cache_path.into(),
             broadcast: "broadcast".into(),
             snapshots: "snapshots".into(),
             gas_snapshot_check: false,
