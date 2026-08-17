@@ -156,7 +156,7 @@ pub use semver;
 #[cfg(not(test))]
 static SELECTED_PROFILE: std::sync::OnceLock<Profile> = std::sync::OnceLock::new();
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 struct ProjectPathDefaults {
     out: &'static str,
     cache_path: &'static str,
@@ -168,8 +168,8 @@ static PROJECT_PATH_DEFAULTS: OnceLock<ProjectPathDefaults> = OnceLock::new();
 
 /// Overrides process-local project path defaults before configuration loading.
 ///
-/// This is intended for feature-built Foundry binaries. File, environment, and command-line
-/// providers retain their normal higher precedence.
+/// This is intended for feature-built Foundry binaries. These paths override file-based project
+/// configuration while environment and command-line providers retain higher precedence.
 #[doc(hidden)]
 pub fn set_process_default_paths(out: &'static str, cache_path: &'static str) {
     let requested = ProjectPathDefaults { out, cache_path };
@@ -1026,6 +1026,9 @@ impl Config {
             TomlFileProvider::new(Some("FOUNDRY_CONFIG"), root.join(Self::FILE_NAME)),
             profile.clone(),
         );
+        if let Some(project_paths) = PROJECT_PATH_DEFAULTS.get() {
+            figment = figment.merge(Serialized::from(project_paths, profile.clone()));
+        }
 
         // merge environment variables
         figment = figment
@@ -2145,7 +2148,9 @@ impl Config {
             .build_with_root::<()>(root);
         let detected_artifacts: PathBuf = paths.artifacts.file_name().unwrap().into();
         let mut config = Self::default();
-        let artifacts = if detected_artifacts == Path::new(STANDARD_PROJECT_PATH_DEFAULTS.out) {
+        let artifacts = if PROJECT_PATH_DEFAULTS.get().is_some()
+            || detected_artifacts == Path::new(STANDARD_PROJECT_PATH_DEFAULTS.out)
+        {
             config.out.clone()
         } else {
             detected_artifacts

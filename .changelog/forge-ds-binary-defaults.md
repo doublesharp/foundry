@@ -3,4 +3,4 @@ forge: minor
 foundry-config: patch
 ---
 
-Added a portable feature-built Forge mode with isolated default artifact and project-cache paths while preserving explicit configuration overrides.
+Added a portable `forge-ds` executable whose artifact and project-cache isolation overrides project configuration while preserving explicit environment and command-line overrides.
