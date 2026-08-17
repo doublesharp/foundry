@@ -1509,7 +1509,14 @@ impl TestArgs {
             return Ok((src_files().chain(test_files()).collect(), None));
         }
 
-        let mut project = config.create_project(config.cache, true)?;
+        if test_filter.has_only_path_filters() {
+            let sources = src_files()
+                .chain(test_files())
+                .filter(|path| !path.is_sol_test() || test_filter.matches_path(path))
+                .collect();
+            return Ok((sources, None));
+        }
+
         let sources = src_files()
             .chain(
                 // Preserve path-filter behavior for conventional test files while still
@@ -1517,6 +1524,7 @@ impl TestArgs {
                 test_files().filter(|path| !path.is_sol_test() || test_filter.matches_path(path)),
             )
             .collect::<BTreeSet<_>>();
+        let mut project = config.create_project(config.cache, true)?;
         let output = compile_abi_project_cached(
             &mut project,
             ProjectCompiler::new()

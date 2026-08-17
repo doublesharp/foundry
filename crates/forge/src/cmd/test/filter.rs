@@ -73,6 +73,15 @@ impl FilterArgs {
             && self.path_pattern_inverse.is_none()
     }
 
+    /// Returns true if this filter only restricts test source paths.
+    pub const fn has_only_path_filters(&self) -> bool {
+        (self.path_pattern.is_some() || self.path_pattern_inverse.is_some())
+            && self.test_pattern.is_none()
+            && self.test_pattern_inverse.is_none()
+            && self.contract_pattern.is_none()
+            && self.contract_pattern_inverse.is_none()
+    }
+
     /// Merges the set filter globs with the config's values
     pub fn merge_with_config(mut self, config: &Config) -> ProjectPathsAwareFilter {
         self.test_pattern =
@@ -173,6 +182,11 @@ impl ProjectPathsAwareFilter {
     /// Returns true if the filter is empty.
     pub const fn is_empty(&self) -> bool {
         self.args_filter.is_empty()
+    }
+
+    /// Returns true if this filter only restricts test source paths.
+    pub const fn has_only_path_filters(&self) -> bool {
+        self.rerun_failures.is_none() && self.args_filter.has_only_path_filters()
     }
 
     /// Returns the CLI arguments.
@@ -278,5 +292,62 @@ impl TestFilter for ProjectPathsAwareFilter {
 impl fmt::Display for ProjectPathsAwareFilter {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.args_filter.fmt(f)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn identifies_only_path_filters() {
+        let include = FilterArgs {
+            path_pattern: Some("test/Selected.t.sol".parse().unwrap()),
+            ..Default::default()
+        };
+        let exclude = FilterArgs {
+            path_pattern_inverse: Some("test/Slow*.t.sol".parse().unwrap()),
+            ..Default::default()
+        };
+        let combined_paths = FilterArgs {
+            path_pattern: Some("test/*.t.sol".parse().unwrap()),
+            path_pattern_inverse: Some("test/Slow*.t.sol".parse().unwrap()),
+            ..Default::default()
+        };
+
+        assert!(include.has_only_path_filters());
+        assert!(exclude.has_only_path_filters());
+        assert!(combined_paths.has_only_path_filters());
+
+        let mut project_filter = include.clone().merge_with_config(&Config::default());
+        assert!(project_filter.has_only_path_filters());
+        project_filter.set_rerun_failures(Vec::new());
+        assert!(!project_filter.has_only_path_filters());
+
+        for filter in [
+            FilterArgs::default(),
+            FilterArgs {
+                path_pattern: Some("test/*.t.sol".parse().unwrap()),
+                test_pattern: Some(regex::Regex::new("testFast").unwrap()),
+                ..Default::default()
+            },
+            FilterArgs {
+                path_pattern: Some("test/*.t.sol".parse().unwrap()),
+                test_pattern_inverse: Some(regex::Regex::new("testSlow").unwrap()),
+                ..Default::default()
+            },
+            FilterArgs {
+                path_pattern: Some("test/*.t.sol".parse().unwrap()),
+                contract_pattern: Some(regex::Regex::new("SelectedTest").unwrap()),
+                ..Default::default()
+            },
+            FilterArgs {
+                path_pattern: Some("test/*.t.sol".parse().unwrap()),
+                contract_pattern_inverse: Some(regex::Regex::new("SlowTest").unwrap()),
+                ..Default::default()
+            },
+        ] {
+            assert!(!filter.has_only_path_filters());
+        }
     }
 }

@@ -1,8 +1,12 @@
 //! Contains various tests for `forge test`.
 
+#[cfg(unix)]
+use crate::build::{compiler_invocations, write_counting_solc};
 use crate::utils::assert_debug_dump_identifies_contract;
 use alloy_primitives::{Address, U256};
 use anvil::{NodeConfig, spawn};
+#[cfg(unix)]
+use foundry_compilers::compilers::solc::Solc;
 use foundry_config::{CompilationRestrictions, SettingsOverrides, filter::GlobMatcher};
 use foundry_test_utils::{
     TestCommand,
@@ -416,6 +420,72 @@ Suite result: ok. 1 passed; 0 failed; 0 skipped; [ELAPSED]
 Ran 1 test suite [ELAPSED]: 1 tests passed, 0 failed, 0 skipped (1 total tests)
 
 "#]]);
+});
+
+#[cfg(unix)]
+forgetest!(path_only_filter_invokes_solc_once, |prj, cmd| {
+    prj.insert_ds_test();
+    prj.add_source(
+        "Fixture.sol",
+        r#"
+contract Fixture {
+    function value() external pure returns (uint256) {
+        return 1;
+    }
+}
+"#,
+    );
+    prj.add_source(
+        "Selected.t.sol",
+        r#"
+import "./test.sol";
+import "./Fixture.sol";
+
+contract SelectedTest is DSTest {
+    function testSelected() external {
+        assertTrue(new Fixture().value() == 1);
+    }
+}
+"#,
+    );
+    prj.add_source(
+        "Unselected.t.sol",
+        r#"
+import "./test.sol";
+
+contract UnselectedTest is DSTest {
+    function testMustNotRun() external {
+        assertTrue(false);
+    }
+}
+"#,
+    );
+
+    let wrapper_dir = tempfile::tempdir().unwrap();
+    let invocations = wrapper_dir.path().join("standard-json-invocations");
+    let wrapper = wrapper_dir.path().join("solc-wrapper");
+    let solc = Solc::find_svm_installed_version(&"0.8.35".parse().unwrap()).unwrap().unwrap();
+    write_counting_solc(&wrapper, &solc.solc, &invocations, "path-only-filter");
+    prj.update_config(|config| {
+        config.solc = Some(foundry_config::SolcReq::Local(wrapper));
+        config.optimizer = Some(true);
+        config.via_ir = true;
+    });
+
+    cmd.args([
+        "test",
+        "--match-path",
+        "*src/Selected.t.sol",
+        "--no-cache",
+        "--allow-local-compiler",
+    ])
+    .assert_success();
+
+    assert_eq!(
+        compiler_invocations(&invocations),
+        1,
+        "path-only filtering must not perform a separate ABI compiler pass"
+    );
 });
 
 // tests that using the --match-path option works with absolute paths
