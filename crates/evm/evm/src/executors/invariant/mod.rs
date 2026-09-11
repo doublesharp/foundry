@@ -40,7 +40,7 @@ use foundry_evm_core::{
     evm::FoundryEvmNetwork,
     precompiles::PRECOMPILES,
 };
-use foundry_evm_coverage::HitMaps;
+use foundry_evm_coverage::{HitMaps, InstrumentedHitMaps};
 use foundry_evm_fuzz::{
     BasicTxDetails, FuzzCase, FuzzFixtures, ObservedCall,
     invariant::{
@@ -582,6 +582,8 @@ struct InvariantTestData {
     gas_report_traces: Vec<Vec<CallTraceArena>>,
     // Line coverage information collected from all fuzzed calls.
     line_coverage: Option<HitMaps>,
+    // Instrumented coverage information collected from all fuzzed calls.
+    instrumented_coverage: Option<InstrumentedHitMaps>,
     // Metrics for each fuzzed selector.
     metrics: HashMap<String, InvariantMetrics>,
     // Cache from fuzzed (target, selector) to its metric key. Only resolved keys are cached and
@@ -625,6 +627,7 @@ impl InvariantTest {
             last_run_inputs: vec![],
             gas_report_traces: vec![],
             line_coverage: None,
+            instrumented_coverage: None,
             metrics: HashMap::default(),
             metric_key_cache: HashMap::default(),
             branch_runner,
@@ -652,6 +655,10 @@ impl InvariantTest {
     /// Merge current collected line coverage with the new coverage from last fuzzed call.
     fn merge_line_coverage(&mut self, new_coverage: Option<HitMaps>) {
         HitMaps::merge_opt(&mut self.test_data.line_coverage, new_coverage);
+    }
+
+    fn merge_instrumented_coverage(&mut self, new_coverage: Option<InstrumentedHitMaps>) {
+        InstrumentedHitMaps::merge_opt(&mut self.test_data.instrumented_coverage, new_coverage);
     }
 
     /// Update metrics for a fuzzed selector, extracted from tx details.
@@ -755,6 +762,8 @@ struct InvariantTestRun<FEN: FoundryEvmNetwork> {
     new_coverage: bool,
     // Line coverage staged until the run is accepted.
     line_coverage: Option<HitMaps>,
+    // Instrumented coverage staged until the run is accepted.
+    instrumented_coverage: Option<InstrumentedHitMaps>,
     // Whether this run's inputs should become the reported last run.
     save_last_run_inputs: bool,
     // For optimization mode: the best value found during this run (if any).
@@ -796,6 +805,7 @@ impl<FEN: FoundryEvmNetwork> InvariantTestRun<FEN> {
             rejects: 0,
             new_coverage: false,
             line_coverage: None,
+            instrumented_coverage: None,
             save_last_run_inputs: false,
             optimization_value: None,
             optimization_prefix_len: 0,
@@ -1227,6 +1237,10 @@ impl<'a, FEN: FoundryEvmNetwork> InvariantExecutor<'a, FEN> {
                                 &mut current_run.line_coverage,
                                 call_result.line_coverage.take(),
                             );
+                            InstrumentedHitMaps::merge_opt(
+                                &mut current_run.instrumented_coverage,
+                                call_result.instrumented_coverage.take(),
+                            );
                             assertion_failure = !discarded
                                 && did_fail_on_assert(call_result, &call_result.state_changeset);
                             pre_merge_edges_hash = assertion_failure
@@ -1514,6 +1528,7 @@ impl<'a, FEN: FoundryEvmNetwork> InvariantExecutor<'a, FEN> {
                 );
             }
             invariant_test.merge_line_coverage(current_run.line_coverage.take());
+            invariant_test.merge_instrumented_coverage(current_run.instrumented_coverage.take());
             for fuzz_run in &current_run.fuzz_runs {
                 campaign_state.record_call(fuzz_run.gas);
             }
@@ -1627,6 +1642,7 @@ impl<'a, FEN: FoundryEvmNetwork> InvariantExecutor<'a, FEN> {
             result.last_run_inputs,
             result.gas_report_traces,
             result.line_coverage,
+            result.instrumented_coverage,
             result.metrics.into_iter().collect(),
             if plan.worker_id == 0 { corpus_manager.failed_replays } else { 0 },
             1,

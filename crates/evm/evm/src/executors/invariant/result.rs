@@ -16,7 +16,7 @@ use foundry_evm_core::{
     evm::FoundryEvmNetwork,
     utils::StateChangeset,
 };
-use foundry_evm_coverage::HitMaps;
+use foundry_evm_coverage::{HitMaps, InstrumentedHitMaps};
 use foundry_evm_fuzz::{
     BasicTxDetails,
     invariant::{FuzzRunIdentifiedContracts, InvariantContract},
@@ -47,6 +47,8 @@ pub struct InvariantFuzzTestResult {
     pub gas_report_traces: Vec<Vec<CallTraceArena>>,
     /// The coverage info collected during the invariant test runs.
     pub line_coverage: Option<HitMaps>,
+    /// The instrumented coverage info collected during the invariant test runs.
+    pub instrumented_coverage: Option<InstrumentedHitMaps>,
     /// Fuzzed selectors metrics collected during the invariant test runs.
     pub metrics: HashMap<String, InvariantMetrics>,
     /// Number of failed replays from persisted corpus.
@@ -73,6 +75,7 @@ impl InvariantFuzzTestResult {
         last_run_inputs: Vec<BasicTxDetails>,
         gas_report_traces: Vec<Vec<CallTraceArena>>,
         line_coverage: Option<HitMaps>,
+        instrumented_coverage: Option<InstrumentedHitMaps>,
         metrics: HashMap<String, InvariantMetrics>,
         failed_corpus_replays: usize,
         workers: usize,
@@ -97,6 +100,7 @@ impl InvariantFuzzTestResult {
             last_run_inputs,
             gas_report_traces,
             line_coverage,
+            instrumented_coverage,
             metrics,
             failed_corpus_replays,
             workers,

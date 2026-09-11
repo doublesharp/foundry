@@ -425,6 +425,28 @@ pub struct FuzzFailureReplayConfig {
     pub test: String,
 }
 
+/// Coverage collection mode for test execution.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CoverageMode {
+    /// Do not collect coverage.
+    #[default]
+    None,
+    /// Collect coverage from source maps.
+    SourceMap,
+    /// Collect source-instrumented coverage hits.
+    Instrumented,
+}
+
+impl CoverageMode {
+    pub const fn source_map_enabled(self) -> bool {
+        matches!(self, Self::SourceMap)
+    }
+
+    pub const fn instrumented_enabled(self) -> bool {
+        matches!(self, Self::Instrumented)
+    }
+}
+
 /// Configuration for the test runner.
 ///
 /// This is modified after instantiation through inline config.
@@ -454,8 +476,8 @@ pub struct TestRunnerConfig<FEN: FoundryEvmNetwork> {
     /// The address which will be used to deploy the initial contracts and send all transactions.
     pub sender: Address,
 
-    /// Whether to collect line coverage info
-    pub line_coverage: bool,
+    /// Coverage collection mode.
+    pub coverage: CoverageMode,
     /// Whether to collect debug info
     pub debug: bool,
     /// Whether to enable steps tracking in the tracer.
@@ -503,7 +525,7 @@ impl<FEN: FoundryEvmNetwork> TestRunnerConfig<FEN> {
         );
         self.spec_id = self.evm_env.cfg_env.spec;
         self.isolation = config.isolate;
-        // `line_coverage`, `debug`, `decode_internal` and `record_all_steps` are Forge-specific
+        // `coverage`, `debug`, `decode_internal` and `record_all_steps` are Forge-specific
         // and not present in the config.
         // TODO: `self.evm_opts` and `self.evm_env` are only partially reconfigured.
         self.evm_opts.always_use_create_2_factory = config.always_use_create_2_factory;
@@ -525,7 +547,8 @@ impl<FEN: FoundryEvmNetwork> TestRunnerConfig<FEN> {
             cheatcodes.config = Arc::new(config);
         }
         inspector.tracing_requirements(self.trace_requirements());
-        inspector.collect_line_coverage(self.line_coverage);
+        inspector.collect_line_coverage(self.coverage.source_map_enabled());
+        inspector.collect_instrumented_coverage(self.coverage.instrumented_enabled());
         inspector.enable_isolation(self.isolation);
         executor.set_spec_id(self.spec_id);
         executor.set_legacy_assertions(self.config.legacy_assertions);
@@ -555,7 +578,8 @@ impl<FEN: FoundryEvmNetwork> TestRunnerConfig<FEN> {
                     .logs(self.config.live_logs)
                     .cheatcodes(cheats_config)
                     .trace_requirements(self.trace_requirements())
-                    .line_coverage(self.line_coverage)
+                    .line_coverage(self.coverage.source_map_enabled())
+                    .instrumented_coverage(self.coverage.instrumented_enabled())
                     .enable_isolation(self.isolation)
                     .create2_deployer(self.evm_opts.create2_deployer)
                     .set_analysis(analysis)
@@ -594,8 +618,8 @@ pub struct MultiContractRunnerBuilder {
     pub config: Arc<Config>,
     /// Parsed inline configuration.
     pub inline_config: Arc<InlineConfig>,
-    /// Whether or not to collect line coverage info
-    pub line_coverage: bool,
+    /// Coverage collection mode.
+    pub coverage: CoverageMode,
     /// Whether or not to collect debug info
     pub debug: bool,
     /// Whether to enable steps tracking in the tracer.
@@ -640,7 +664,7 @@ impl MultiContractRunnerBuilder {
             fork: None,
             fork_chain_id: None,
             fork_hardfork: None,
-            line_coverage: false,
+            coverage: Default::default(),
             debug: false,
             isolation: false,
             decode_internal: Default::default(),
@@ -715,7 +739,17 @@ impl MultiContractRunnerBuilder {
     }
 
     pub const fn set_coverage(mut self, enable: bool) -> Self {
-        self.line_coverage = enable;
+        self.coverage = if enable { CoverageMode::SourceMap } else { CoverageMode::None };
+        self
+    }
+
+    pub const fn set_instrumented_coverage(mut self, enable: bool) -> Self {
+        self.coverage = if enable { CoverageMode::Instrumented } else { CoverageMode::None };
+        self
+    }
+
+    pub const fn set_coverage_mode(mut self, coverage: CoverageMode) -> Self {
+        self.coverage = coverage;
         self
     }
 
@@ -936,7 +970,7 @@ impl MultiContractRunnerBuilder {
                 fork_chain_id,
                 fork_hardfork: self.fork_hardfork,
                 sender: self.sender.unwrap_or(self.config.sender),
-                line_coverage: self.line_coverage,
+                coverage: self.coverage,
                 debug: self.debug,
                 decode_internal: self.decode_internal,
                 record_all_steps: self.record_all_steps,

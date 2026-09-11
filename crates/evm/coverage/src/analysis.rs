@@ -558,7 +558,7 @@ impl SourceAnalysis {
     #[instrument(name = "SourceAnalysis::new", skip_all)]
     pub fn new(data: &SourceFiles, output: &ProjectCompileOutput) -> eyre::Result<Self> {
         let mut resolved_empty_special_functions = Vec::new();
-        let mut sourced_items = output.parser().solc().compiler().enter(|compiler| {
+        let sourced_items = output.parser().solc().compiler().enter(|compiler| {
             resolved_empty_special_functions =
                 resolve_empty_special_functions(compiler.gcx(), data);
             data.sources
@@ -615,9 +615,24 @@ impl SourceAnalysis {
                 .collect::<Vec<(u32, Vec<CoverageItem>)>>()
         });
 
+        Ok(Self::from_sourced_items_with_empty_special_functions(
+            sourced_items,
+            resolved_empty_special_functions,
+        ))
+    }
+
+    /// Creates a source analysis from precomputed coverage items.
+    pub fn from_sourced_items(sourced_items: Vec<(u32, Vec<CoverageItem>)>) -> Self {
+        Self::from_sourced_items_with_empty_special_functions(sourced_items, Vec::new())
+    }
+
+    fn from_sourced_items_with_empty_special_functions(
+        mut sourced_items: Vec<(u32, Vec<CoverageItem>)>,
+        resolved_empty_special_functions: Vec<ResolvedEmptySpecialFunction>,
+    ) -> Self {
         // Create mapping and merge items.
         sourced_items.sort_by_key(|(id, items)| (*id, items.first().map(|i| i.loc.bytes.start)));
-        let Some(&(max_idx, _)) = sourced_items.last() else { return Ok(Self::default()) };
+        let Some(&(max_idx, _)) = sourced_items.last() else { return Self::default() };
         let len = max_idx + 1;
         let mut all_items = Vec::new();
         let mut map = vec![(u32::MAX, 0); len as usize];
@@ -655,7 +670,7 @@ impl SourceAnalysis {
                 .extend(item_ids);
         }
 
-        Ok(Self { all_items, map, empty_special_functions, contract_empty_special_functions })
+        Self { all_items, map, empty_special_functions, contract_empty_special_functions }
     }
 
     /// Returns all the coverage items.

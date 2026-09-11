@@ -1,4 +1,4 @@
-//! The `forge` CLI: build, test, fuzz, debug and deploy Solidity contracts.
+//! Forge with isolated default artifact and project-cache paths.
 
 #![cfg_attr(
     target_os = "macos",
@@ -11,5 +11,6 @@
 mod shared;
 
 fn main() {
+    foundry_config::set_process_default_paths("forge-ds-out", "forge-ds-cache");
     shared::run();
 }

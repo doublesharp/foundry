@@ -5,7 +5,7 @@ use super::{
 use crate::executors::{EarlyExit, EvmExecutionCancellation};
 use alloy_primitives::{Address, I256, Selector};
 use eyre::{Result, ensure};
-use foundry_evm_coverage::HitMaps;
+use foundry_evm_coverage::{HitMaps, InstrumentedHitMaps};
 use foundry_evm_fuzz::BasicTxDetails;
 use std::{
     collections::{HashMap, HashSet},
@@ -280,6 +280,7 @@ fn fold_outputs(outputs: Vec<InvariantWorkerOutput>) -> Result<InvariantFuzzTest
     let mut last_run_inputs = Vec::new();
     let mut gas_report_traces = Vec::new();
     let mut line_coverage = None;
+    let mut instrumented_coverage = None;
     let mut metrics = HashMap::default();
     let mut failed_corpus_replays = 0;
     let mut optimization_best = None;
@@ -300,6 +301,7 @@ fn fold_outputs(outputs: Vec<InvariantWorkerOutput>) -> Result<InvariantFuzzTest
         }
         gas_report_traces.extend(result.gas_report_traces);
         HitMaps::merge_opt(&mut line_coverage, result.line_coverage);
+        InstrumentedHitMaps::merge_opt(&mut instrumented_coverage, result.instrumented_coverage);
         merge_metrics(&mut metrics, result.metrics);
         merge_optimization(
             &mut optimization_best,
@@ -318,6 +320,7 @@ fn fold_outputs(outputs: Vec<InvariantWorkerOutput>) -> Result<InvariantFuzzTest
         last_run_inputs,
         gas_report_traces,
         line_coverage,
+        instrumented_coverage,
         metrics,
         failed_corpus_replays,
         workers,
@@ -446,6 +449,7 @@ mod tests {
             reverts,
             Vec::new(),
             Vec::new(),
+            None,
             None,
             HashMap::default(),
             failed_corpus_replays,

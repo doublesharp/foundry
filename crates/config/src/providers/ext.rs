@@ -1,4 +1,4 @@
-use crate::{Config, extend, utils};
+use crate::{Config, STANDARD_PROJECT_PATH_DEFAULTS, extend, utils};
 use figment::{
     Error, Figment, Metadata, Profile, Provider,
     providers::{Env, Format, Toml},
@@ -545,6 +545,7 @@ fn merge_tracing_labels(legacy: &Dict, tracing: &mut Dict) {
 pub(crate) struct DappHardhatDirProvider<'a> {
     pub(crate) root: &'a Path,
     pub(crate) detect_src: bool,
+    pub(crate) default_out: &'a Path,
 }
 
 impl Provider for DappHardhatDirProvider<'_> {
@@ -565,15 +566,14 @@ impl Provider for DappHardhatDirProvider<'_> {
                     .into(),
             );
         }
-        dict.insert(
-            "out".to_string(),
-            ProjectPathsConfig::find_artifacts_dir(self.root)
-                .file_name()
-                .unwrap()
-                .to_string_lossy()
-                .to_string()
-                .into(),
-        );
+        let detected_out = ProjectPathsConfig::find_artifacts_dir(self.root);
+        let detected_out = detected_out.file_name().unwrap();
+        let out = if detected_out == STANDARD_PROJECT_PATH_DEFAULTS.out {
+            self.default_out.as_os_str()
+        } else {
+            detected_out
+        };
+        dict.insert("out".to_string(), out.to_string_lossy().to_string().into());
 
         // detect libs folders:
         //   if `lib` _and_ `node_modules` exists: include both

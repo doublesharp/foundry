@@ -588,6 +588,45 @@ Ran 1 test suite [ELAPSED]: 1 tests passed, 0 failed, 0 skipped (1 total tests)
     ]]);
 });
 
+// Path filters must exclude runnable tests even when their files do not use `.t.sol`.
+forgetest!(path_filtered_tests_skip_unselected_plain_solidity_tests, |prj, cmd| {
+    prj.update_config(|config| {
+        config.dynamic_test_linking = false;
+        config.optimizer = Some(false);
+        config.via_ir = false;
+    });
+    prj.add_test("Selected.t.sol", "contract Selected { function testSelected() public pure {} }");
+    prj.add_test(
+        "Other.sol",
+        r#"
+contract Other {
+    function testOther(
+        uint256 a0, uint256 a1, uint256 a2, uint256 a3, uint256 a4, uint256 a5,
+        uint256 a6, uint256 a7, uint256 a8, uint256 a9, uint256 a10, uint256 a11,
+        uint256 a12, uint256 a13, uint256 a14, uint256 a15, uint256 a16
+    ) public pure {
+        require(a0 + a1 + a2 + a3 + a4 + a5 + a6 + a7 + a8 + a9 + a10 + a11
+            + a12 + a13 + a14 + a15 + a16 != 123);
+    }
+}
+"#,
+    );
+
+    for filter in [["--match-path", "test/Selected.t.sol"], ["--no-match-path", "test/Other.sol"]] {
+        cmd.forge_fuse().args(["test", "--no-cache"]).args(filter).assert_success().stdout_eq(
+            str![[r#"
+...
+Ran 1 test for test/Selected.t.sol:Selected
+[PASS] testSelected() ([GAS])
+Suite result: ok. 1 passed; 0 failed; 0 skipped; [ELAPSED]
+
+Ran 1 test suite [ELAPSED]: 1 tests passed, 0 failed, 0 skipped (1 total tests)
+
+"#]],
+        );
+    }
+});
+
 // <https://github.com/foundry-rs/foundry/issues/16529>
 forgetest_init!(filtered_tests_preserve_compilation_restrictions, |prj, cmd| {
     prj.wipe_contracts();
@@ -2121,6 +2160,51 @@ Compiling 21 files with [..]
 ...
 
 "#]]);
+});
+
+forgetest_init!(preprocess_custom_storage_layout_constructor, |prj, cmd| {
+    prj.update_config(|config| config.dynamic_test_linking = true);
+
+    prj.add_source(
+        "CustomLayout.sol",
+        r#"
+pragma solidity >=0.8.29;
+
+contract CustomLayout layout at 42 {
+    uint256 public number;
+
+    constructor(uint256 value) {
+        number = value;
+    }
+}
+    "#,
+    );
+
+    prj.add_test(
+        "CustomLayout.t.sol",
+        r#"
+pragma solidity >=0.8.29;
+
+import {Test} from "forge-std/Test.sol";
+import {CustomLayout} from "../src/CustomLayout.sol";
+
+contract CustomLayoutTest is Test {
+    function customCreationCode() internal view returns (bytes memory) {
+        return type(CustomLayout).creationCode;
+    }
+
+    function test_custom_layout_constructor() public {
+        bytes memory creationCode = customCreationCode();
+        assertGt(creationCode.length, 0);
+
+        CustomLayout target = new CustomLayout(42);
+        assertEq(target.number(), 42);
+    }
+}
+    "#,
+    );
+
+    cmd.args(["test", "--match-test", "test_custom_layout_constructor"]).assert_success();
 });
 
 // Test preprocessed contracts with decode internal fns.

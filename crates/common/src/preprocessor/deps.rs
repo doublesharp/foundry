@@ -29,6 +29,8 @@ pub(crate) struct PreprocessorDependencies {
     pub preprocessed_contracts: BTreeMap<ContractId, Vec<BytecodeDependency>>,
     // Referenced contract ids.
     pub referenced_contracts: HashSet<ContractId>,
+    // Contract ids whose rewritten new-expressions require deploy helpers.
+    pub deploy_helpers: HashSet<ContractId>,
 }
 
 impl PreprocessorDependencies {
@@ -159,7 +161,23 @@ impl PreprocessorDependencies {
             referenced_contracts.extend(dependencies.iter().map(|dep| dep.referenced_contract));
         }
 
-        Self { preprocessed_contracts, referenced_contracts }
+        let deploy_helpers = preprocessed_contracts
+            .values()
+            .flatten()
+            .filter_map(|dependency| {
+                if matches!(&dependency.kind, BytecodeDependencyKind::New { .. }) {
+                    let contract = gcx.hir.contract(dependency.referenced_contract);
+                    contract
+                        .ctor
+                        .filter(|ctor_id| !gcx.hir.function(*ctor_id).parameters.is_empty())
+                        .map(|_| dependency.referenced_contract)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        Self { preprocessed_contracts, referenced_contracts, deploy_helpers }
     }
 }
 

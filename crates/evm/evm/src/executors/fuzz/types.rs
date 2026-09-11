@@ -4,7 +4,7 @@ use alloy_primitives::{
     map::{AddressHashMap, HashMap},
 };
 use foundry_evm_core::{Breakpoints, evm::FoundryEvmNetwork};
-use foundry_evm_coverage::HitMaps;
+use foundry_evm_coverage::{HitMaps, InstrumentedHitMaps};
 use foundry_evm_fuzz::{BasicTxDetails, FuzzCase};
 use foundry_evm_traces::SparsedTraceArena;
 use revm::interpreter::InstructionResult;
@@ -20,6 +20,8 @@ pub struct CaseOutcome {
     pub debug_bytecodes: AddressHashMap<Bytes>,
     /// The coverage info collected during the call.
     pub coverage: Option<HitMaps>,
+    /// The instrumented coverage info collected during the call.
+    pub instrumented_coverage: Option<InstrumentedHitMaps>,
     /// Breakpoints char pc map.
     pub breakpoints: Breakpoints,
     /// logs of a single fuzz test case.

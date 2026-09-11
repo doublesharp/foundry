@@ -18,8 +18,8 @@ use figment::{
 };
 use filter::GlobMatcher;
 use foundry_compilers::{
-    ArtifactOutput, ConfigurableArtifacts, Graph, Project, ProjectPathsConfig,
-    RestrictionsWithVersion, VyperLanguage,
+    ArtifactOutput, ConfigurableArtifacts, Graph, LocalCompilerOutputCache, Project,
+    ProjectPathsConfig, RestrictionsWithVersion, VyperLanguage,
     artifacts::{
         BytecodeHash, DebuggingSettings, EvmVersion, Libraries, ModelCheckerSettings,
         ModelCheckerTarget, Optimizer, OptimizerDetails, RevertStrings, Settings, SettingsMetadata,
@@ -48,6 +48,7 @@ use std::{
     fs, io,
     path::{Path, PathBuf},
     str::FromStr,
+    sync::{Arc, OnceLock},
 };
 
 #[cfg(windows)]
@@ -154,6 +155,31 @@ pub use semver;
 
 #[cfg(not(test))]
 static SELECTED_PROFILE: std::sync::OnceLock<Profile> = std::sync::OnceLock::new();
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+struct ProjectPathDefaults {
+    out: &'static str,
+    cache_path: &'static str,
+}
+
+const STANDARD_PROJECT_PATH_DEFAULTS: ProjectPathDefaults =
+    ProjectPathDefaults { out: "out", cache_path: "cache" };
+static PROJECT_PATH_DEFAULTS: OnceLock<ProjectPathDefaults> = OnceLock::new();
+
+/// Overrides process-local project path defaults before configuration loading.
+///
+/// This is intended for feature-built Foundry binaries. These paths override file-based project
+/// configuration while environment and command-line providers retain higher precedence.
+#[doc(hidden)]
+pub fn set_process_default_paths(out: &'static str, cache_path: &'static str) {
+    let requested = ProjectPathDefaults { out, cache_path };
+    let configured = PROJECT_PATH_DEFAULTS.get_or_init(|| requested);
+    assert_eq!(configured, &requested, "project path defaults were already initialized");
+}
+
+fn project_path_defaults() -> ProjectPathDefaults {
+    PROJECT_PATH_DEFAULTS.get().copied().unwrap_or(STANDARD_PROJECT_PATH_DEFAULTS)
+}
 
 /// Foundry configuration
 ///
@@ -980,8 +1006,11 @@ impl Config {
 
         let root = self.root.as_path();
         let profile = Self::selected_profile();
-        let mut figment = Figment::default()
-            .merge(DappHardhatDirProvider { root, detect_src: self.uses_default_src() });
+        let mut figment = Figment::default().merge(DappHardhatDirProvider {
+            root,
+            detect_src: self.uses_default_src(),
+            default_out: &self.out,
+        });
 
         // merge global foundry.toml file
         if let Some(global_toml) = Self::foundry_dir_toml().filter(|p| p.exists()) {
@@ -997,6 +1026,9 @@ impl Config {
             TomlFileProvider::new(Some("FOUNDRY_CONFIG"), root.join(Self::FILE_NAME)),
             profile.clone(),
         );
+        if let Some(project_paths) = PROJECT_PATH_DEFAULTS.get() {
+            figment = figment.merge(Serialized::from(project_paths, profile.clone()));
+        }
 
         // merge environment variables
         figment = figment
@@ -1381,13 +1413,21 @@ impl Config {
             builder = builder.sparse_output(filter);
         }
 
-        let project = builder.build(self.compiler()?)?;
+        let mut project = builder.build(self.compiler()?)?;
+
+        if cached
+            && self.cache
+            && !self.force
+            && let Some(cache_dir) = Self::foundry_compiler_cache_dir()
+        {
+            project
+                .compiler
+                .set_compiler_output_cache(Arc::new(LocalCompilerOutputCache::new(cache_dir)));
+        }
 
         // `ProjectBuilder` slashes paths on Windows. Re-encode a contextual remapping's trailing
         // directory boundary with the native separator so a later `Remapping::to_string` does not
         // discard it while converting the context back to slash-separated solc syntax.
-        #[cfg(windows)]
-        let mut project = project;
         #[cfg(windows)]
         for remapping in &mut project.paths.remappings {
             if let Some(context) = &mut remapping.context
@@ -2106,8 +2146,15 @@ impl Config {
             // directories are read below, so opt out of it.
             .remappings(Vec::new())
             .build_with_root::<()>(root);
-        let artifacts: PathBuf = paths.artifacts.file_name().unwrap().into();
+        let detected_artifacts: PathBuf = paths.artifacts.file_name().unwrap().into();
         let mut config = Self::default();
+        let artifacts = if PROJECT_PATH_DEFAULTS.get().is_some()
+            || detected_artifacts == Path::new(STANDARD_PROJECT_PATH_DEFAULTS.out)
+        {
+            config.out.clone()
+        } else {
+            detected_artifacts
+        };
         if config.uses_default_src() {
             config.src = paths.sources.file_name().unwrap().into();
         }
@@ -2304,6 +2351,11 @@ impl Config {
     /// Returns the path to foundry rpc cache dir: `~/.foundry/cache/rpc`.
     pub fn foundry_rpc_cache_dir() -> Option<PathBuf> {
         Some(Self::foundry_cache_dir()?.join("rpc"))
+    }
+
+    /// Returns the directory for locally cached raw compiler output: `~/.foundry/cache/compilers`.
+    pub fn foundry_compiler_cache_dir() -> Option<PathBuf> {
+        Some(Self::foundry_cache_dir()?.join("compilers"))
     }
     /// Returns the path to foundry chain's cache dir: `~/.foundry/cache/rpc/<chain>`
     pub fn foundry_chain_cache_dir(chain_id: impl Into<Chain>) -> Option<PathBuf> {
@@ -2911,21 +2963,22 @@ impl Provider for Config {
 
 impl Default for Config {
     fn default() -> Self {
+        let project_paths = project_path_defaults();
         Self {
             profile: Self::DEFAULT_PROFILE,
             profiles: vec![Self::DEFAULT_PROFILE],
-            fs_permissions: FsPermissions::new([PathPermission::read("out")]),
+            fs_permissions: FsPermissions::new([PathPermission::read(project_paths.out)]),
             isolate: true,
             root: root_default(),
             extends: None,
             src: Self::DEFAULT_SRC.into(),
             test: "test".into(),
             script: "script".into(),
-            out: "out".into(),
+            out: project_paths.out.into(),
             libs: vec!["lib".into()],
             cache: true,
             dynamic_test_linking: true,
-            cache_path: "cache".into(),
+            cache_path: project_paths.cache_path.into(),
             broadcast: "broadcast".into(),
             snapshots: "snapshots".into(),
             gas_snapshot_check: false,
@@ -9139,7 +9192,7 @@ mod tests {
                 "foundry.toml",
                 r#"
                 [profile.default.coverage]
-                report = ["summary", "lcov"]
+                report = ["summary", "lcov", "json"]
                 lcov_version = "2.2.0"
                 ir_minimum = true
                 report_file = "out/lcov.info"
@@ -9151,7 +9204,11 @@ mod tests {
             let config = Config::load_with_root(jail.directory()).unwrap();
             assert_eq!(
                 config.coverage.report,
-                vec![CoverageReportKind::Summary, CoverageReportKind::Lcov]
+                vec![
+                    CoverageReportKind::Summary,
+                    CoverageReportKind::Lcov,
+                    CoverageReportKind::Json,
+                ]
             );
             assert_eq!(config.coverage.lcov_version, semver::Version::new(2, 2, 0));
             assert!(config.coverage.ir_minimum);

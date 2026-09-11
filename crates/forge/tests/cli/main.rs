@@ -17,6 +17,7 @@ mod compiler;
 mod config;
 mod context;
 mod coverage;
+mod coverage_flow;
 mod create;
 mod debug;
 mod doc;

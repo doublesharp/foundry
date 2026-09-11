@@ -17,6 +17,11 @@ workspace = true
 name = "forge"
 path = "bin/main.rs"
 
+[[bin]]
+name = "forge-ds"
+path = "bin/forge-ds.rs"
+required-features = ["forge-ds"]
+
 [[test]]
 name = "ui"
 path = "tests/ui.rs"
@@ -130,6 +135,7 @@ rexpect.workspace = true
 [features]
 default = ["jemalloc", "asm-keccak", "optimism"]
 asm-keccak = ["alloy-primitives/asm-keccak", "revm/asm-keccak"]
+forge-ds = []
 jemalloc = ["foundry-cli/jemalloc"]
 mimalloc = ["foundry-cli/mimalloc"]
 tracy-allocator = ["foundry-cli/tracy-allocator"]

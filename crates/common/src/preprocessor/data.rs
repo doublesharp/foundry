@@ -190,9 +190,15 @@ pub(crate) fn collect_preprocessor_data(
 /// Creates helper libraries for contracts with a non-empty constructor.
 ///
 /// See [`ContractData::build_helper`] for more details.
-pub(crate) fn create_deploy_helpers(data: &BTreeMap<ContractId, ContractData>) -> Sources {
+pub(crate) fn create_deploy_helpers(
+    data: &BTreeMap<ContractId, ContractData>,
+    required_helpers: &HashSet<ContractId>,
+) -> Sources {
     let mut deploy_helpers = Sources::new();
     for (contract_id, contract) in data {
+        if !required_helpers.contains(contract_id) {
+            continue;
+        }
         if let Some(code) = contract.build_helper() {
             let path = format!("foundry-pp/DeployHelper{}.sol", contract_id.index());
             deploy_helpers.insert(path.into(), Source::new(code));

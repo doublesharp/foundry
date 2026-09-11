@@ -1,7 +1,7 @@
 use super::{
     Cheatcodes, CheatsConfig, ChiselState, CmpOperands, CustomPrintTracer, EdgeCovConfig,
-    EdgeCovInspector, EdgeCoverage, Fuzzer, LineCoverageCollector, LogCollector, RevertDiagnostic,
-    ScriptExecutionInspector, TempoLabels, TracingInspector,
+    EdgeCovInspector, EdgeCoverage, Fuzzer, InstrumentedCoverageCollector, LineCoverageCollector,
+    LogCollector, RevertDiagnostic, ScriptExecutionInspector, TempoLabels, TracingInspector,
 };
 use alloy_primitives::{
     Address, B256, Bytes, Log, TxKind, U256, keccak256,
@@ -24,7 +24,7 @@ use foundry_evm_core::{
     precompiles::P256_VERIFY,
     refresh_chain_journal,
 };
-use foundry_evm_coverage::HitMaps;
+use foundry_evm_coverage::{FOUNDRY_COVERAGE_ADDRESS, HitMaps, InstrumentedHitMaps};
 use foundry_evm_networks::{NetworkConfigs, arbitrum};
 use foundry_evm_traces::{SparsedTraceArena, TraceRequirements};
 use revm::{
@@ -80,6 +80,8 @@ pub struct InspectorStackBuilder<BLOCK: Clone> {
     pub logs: Option<bool>,
     /// Whether line coverage info should be collected.
     pub line_coverage: Option<bool>,
+    /// Whether instrumented coverage info should be collected.
+    pub instrumented_coverage: Option<bool>,
     /// Whether to print all opcode traces into the console. Useful for debugging the EVM.
     pub print: Option<bool>,
     /// The chisel state inspector.
@@ -113,6 +115,7 @@ impl<BLOCK: Clone> Default for InspectorStackBuilder<BLOCK> {
             trace_requirements: TraceRequirements::none(),
             logs: None,
             line_coverage: None,
+            instrumented_coverage: None,
             print: None,
             chisel_state: None,
             enable_isolation: false,
@@ -195,6 +198,13 @@ impl<BLOCK: Clone> InspectorStackBuilder<BLOCK> {
         self
     }
 
+    /// Set whether to collect instrumented coverage information.
+    #[inline]
+    pub const fn instrumented_coverage(mut self, yes: bool) -> Self {
+        self.instrumented_coverage = Some(yes);
+        self
+    }
+
     /// Set whether to enable the trace printer.
     #[inline]
     pub const fn print(mut self, yes: bool) -> Self {
@@ -260,6 +270,7 @@ impl<BLOCK: Clone> InspectorStackBuilder<BLOCK> {
             trace_requirements,
             logs,
             line_coverage,
+            instrumented_coverage,
             print,
             chisel_state,
             enable_isolation,
@@ -293,6 +304,7 @@ impl<BLOCK: Clone> InspectorStackBuilder<BLOCK> {
             stack.set_chisel(chisel_state);
         }
         stack.collect_line_coverage(line_coverage.unwrap_or(false));
+        stack.collect_instrumented_coverage(instrumented_coverage.unwrap_or(false));
         stack.collect_logs(logs);
         stack.print(print.unwrap_or(false));
         stack.tracing_requirements(trace_requirements);
@@ -345,6 +357,7 @@ pub struct InspectorData<FEN: FoundryEvmNetwork> {
     pub labels: AddressHashMap<String>,
     pub traces: Option<SparsedTraceArena>,
     pub line_coverage: Option<HitMaps>,
+    pub instrumented_coverage: Option<InstrumentedHitMaps>,
     pub edge_coverage: Option<EdgeCoverage>,
     pub evm_cmp_values: Option<Vec<CmpOperands>>,
     pub cheatcodes: Option<Box<Cheatcodes<FEN>>>,
@@ -435,6 +448,8 @@ pub struct InspectorStackInner {
     pub chisel_state: Option<Box<ChiselState>>,
     pub edge_coverage: Option<Box<EdgeCovInspector>>,
     pub fuzzer: Option<Box<Fuzzer>>,
+    /// Collects source-instrumented coverage before other inspectors observe probe calls.
+    pub instrumented_coverage: Option<Box<InstrumentedCoverageCollector>>,
     pub line_coverage: Option<Box<LineCoverageCollector>>,
     pub log_collector: Option<Box<LogCollector>>,
     pub printer: Option<Box<CustomPrintTracer>>,
@@ -707,6 +722,12 @@ impl<FEN: FoundryEvmNetwork> InspectorStack<FEN> {
         self.refresh_static_step_dispatch();
     }
 
+    /// Set whether to enable the instrumented coverage collector.
+    #[inline]
+    pub fn collect_instrumented_coverage(&mut self, yes: bool) {
+        self.instrumented_coverage = yes.then(Default::default);
+    }
+
     /// Set whether to enable the edge coverage collector with default config.
     #[inline]
     pub fn collect_edge_coverage(&mut self, yes: bool) {
@@ -840,6 +861,7 @@ impl<FEN: FoundryEvmNetwork> InspectorStack<FEN> {
             inner:
                 InspectorStackInner {
                     chisel_state,
+                    instrumented_coverage,
                     line_coverage,
                     edge_coverage,
                     log_collector,
@@ -890,6 +912,8 @@ impl<FEN: FoundryEvmNetwork> InspectorStack<FEN> {
             },
             traces,
             line_coverage: line_coverage.map(|line_coverage| line_coverage.finish()),
+            instrumented_coverage: instrumented_coverage
+                .map(|instrumented_coverage| instrumented_coverage.finish()),
             edge_coverage,
             evm_cmp_values,
             cheatcodes,
@@ -1456,6 +1480,7 @@ impl<FEN: FoundryEvmNetwork> Inspector<FoundryContextFor<'_, FEN>>
 
         call_inspectors!(
             [
+                &mut self.instrumented_coverage,
                 &mut self.line_coverage,
                 &mut self.tracer,
                 &mut self.cheatcodes,
@@ -1620,6 +1645,12 @@ impl<FEN: FoundryEvmNetwork> Inspector<FoundryContextFor<'_, FEN>>
 
         if ecx.journal().depth() == 0 {
             self.top_level_frame_start(ecx);
+        }
+
+        if let Some(coverage) = &mut self.instrumented_coverage
+            && let Some(outcome) = coverage.call(ecx, call)
+        {
+            return Some(outcome);
         }
 
         if let Some(revert_diag) = self.revert_diag.as_deref_mut() {
@@ -1806,6 +1837,14 @@ impl<FEN: FoundryEvmNetwork> Inspector<FoundryContextFor<'_, FEN>>
             return;
         }
 
+        // Probe calls return before any other inspector starts a frame.
+        if self.instrumented_coverage.is_some()
+            && inputs.bytecode_address == FOUNDRY_COVERAGE_ADDRESS
+            && inputs.scheme == CallScheme::StaticCall
+        {
+            return;
+        }
+
         if ecx.journal().depth() == 0 {
             self.inner.top_level_frame_failed_before_rewrite |= !outcome.result.result.is_ok();
         }
@@ -1822,6 +1861,10 @@ impl<FEN: FoundryEvmNetwork> Inspector<FoundryContextFor<'_, FEN>>
         }
 
         self.do_call_end(ecx, inputs, outcome);
+        // Preserve the final output after cheatcodes have processed expected reverts.
+        if let Some(coverage) = &mut self.instrumented_coverage {
+            coverage.call_end(ecx, inputs, outcome);
+        }
 
         if let Some(revert_diag) = self.revert_diag.as_deref_mut() {
             revert_diag.frame_end();
@@ -1961,6 +2004,9 @@ impl<FEN: FoundryEvmNetwork> Inspector<FoundryContextFor<'_, FEN>>
         }
 
         self.do_create_end(ecx, call, outcome);
+        if let Some(coverage) = &mut self.instrumented_coverage {
+            coverage.create_end(ecx, call, outcome);
+        }
 
         if let Some(revert_diag) = self.revert_diag.as_deref_mut() {
             revert_diag.frame_end();
@@ -2252,7 +2298,94 @@ mod tests {
         Address, Fuzzer, InspectorStack, InspectorStackInner, OpcodeStepDispatch, RevertDiagnostic,
         TraceRequirements, compute_batch_create_salt,
     };
-    use foundry_evm_core::evm::EthEvmNetwork;
+    use crate::{backend::Backend, executors::ExecutorBuilder};
+    use alloy_primitives::{B256, Bytes, U256};
+    use foundry_evm_core::{EvmEnv, evm::EthEvmNetwork};
+    use foundry_evm_coverage::FOUNDRY_COVERAGE_ADDRESS;
+    use foundry_evm_networks::NetworkConfigs;
+    use revm::{bytecode::Bytecode, context::TxEnv};
+
+    #[test]
+    fn instrumented_probes_do_not_open_trace_frames() {
+        let mut executor = ExecutorBuilder::<EthEvmNetwork>::default()
+            .inspectors(|stack| {
+                stack
+                    .instrumented_coverage(true)
+                    .trace_requirements(TraceRequirements::none().with_calls(true))
+            })
+            .gas_limit(1_000_000)
+            .build(
+                EvmEnv::default(),
+                TxEnv::default(),
+                Backend::spawn(None).unwrap(),
+                NetworkConfigs::default(),
+            );
+        let target = Address::repeat_byte(0x11);
+        // Store the tag, issue a coverage probe, then return 42 from the real frame.
+        let mut code = vec![0x60, 0x01, 0x5f, 0x52, 0x5f, 0x5f, 0x60, 0x20, 0x5f, 0x73];
+        code.extend_from_slice(FOUNDRY_COVERAGE_ADDRESS.as_slice());
+        code.extend_from_slice(&[0x5a, 0xfa, 0x50, 0x60, 0x2a, 0x5f, 0x52, 0x60, 0x20, 0x5f, 0xf3]);
+        executor.set_code(target, Bytecode::new_raw(code.into())).unwrap();
+
+        let result = executor.call_raw(Address::ZERO, target, Bytes::new(), U256::ZERO).unwrap();
+        assert!(!result.reverted);
+        assert_eq!(result.instrumented_coverage.unwrap().0.get(&B256::with_last_byte(1)), Some(&1));
+        let traces = result.traces.unwrap();
+        let nodes = traces.arena.nodes();
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].trace.address, target);
+        assert_eq!(nodes[0].trace.output.as_ref(), U256::from(42).to_be_bytes::<32>().as_slice());
+    }
+
+    #[test]
+    fn ordinary_calls_to_coverage_address_finish_trace_frames() {
+        for instrumented in [false, true] {
+            let mut executor = ExecutorBuilder::<EthEvmNetwork>::default()
+                .inspectors(|stack| {
+                    stack
+                        .instrumented_coverage(instrumented)
+                        .trace_requirements(TraceRequirements::none().with_calls(true))
+                })
+                .gas_limit(1_000_000)
+                .build(
+                    EvmEnv::default(),
+                    TxEnv::default(),
+                    Backend::spawn(None).unwrap(),
+                    NetworkConfigs::default(),
+                );
+            let target = Address::repeat_byte(0x11);
+            let mut code = vec![0x5f, 0x5f, 0x5f, 0x5f, 0x5f, 0x73];
+            code.extend_from_slice(FOUNDRY_COVERAGE_ADDRESS.as_slice());
+            code.extend_from_slice(&[
+                0x5a, 0xf1, 0x50, 0x60, 0x63, 0x5f, 0x52, 0x60, 0x20, 0x5f, 0xf3,
+            ]);
+            executor.set_code(target, Bytecode::new_raw(code.into())).unwrap();
+            executor
+                .set_code(
+                    FOUNDRY_COVERAGE_ADDRESS,
+                    Bytecode::new_raw(Bytes::from_static(&[
+                        0x60, 0x2a, 0x5f, 0x52, 0x60, 0x20, 0x5f, 0xf3,
+                    ])),
+                )
+                .unwrap();
+
+            let result =
+                executor.call_raw(Address::ZERO, target, Bytes::new(), U256::ZERO).unwrap();
+            assert!(!result.reverted);
+            let traces = result.traces.unwrap();
+            let nodes = traces.arena.nodes();
+            assert_eq!(nodes.len(), 2);
+            assert_eq!(
+                nodes[0].trace.output.as_ref(),
+                U256::from(99).to_be_bytes::<32>().as_slice()
+            );
+            assert_eq!(nodes[1].trace.address, FOUNDRY_COVERAGE_ADDRESS);
+            assert_eq!(
+                nodes[1].trace.output.as_ref(),
+                U256::from(42).to_be_bytes::<32>().as_slice()
+            );
+        }
+    }
 
     #[test]
     fn opcode_dispatch_defaults_to_no_static_inspectors() {

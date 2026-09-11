@@ -1,5 +1,8 @@
 use crate::utils::generate_large_init_contract;
-use foundry_compilers::artifacts::{BytecodeHash, EvmVersion};
+use foundry_compilers::{
+    artifacts::{BytecodeHash, EvmVersion, remappings::Remapping},
+    compilers::solc::Solc,
+};
 use foundry_config::{CompilationRestrictions, SettingsOverrides};
 use foundry_test_utils::{forgetest, forgetest_init, snapbox::IntoData, str, util::OutputExt};
 use globset::Glob;
@@ -9,10 +12,215 @@ use std::{
     io::Write,
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    str::FromStr,
 };
 
 #[cfg(unix)]
 use std::os::unix::fs::{PermissionsExt, symlink};
+
+#[cfg(unix)]
+fn write_counting_solc(path: &Path, solc: &Path, invocations: &Path, identity: &str) {
+    fs::write(
+        path,
+        format!(
+            r#"#!/bin/sh
+# {identity}
+for arg in "$@"; do
+    if [ "$arg" = "--standard-json" ]; then
+        printf '1\n' >> '{}'
+    fi
+done
+exec '{}' "$@"
+"#,
+            invocations.display(),
+            solc.display(),
+        ),
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(path).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(path, permissions).unwrap();
+}
+
+#[cfg(unix)]
+fn compiler_invocations(path: &Path) -> usize {
+    fs::read_to_string(path).map_or(0, |contents| contents.lines().count())
+}
+
+#[cfg(unix)]
+fn add_shared_cache_project(prj: &foundry_test_utils::TestProject, solc: &Path) {
+    prj.add_raw_source(
+        "CacheConsumer.sol",
+        r#"// SPDX-License-Identifier: MIT
+pragma solidity 0.8.35;
+
+import {Dependency} from "shared/Dependency.sol";
+
+contract CacheConsumer is Dependency {}
+"#,
+    );
+    prj.create_file(
+        "lib/shared/src/Dependency.sol",
+        r#"// SPDX-License-Identifier: MIT
+pragma solidity 0.8.35;
+
+contract Dependency {}
+"#,
+    );
+    prj.update_config(|config| {
+        config.solc = Some(foundry_config::SolcReq::Local(solc.to_path_buf()));
+        config.remappings = vec![Remapping::from_str("shared/=lib/shared/src/").unwrap().into()];
+    });
+}
+
+#[cfg(unix)]
+fn assert_cache_consumer_artifact(prj: &foundry_test_utils::TestProject) {
+    let artifact = prj.artifacts().join("CacheConsumer.sol/CacheConsumer.json");
+    let artifact: serde_json::Value = serde_json::from_slice(&fs::read(artifact).unwrap()).unwrap();
+    assert!(artifact["bytecode"]["object"].as_str().is_some_and(|bytecode| bytecode.len() > 2));
+    assert!(artifact["metadata"]["compiler"]["version"].is_string());
+}
+
+#[cfg(unix)]
+forgetest!(shared_compiler_cache_reuses_output_across_roots, |prj, cmd| {
+    let second = foundry_test_utils::TestProject::new(
+        "shared-compiler-cache-second-root",
+        foundry_compilers::PathStyle::Dapptools,
+    );
+    let home = tempfile::tempdir().unwrap();
+    let wrapper_dir = tempfile::tempdir().unwrap();
+    let invocations = wrapper_dir.path().join("standard-json-invocations");
+    let wrapper = wrapper_dir.path().join("solc-wrapper");
+    let solc = Solc::find_svm_installed_version(&"0.8.35".parse().unwrap()).unwrap().unwrap();
+    write_counting_solc(&wrapper, &solc.solc, &invocations, "identity-one");
+
+    add_shared_cache_project(&prj, &wrapper);
+    add_shared_cache_project(&second, &wrapper);
+
+    cmd.env("HOME", home.path());
+    cmd.args(["build"]).assert_success();
+    assert_eq!(compiler_invocations(&invocations), 1, "first root must compile");
+    prj.assert_artifacts_dir_exists();
+    assert_cache_consumer_artifact(&prj);
+    prj.assert_cache_exists();
+
+    // The second build must obtain only raw compiler output from the shared cache.
+    drop(cmd);
+    let mut second_cmd = second.forge_command();
+    second_cmd.env("HOME", home.path());
+    second_cmd.args(["build"]).assert_success();
+    assert_eq!(
+        compiler_invocations(&invocations),
+        1,
+        "identical second root should hit the shared compiler-output cache"
+    );
+    second.assert_artifacts_dir_exists();
+    assert_cache_consumer_artifact(&second);
+    second.assert_cache_exists();
+
+    second.clear();
+    assert!(
+        !second.config_from_output(["--no-cache"]).cache,
+        "--no-cache must disable the project cache"
+    );
+    second_cmd.forge_fuse().env("HOME", home.path());
+    second_cmd.args(["build", "--no-cache"]).assert_success();
+    assert_eq!(compiler_invocations(&invocations), 2, "--no-cache must bypass the shared cache");
+
+    second.clear();
+    second_cmd.forge_fuse().env("HOME", home.path());
+    second_cmd.args(["build", "--force"]).assert_success();
+    assert_eq!(compiler_invocations(&invocations), 3, "--force must bypass the shared cache");
+
+    prj.clear();
+    let mut first_cmd = prj.forge_command();
+    first_cmd.env("HOME", home.path());
+    first_cmd.args(["build", "--via-ir"]).assert_success();
+    assert_eq!(compiler_invocations(&invocations), 4, "viaIR must use a distinct entry");
+
+    second.clear();
+    second_cmd.forge_fuse().env("HOME", home.path());
+    second_cmd.args(["build"]).assert_success();
+    assert_eq!(compiler_invocations(&invocations), 4, "non-viaIR entry must be retained");
+
+    second.clear();
+    second_cmd.forge_fuse().env("HOME", home.path());
+    second_cmd.args(["build", "--via-ir"]).assert_success();
+    assert_eq!(compiler_invocations(&invocations), 4, "viaIR entry must be retained");
+
+    second.add_raw_source(
+        "CacheConsumer.sol",
+        r#"// SPDX-License-Identifier: MIT
+pragma solidity 0.8.35;
+
+import {Dependency} from "shared/Dependency.sol";
+
+contract CacheConsumer is Dependency {
+    function changed() external pure returns (uint256) {
+        return 1;
+    }
+}
+"#,
+    );
+    second_cmd.forge_fuse().env("HOME", home.path());
+    second_cmd.args(["build"]).assert_success();
+    assert_eq!(compiler_invocations(&invocations), 5, "changed source must miss");
+
+    write_counting_solc(&wrapper, &solc.solc, &invocations, "identity-two");
+    second.clear();
+    second_cmd.forge_fuse().env("HOME", home.path());
+    second_cmd.args(["build"]).assert_success();
+    assert_eq!(compiler_invocations(&invocations), 6, "changed compiler identity must miss");
+
+    fs::remove_dir_all(second.root().join("lib/shared")).unwrap();
+    second_cmd.forge_fuse().env("HOME", home.path());
+    second_cmd.args(["build"]).assert_failure();
+    assert_eq!(
+        compiler_invocations(&invocations),
+        7,
+        "the compiler must still receive and reject the missing dependency"
+    );
+});
+
+#[cfg(unix)]
+forgetest!(filtered_test_no_cache_bypasses_shared_compiler_cache, |prj, cmd| {
+    let home = tempfile::tempdir().unwrap();
+    let wrapper_dir = tempfile::tempdir().unwrap();
+    let invocations = wrapper_dir.path().join("standard-json-invocations");
+    let wrapper = wrapper_dir.path().join("solc-wrapper");
+    let solc = Solc::find_svm_installed_version(&"0.8.35".parse().unwrap()).unwrap().unwrap();
+    write_counting_solc(&wrapper, &solc.solc, &invocations, "identity-one");
+
+    add_shared_cache_project(&prj, &wrapper);
+    prj.add_raw_test(
+        "CacheConsumer.t.sol",
+        r#"// SPDX-License-Identifier: MIT
+pragma solidity 0.8.35;
+
+contract CacheConsumerTest {
+    function testFilteredNoCache() public pure {}
+}
+"#,
+    );
+
+    cmd.env("HOME", home.path());
+    cmd.args(["test", "--match-test", "testFilteredNoCache"]).assert_success();
+    assert_eq!(
+        compiler_invocations(&invocations),
+        2,
+        "filtered test prewarm must compile its ABI discovery and final project outputs"
+    );
+
+    prj.clear();
+    cmd.forge_fuse().env("HOME", home.path());
+    cmd.args(["test", "--match-test", "testFilteredNoCache", "--no-cache"]).assert_success();
+    assert_eq!(
+        compiler_invocations(&invocations),
+        4,
+        "filtered ABI discovery and the final --no-cache compilation must both bypass shared output"
+    );
+    assert!(!prj.cache().exists(), "--no-cache must not write the local project cache");
+});
 
 fn git(root: &Path, args: &[&str]) -> String {
     let output = Command::new("git").current_dir(root).args(args).output().unwrap();

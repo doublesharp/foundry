@@ -22,7 +22,7 @@ use foundry_evm_core::{
     decode::{RevertDecoder, SkipReason},
     evm::FoundryEvmNetwork,
 };
-use foundry_evm_coverage::HitMaps;
+use foundry_evm_coverage::{HitMaps, InstrumentedHitMaps};
 use foundry_evm_fuzz::{
     BaseCounterExample, BasicTxDetails, CallDetails, CounterExample, FuzzCase, FuzzError,
     FuzzFixtures, FuzzRunMetadata, FuzzTestResult,
@@ -77,6 +77,8 @@ struct WorkerState<FEN: FoundryEvmNetwork> {
     breakpoints: Option<Breakpoints>,
     /// Coverage collected by this worker
     coverage: Option<HitMaps>,
+    /// Instrumented coverage collected by this worker
+    instrumented_coverage: Option<InstrumentedHitMaps>,
     /// Logs from all cases this worker ran
     logs: Vec<Log>,
     /// Deprecated cheatcodes seen by this worker
@@ -108,6 +110,7 @@ impl<FEN: FoundryEvmNetwork> WorkerState<FEN> {
             debug_bytecodes: HashMap::default(),
             breakpoints: None,
             coverage: None,
+            instrumented_coverage: None,
             logs: Vec::new(),
             deprecated_cheatcodes: HashMap::default(),
             runs: 0,
@@ -373,6 +376,7 @@ impl<FEN: FoundryEvmNetwork> FuzzedExecutor<FEN> {
             result.first_case = FuzzCase { gas: call.gas_used, stipend: call.stipend };
             result.gas_by_case.push((call.gas_used, call.stipend));
             result.line_coverage = call.line_coverage;
+            result.instrumented_coverage = call.instrumented_coverage;
             result.logs = call.logs;
             result.gas_report_traces.extend(call.traces.into_iter().map(|trace| trace.arena));
         } else {
@@ -504,6 +508,7 @@ impl<FEN: FoundryEvmNetwork> FuzzedExecutor<FEN> {
                 traces: call.traces,
                 debug_bytecodes: call.debug_bytecodes,
                 coverage: call.line_coverage,
+                instrumented_coverage: call.instrumented_coverage,
                 breakpoints,
                 logs: call.logs,
                 deprecated_cheatcodes,
@@ -631,6 +636,10 @@ impl<FEN: FoundryEvmNetwork> FuzzedExecutor<FEN> {
             }
             result.gas_report_traces.extend(worker.traces.into_iter().map(|t| t.arena));
             HitMaps::merge_opt(&mut result.line_coverage, worker.coverage);
+            InstrumentedHitMaps::merge_opt(
+                &mut result.instrumented_coverage,
+                worker.instrumented_coverage,
+            );
             result.deprecated_cheatcodes.extend(worker.deprecated_cheatcodes);
         }
 
@@ -926,6 +935,10 @@ impl<FEN: FoundryEvmNetwork> FuzzedExecutor<FEN> {
                         }
 
                         HitMaps::merge_opt(&mut worker.coverage, case.coverage);
+                        InstrumentedHitMaps::merge_opt(
+                            &mut worker.instrumented_coverage,
+                            case.instrumented_coverage,
+                        );
                         worker.deprecated_cheatcodes = case.deprecated_cheatcodes;
                     }
                     FuzzOutcome::CounterExample(CounterExampleOutcome {
@@ -1036,5 +1049,59 @@ impl<FEN: FoundryEvmNetwork> FuzzedExecutor<FEN> {
     /// Derives the deterministic RNG seed for cheatcode randomness in a worker-local run.
     fn fuzz_run_seed(seed: U256, worker_id: usize, run: u32) -> U256 {
         Self::fuzz_worker_seed(seed, worker_id).wrapping_add(U256::from(run.saturating_sub(1)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::executors::ExecutorBuilder;
+    use alloy_primitives::B256;
+    use foundry_evm_core::{EvmEnv, backend::Backend, evm::EthEvmNetwork};
+    use foundry_evm_coverage::FOUNDRY_COVERAGE_ADDRESS;
+    use revm::{bytecode::Bytecode, context::TxEnv};
+
+    #[test]
+    fn successful_persisted_replay_retains_instrumented_hits() {
+        let mut executor = ExecutorBuilder::<EthEvmNetwork>::default()
+            .inspectors(|stack| stack.instrumented_coverage(true))
+            .gas_limit(1_000_000)
+            .build(
+                EvmEnv::default(),
+                TxEnv::default(),
+                Backend::spawn(None).unwrap(),
+                Default::default(),
+            );
+        let target = Address::repeat_byte(0x11);
+        // Emit tag 1 and return successfully.
+        let mut code = vec![0x60, 0x01, 0x5f, 0x52, 0x5f, 0x5f, 0x60, 0x20, 0x5f, 0x73];
+        code.extend_from_slice(FOUNDRY_COVERAGE_ADDRESS.as_slice());
+        code.extend_from_slice(&[0x5a, 0xfa, 0x50, 0x00]);
+        executor.set_code(target, Bytecode::new_raw(code.into())).unwrap();
+        let function = Function::parse("testFuzz_replay(uint256)").unwrap();
+        let failure = BaseCounterExample::from_fuzz_call(
+            function
+                .abi_encode_input(&[alloy_dyn_abi::DynSolValue::Uint(U256::from(7), 256)])
+                .unwrap()
+                .into(),
+            vec![],
+            None,
+        );
+        let mut executor = FuzzedExecutor::new(
+            executor,
+            TestRunner::default(),
+            Address::ZERO,
+            FuzzConfig::default(),
+            Some(failure),
+            None,
+        );
+
+        let result = executor
+            .replay_persisted_failure(&function, target, &RevertDecoder::default())
+            .unwrap();
+        assert!(result.success);
+        let hits = result.instrumented_coverage.expect("persisted replay lost its coverage");
+        assert_eq!(hits.0.len(), 1);
+        assert_eq!(hits.0.get(&B256::with_last_byte(1)), Some(&1));
     }
 }

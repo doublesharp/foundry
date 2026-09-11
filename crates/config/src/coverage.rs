@@ -15,6 +15,7 @@ pub enum CoverageReportKind {
     #[default]
     Summary,
     Lcov,
+    Json,
     Debug,
     Bytecode,
     /// JSON report mapping each test to the source items it covers.
@@ -136,7 +137,7 @@ mod tests {
     #[test]
     fn deserialize_from_toml() {
         let toml = r#"
-            report = ["summary", "lcov"]
+            report = ["summary", "lcov", "json"]
             lcov_version = "2.2.0"
             ir_minimum = true
             report_file = "out/lcov.info"
@@ -145,7 +146,10 @@ mod tests {
             skip_files = ["test/**", "src/mocks/**"]
         "#;
         let cfg: CoverageConfig = toml::from_str(toml).unwrap();
-        assert_eq!(cfg.report, vec![CoverageReportKind::Summary, CoverageReportKind::Lcov]);
+        assert_eq!(
+            cfg.report,
+            vec![CoverageReportKind::Summary, CoverageReportKind::Lcov, CoverageReportKind::Json,]
+        );
         assert_eq!(cfg.lcov_version, Version::new(2, 2, 0));
         assert!(cfg.ir_minimum);
         assert_eq!(cfg.report_file.as_deref(), Some(std::path::Path::new("out/lcov.info")));

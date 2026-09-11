@@ -2,23 +2,36 @@ use super::{
     test::{ProjectPathsAwareFilter, TestArgs, TestExecutionOptions},
     watch::WatchArgs,
 };
-use crate::coverage::{
-    BytecodeReporter, ContractId, CoverageAttributionReporter, CoverageReport, CoverageReporter,
-    CoverageSummaryReporter, DebugReporter, ItemAnchor, LcovReporter, ResolvedHitMap,
-    ResolvedHitMaps,
-    analysis::{SourceAnalysis, SourceFiles},
-    anchors::{find_anchors, find_execution_anchors},
+use crate::{
+    coverage::{
+        BytecodeReporter, ContractId, CoverageAttributionReporter, CoverageReport,
+        CoverageReporter, CoverageSummaryReporter, DebugReporter, InstrumentedHitMaps, ItemAnchor,
+        JsonReporter, LcovReporter, ResolvedHitMap, ResolvedHitMaps,
+        analysis::{SourceAnalysis, SourceFiles},
+        anchors::{find_anchors, find_execution_anchors},
+        instrumentation::{
+            CoverageInstrumentationPreprocessor, InstrumentedCoverageMetadata,
+            InstrumentedCoverageMetadataRef, read_metadata,
+        },
+        instrumented::{self, InstrumentedCoverageTagIndex},
+    },
+    multi_runner::CoverageMode,
 };
 use alloy_json_abi::StateMutability;
 use alloy_primitives::{Address, Bytes, U256, map::HashMap};
 use clap::{Parser, ValueHint};
 use eyre::Result;
 use foundry_cli::utils::{FoundryPathExt, LoadConfig, STATIC_FUZZ_SEED};
-use foundry_common::{TestFilter, compile::ProjectCompiler, errors::convert_solar_errors};
+use foundry_common::{
+    TestFilter,
+    compile::{ProjectCompiler, with_compilation_reporter},
+    errors::convert_solar_errors,
+};
 use foundry_compilers::{
     Artifact, ArtifactId, Project, ProjectCompileOutput, ProjectPathsConfig, VYPER_EXTENSIONS,
     artifacts::{CompactBytecode, CompactDeployedBytecode, sourcemap::SourceMap},
     compilers::{Language, multi::MultiCompilerLanguage},
+    project::ProjectCompiler as FoundryProjectCompiler,
     utils::source_files_iter,
 };
 use foundry_config::{
@@ -31,7 +44,7 @@ use semver::Version;
 use std::{
     collections::BTreeSet,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 
 // Loads project's figment and merges the build cli arguments into it
@@ -88,6 +101,14 @@ pub struct CoverageArgs {
     #[arg(long)]
     ir_minimum: bool,
 
+    /// Collect coverage by instrumenting sources before compilation instead of from source maps.
+    ///
+    /// Records line, statement, branch, and function hits using source probes at runtime.
+    /// Preserves the project's optimizer and `viaIR` settings. The probes change bytecode and gas
+    /// usage, so this build is intended only for measuring coverage.
+    #[arg(long)]
+    instrumented: bool,
+
     /// The path to output the report.
     ///
     /// Used only when a single file report is requested. If not specified, the
@@ -132,7 +153,8 @@ impl CoverageArgs {
         let has_lcov = self.report.iter().any(|kind| matches!(kind, CoverageReportKind::Lcov));
         let has_attribution =
             self.report.iter().any(|kind| matches!(kind, CoverageReportKind::Attribution));
-        usize::from(has_lcov) + usize::from(has_attribution)
+        let has_json = self.report.iter().any(|kind| matches!(kind, CoverageReportKind::Json));
+        usize::from(has_lcov) + usize::from(has_attribution) + usize::from(has_json)
     }
 
     pub(crate) fn ensure_mode_compatible(&self) -> Result<()> {
@@ -158,9 +180,13 @@ impl CoverageArgs {
         self.resolve_with(&config.coverage);
         let filter = self.test.filter(&config)?;
 
-        let (paths, mut output) = {
-            let (project, output) = self.build(&config, &filter)?;
-            (project.paths, output)
+        if self.instrumented && self.report.contains(&CoverageReportKind::Bytecode) {
+            eyre::bail!("`--report bytecode` is not supported with `--instrumented`");
+        }
+
+        let (paths, mut output, instrumentation) = {
+            let build = self.build(&config, &filter)?;
+            (build.project.paths, build.output, build.instrumentation)
         };
 
         if self.report_file.is_some() && self.file_report_count() > 1 {
@@ -173,10 +199,10 @@ impl CoverageArgs {
         self.populate_reporters(&paths.root);
 
         sh_println!("Analysing contracts...")?;
-        let report = self.prepare(&paths, &mut output)?;
+        let prepared = self.prepare(&paths, &mut output, instrumentation.as_ref())?;
 
         sh_println!("Running tests...")?;
-        self.collect(&paths.root, &output, report, config, evm_opts, filter).await
+        self.collect(&paths.root, &output, prepared, config, evm_opts, filter).await
     }
 
     /// Merge `[profile.<name>.coverage]` config values into this struct. CLI
@@ -222,6 +248,10 @@ impl CoverageArgs {
                     let path = self.report_path(root, "lcov.info");
                     Some(Box::new(LcovReporter::new(path, self.lcov_version.clone())))
                 }
+                CoverageReportKind::Json => {
+                    let path = self.report_path(root, "coverage-final.json");
+                    Some(Box::new(JsonReporter::new(root.to_path_buf(), path)))
+                }
                 CoverageReportKind::Bytecode => Some(Box::new(BytecodeReporter::new(
                     root.to_path_buf(),
                     root.join("bytecode-coverage"),
@@ -233,49 +263,108 @@ impl CoverageArgs {
     }
 
     /// Builds the project.
-    fn build(
-        &self,
-        config: &Config,
-        filter: &ProjectPathsAwareFilter,
-    ) -> Result<(Project, ProjectCompileOutput)> {
+    fn build(&self, config: &Config, filter: &ProjectPathsAwareFilter) -> Result<CoverageBuild> {
         let mut project = config.ephemeral_project()?;
 
-        if self.ir_minimum {
-            sh_warn!(
-                "`--ir-minimum` enables `viaIR` with minimum optimization, \
-                 which can result in inaccurate source mappings.\n\
-                 Only use this flag as a workaround if you are experiencing \"stack too deep\" errors.\n\
-                 Note that `viaIR` is production ready since Solidity 0.8.13 and above.\n\
-                 See more: https://book.getfoundry.sh/guides/best-practices/stack-too-deep"
-            )?;
+        if self.instrumented {
+            if self.ir_minimum {
+                sh_warn!(
+                    "`--ir-minimum` enables `viaIR` with minimum optimization for the \
+                     instrumented coverage build."
+                )?;
+                config.disable_optimizations(&mut project, true);
+            }
         } else {
-            sh_warn!(
-                "optimizer settings and `viaIR` have been disabled for accurate coverage reports.\n\
-                 If you encounter \"stack too deep\" errors, consider using `--ir-minimum` which \
-                 enables `viaIR` with minimum optimization resolving most of the errors.\n\
-                 See more: https://book.getfoundry.sh/guides/best-practices/stack-too-deep"
-            )?;
+            if self.ir_minimum {
+                sh_warn!(
+                    "`--ir-minimum` enables `viaIR` with minimum optimization, \
+                     which can result in inaccurate source mappings.\n\
+                     Only use this flag as a workaround if you are experiencing \"stack too deep\" errors.\n\
+                     Note that `viaIR` is production ready since Solidity 0.8.13 and above.\n\
+                     See more: https://book.getfoundry.sh/guides/best-practices/stack-too-deep"
+                )?;
+            } else {
+                sh_warn!(
+                    "optimizer settings and `viaIR` have been disabled for accurate coverage reports.\n\
+                     If you encounter \"stack too deep\" errors, consider using `--ir-minimum` which \
+                     enables `viaIR` with minimum optimization resolving most of the errors.\n\
+                     See more: https://book.getfoundry.sh/guides/best-practices/stack-too-deep"
+                )?;
+            }
+            config.disable_optimizations(&mut project, self.ir_minimum);
         }
 
-        config.disable_optimizations(&mut project, self.ir_minimum);
-
-        let mut compiler = ProjectCompiler::new().dynamic_test_linking(config.dynamic_test_linking);
-        if filter.args().path_pattern.is_some() || filter.args().path_pattern_inverse.is_some() {
-            let sources = source_files_iter(&config.src, MultiCompilerLanguage::FILE_EXTENSIONS)
+        let filtered_sources = (filter.args().path_pattern.is_some()
+            || filter.args().path_pattern_inverse.is_some())
+        .then(|| {
+            source_files_iter(&config.src, MultiCompilerLanguage::FILE_EXTENSIONS)
                 .chain(
                     source_files_iter(&config.test, MultiCompilerLanguage::FILE_EXTENSIONS)
-                        // Preserve path-filter behavior for conventional test files while still
-                        // scanning non-test fixtures under the test root.
+                        // Keep non-test fixtures under the test root.
                         .filter(|path| !path.is_sol_test() || filter.matches_path(path)),
                 )
-                // Coverage reports include scripts even though they are not test targets.
+                // Coverage reports also include scripts.
                 .chain(source_files_iter(&config.script, MultiCompilerLanguage::FILE_EXTENSIONS))
-                .collect::<BTreeSet<_>>();
-            compiler = compiler.files(sources);
-        }
-        let output = compiler.compile(&project)?.with_stripped_file_prefixes(project.root());
+                .collect::<BTreeSet<_>>()
+        });
 
-        Ok((project, output))
+        let (output, instrumentation) = if self.instrumented {
+            let metadata = Arc::new(Mutex::new(InstrumentedCoverageMetadata::default()));
+            let output = self
+                .compile_instrumented(
+                    &project,
+                    metadata.clone(),
+                    filter.args().coverage_pattern_inverse.clone(),
+                    filtered_sources.as_ref(),
+                )?
+                .with_stripped_file_prefixes(project.root());
+            (output, Some(read_metadata(&metadata)?))
+        } else {
+            let mut compiler =
+                ProjectCompiler::new().dynamic_test_linking(config.dynamic_test_linking);
+            if let Some(sources) = filtered_sources {
+                compiler = compiler.files(sources);
+            }
+            let output = compiler.compile(&project)?.with_stripped_file_prefixes(project.root());
+            (output, None)
+        };
+
+        Ok(CoverageBuild { project, output, instrumentation })
+    }
+
+    fn compile_instrumented(
+        &self,
+        project: &Project,
+        metadata: InstrumentedCoverageMetadataRef,
+        excluded_sources: Option<regex::Regex>,
+        filtered_sources: Option<&BTreeSet<PathBuf>>,
+    ) -> Result<ProjectCompileOutput> {
+        let root = project.root().to_path_buf();
+        let output = with_compilation_reporter(false, Some(root), || {
+            let mut sources = project.paths.read_input_files()?;
+            if let Some(filtered_sources) = filtered_sources {
+                sources.retain(|path, _| filtered_sources.contains(path));
+            }
+            let compiler = FoundryProjectCompiler::with_sources(project, sources)?
+                .with_preprocessor(CoverageInstrumentationPreprocessor::new(
+                    metadata,
+                    self.include_libs,
+                    self.exclude_tests,
+                    excluded_sources,
+                ));
+            compiler.compile().map_err(eyre::Report::from)
+        })?;
+
+        if output.has_compiler_errors() {
+            eyre::bail!("{output}");
+        }
+        if output.is_unchanged() {
+            sh_println!("No files changed, compilation skipped")?;
+        } else {
+            sh_println!("{output}")?;
+        }
+
+        Ok(output)
     }
 
     /// Builds the coverage report.
@@ -284,7 +373,19 @@ impl CoverageArgs {
         &self,
         project_paths: &ProjectPathsConfig,
         output: &mut ProjectCompileOutput,
-    ) -> Result<CoverageReport> {
+        instrumentation: Option<&InstrumentedCoverageMetadata>,
+    ) -> Result<(CoverageReport, Option<InstrumentedCoverageTagIndex>)> {
+        if let Some(metadata) = instrumentation {
+            let (report, index) = instrumented::prepare(
+                project_paths,
+                output,
+                metadata,
+                self.include_libs,
+                self.exclude_tests,
+            )?;
+            return Ok((report, Some(index)));
+        }
+
         let mut report = CoverageReport::default();
 
         output.parser_mut().solc_mut().compiler_mut().enter_mut(|compiler| {
@@ -374,7 +475,7 @@ impl CoverageArgs {
             }));
         }
 
-        Ok(report)
+        Ok((report, None))
     }
 
     /// Runs tests, collects coverage data and generates the final report.
@@ -383,12 +484,14 @@ impl CoverageArgs {
         mut self,
         project_root: &Path,
         output: &ProjectCompileOutput,
-        mut report: CoverageReport,
+        prepared: (CoverageReport, Option<InstrumentedCoverageTagIndex>),
         config: Config,
         evm_opts: EvmOpts,
         filter: ProjectPathsAwareFilter,
     ) -> Result<()> {
+        let (mut report, instrumented_index) = prepared;
         let inline_config = Arc::new(InlineConfig::new_parsed(output, &config)?);
+        let instrumented = instrumented_index.is_some();
         let outcome = self
             .test
             .run_tests(
@@ -397,57 +500,76 @@ impl CoverageArgs {
                 evm_opts,
                 output,
                 &filter,
-                TestExecutionOptions::coverage(inline_config),
+                TestExecutionOptions {
+                    coverage: if instrumented {
+                        CoverageMode::Instrumented
+                    } else {
+                        CoverageMode::SourceMap
+                    },
+                    ..TestExecutionOptions::coverage(inline_config)
+                },
             )
             .await?;
 
         let known_contracts = outcome.known_contracts.as_ref().unwrap();
         let mut resolved_hit_maps = ResolvedHitMaps::default();
 
-        // Add hit data to the coverage report
-        for suite in outcome.results.values() {
-            for result in suite.test_results.values() {
-                let Some(hit_maps) = result.line_coverage.as_ref() else { continue };
-
-                for (code_hash, map) in &hit_maps.0 {
-                    if let Some(resolved) = resolved_hit_maps.get(code_hash) {
-                        report.add_hit_map(
-                            &resolved.contract_id,
-                            map,
-                            resolved.is_deployed_code,
-                        )?;
-                        continue;
+        if let Some(index) = &instrumented_index {
+            let mut aggregated_hits = InstrumentedHitMaps::default();
+            for suite in outcome.results.values() {
+                for result in suite.test_results.values() {
+                    if let Some(hits) = &result.instrumented_coverage {
+                        aggregated_hits.merge_ref(hits);
                     }
+                }
+            }
+            instrumented::add_hits(&mut report, index, &aggregated_hits);
+        } else {
+            // Add hit data to the coverage report
+            for suite in outcome.results.values() {
+                for result in suite.test_results.values() {
+                    let Some(hit_maps) = result.line_coverage.as_ref() else { continue };
 
-                    let Some((artifact_id, is_deployed_code)) = known_contracts
-                        .find_by_deployed_code(map.bytecode())
-                        .map(|(id, _)| (id, true))
-                        .or_else(|| {
-                            known_contracts
-                                .find_by_creation_code(map.bytecode())
-                                .map(|(id, _)| (id, false))
-                        })
-                    else {
-                        continue;
-                    };
+                    for (code_hash, map) in &hit_maps.0 {
+                        if let Some(resolved) = resolved_hit_maps.get(code_hash) {
+                            report.add_hit_map(
+                                &resolved.contract_id,
+                                map,
+                                resolved.is_deployed_code,
+                            )?;
+                            continue;
+                        }
 
-                    let Some(source_id) =
-                        report.get_source_id(&artifact_id.build_id, &artifact_id.source)
-                    else {
-                        continue;
-                    };
-                    let contract_id = ContractId {
-                        version: artifact_id.version.clone(),
-                        build_id: artifact_id.build_id.clone(),
-                        source_id,
-                        contract_name: artifact_id.name.as_str().into(),
-                    };
+                        let Some((artifact_id, is_deployed_code)) = known_contracts
+                            .find_by_deployed_code(map.bytecode())
+                            .map(|(id, _)| (id, true))
+                            .or_else(|| {
+                                known_contracts
+                                    .find_by_creation_code(map.bytecode())
+                                    .map(|(id, _)| (id, false))
+                            })
+                        else {
+                            continue;
+                        };
 
-                    report.add_hit_map(&contract_id, map, is_deployed_code)?;
+                        let Some(source_id) =
+                            report.get_source_id(&artifact_id.build_id, &artifact_id.source)
+                        else {
+                            continue;
+                        };
+                        let contract_id = ContractId {
+                            version: artifact_id.version.clone(),
+                            build_id: artifact_id.build_id.clone(),
+                            source_id,
+                            contract_name: artifact_id.name.as_str().into(),
+                        };
 
-                    resolved_hit_maps
-                        .entry(*code_hash)
-                        .or_insert(ResolvedHitMap { contract_id, is_deployed_code });
+                        report.add_hit_map(&contract_id, map, is_deployed_code)?;
+
+                        resolved_hit_maps
+                            .entry(*code_hash)
+                            .or_insert(ResolvedHitMap { contract_id, is_deployed_code });
+                    }
                 }
             }
         }
@@ -484,7 +606,7 @@ impl CoverageArgs {
             let reporter = CoverageAttributionReporter::new(
                 self.report_path(project_root, "coverage-attribution.json"),
             );
-            reporter.report(&report, &outcome, &resolved_hit_maps)?;
+            reporter.report(&report, &outcome, &resolved_hit_maps, instrumented_index.as_ref())?;
         }
 
         // Check for test failures after generating coverage report.
@@ -510,6 +632,12 @@ impl CoverageArgs {
     pub const fn watch(&self) -> &WatchArgs {
         &self.test.watch
     }
+}
+
+struct CoverageBuild {
+    project: Project,
+    output: ProjectCompileOutput,
+    instrumentation: Option<InstrumentedCoverageMetadata>,
 }
 
 /// Helper function that will link references in unlinked bytecode to the 0 address.
@@ -608,6 +736,31 @@ impl BytecodeData {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn json_and_lcov_reports_use_distinct_default_paths() {
+        let args = CoverageArgs::parse_from([
+            "coverage",
+            "--report=json",
+            "--report=lcov",
+            "--report-file=combined.out",
+        ]);
+        let root = Path::new("/project");
+        assert_eq!(args.file_report_count(), 2);
+        assert_eq!(args.report_path(root, "coverage-final.json"), root.join("coverage-final.json"));
+        assert_eq!(args.report_path(root, "lcov.info"), root.join("lcov.info"));
+    }
+
+    #[test]
+    fn json_report_uses_custom_path_when_alone() {
+        let args =
+            CoverageArgs::parse_from(["coverage", "--report=json", "--report-file=custom.json"]);
+        assert_eq!(args.file_report_count(), 1);
+        assert_eq!(
+            args.report_path(Path::new("/project"), "coverage-final.json"),
+            Path::new("/project/custom.json")
+        );
+    }
 
     #[test]
     fn lcov_version() {

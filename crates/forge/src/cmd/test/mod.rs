@@ -4,9 +4,10 @@ use crate::{
     decode::decode_console_logs,
     gas_report::GasReport,
     multi_runner::{
-        FuzzFailureReplayConfig, FuzzMinimizeConfig, FuzzMinimizeEdgeIndices, FuzzMinimizeMode,
-        FuzzMinimizeObservation, MultiNetworkConfig, ShowmapConfig, SymbolicArtifactReplayConfig,
-        TestFunctionMatcher, is_generated_symbolic_regression_contract,
+        CoverageMode, FuzzFailureReplayConfig, FuzzMinimizeConfig, FuzzMinimizeEdgeIndices,
+        FuzzMinimizeMode, FuzzMinimizeObservation, MultiNetworkConfig, ShowmapConfig,
+        SymbolicArtifactReplayConfig, TestFunctionMatcher,
+        is_generated_symbolic_regression_contract,
     },
     mutation::{MutationRunConfig, run_mutation_testing},
     result::{
@@ -311,7 +312,7 @@ impl From<ShowmapDomainArg> for ShowmapDomain {
 
 #[derive(Clone, Debug)]
 pub(crate) struct TestExecutionOptions {
-    pub(crate) coverage: bool,
+    pub(crate) coverage: CoverageMode,
     pub(crate) decode_internal: InternalTraceMode,
     pub(crate) multi_network: MultiNetworkConfig,
     pub(crate) fuzz_input: Option<FuzzFailureReplayConfig>,
@@ -323,7 +324,7 @@ pub(crate) struct TestExecutionOptions {
 impl TestExecutionOptions {
     pub(crate) fn default_run(inline_config: Arc<InlineConfig>) -> Self {
         Self {
-            coverage: false,
+            coverage: CoverageMode::None,
             decode_internal: InternalTraceMode::None,
             multi_network: MultiNetworkConfig::default(),
             fuzz_input: None,
@@ -334,7 +335,7 @@ impl TestExecutionOptions {
     }
 
     pub(crate) fn coverage(inline_config: Arc<InlineConfig>) -> Self {
-        Self { coverage: true, ..Self::default_run(inline_config) }
+        Self { coverage: CoverageMode::SourceMap, ..Self::default_run(inline_config) }
     }
 }
 
@@ -1508,7 +1509,6 @@ impl TestArgs {
             return Ok((src_files().chain(test_files()).collect(), None));
         }
 
-        let mut project = config.create_project(config.cache, true)?;
         let sources = src_files()
             .chain(
                 // Preserve path-filter behavior for conventional test files while still
@@ -1516,6 +1516,7 @@ impl TestArgs {
                 test_files().filter(|path| !path.is_sol_test() || test_filter.matches_path(path)),
             )
             .collect::<BTreeSet<_>>();
+        let mut project = config.create_project(config.cache, true)?;
         let output = compile_abi_project_cached(
             &mut project,
             ProjectCompiler::new()
@@ -1780,7 +1781,7 @@ impl TestArgs {
         filter: &ProjectPathsAwareFilter,
         mut execution: TestExecutionOptions,
     ) -> Result<TestOutcome> {
-        self.ensure_mutation_mode_compatible(execution.coverage)?;
+        self.ensure_mutation_mode_compatible(execution.coverage != CoverageMode::None)?;
 
         if config.fuzz.run == Some(0) {
             bail!("`fuzz.run` must be greater than 0");
@@ -2145,7 +2146,7 @@ impl TestArgs {
             .with_fork_hardfork(fork_context.and_then(|context| context.hardfork))
             .enable_isolation(evm_opts.isolate)
             .fail_fast(self.fail_fast)
-            .set_coverage(execution.coverage)
+            .set_coverage_mode(execution.coverage)
             .with_multi_network(execution.multi_network)
             .with_showmap(self.showmap_config()?)
             .with_fuzz_only(self.fuzz_only)

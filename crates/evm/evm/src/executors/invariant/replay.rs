@@ -15,7 +15,7 @@ use eyre::Result;
 use foundry_common::{ContractsByAddress, ContractsByArtifact};
 use foundry_config::InvariantConfig;
 use foundry_evm_core::{decode::RevertDecoder, evm::FoundryEvmNetwork};
-use foundry_evm_coverage::HitMaps;
+use foundry_evm_coverage::{HitMaps, InstrumentedHitMaps};
 use foundry_evm_fuzz::{BaseCounterExample, BasicTxDetails, invariant::InvariantContract};
 use foundry_evm_traces::{TraceKind, TraceRequirements, Traces, load_contracts};
 use indicatif::ProgressBar;
@@ -41,6 +41,7 @@ pub fn replay_run<FEN: FoundryEvmNetwork>(
     traces: &mut Traces,
     debug_bytecodes: &mut AddressHashMap<Bytes>,
     line_coverage: &mut Option<HitMaps>,
+    instrumented_coverage: &mut Option<InstrumentedHitMaps>,
     deprecated_cheatcodes: &mut HashMap<&'static str, Option<&'static str>>,
     inputs: &[BasicTxDetails],
     show_solidity: bool,
@@ -59,6 +60,10 @@ pub fn replay_run<FEN: FoundryEvmNetwork>(
         debug_bytecodes.extend(std::mem::take(&mut call_result.debug_bytecodes));
         traces.push((TraceKind::Execution, call_result.traces.clone().unwrap()));
         HitMaps::merge_opt(line_coverage, call_result.line_coverage.take());
+        InstrumentedHitMaps::merge_opt(
+            instrumented_coverage,
+            call_result.instrumented_coverage.take(),
+        );
 
         // Commit state changes to persist across calls in the sequence.
         executor.commit(&mut call_result);
@@ -130,6 +135,7 @@ pub fn replay_error<FEN: FoundryEvmNetwork>(
     traces: &mut Traces,
     debug_bytecodes: &mut AddressHashMap<Bytes>,
     line_coverage: &mut Option<HitMaps>,
+    instrumented_coverage: &mut Option<InstrumentedHitMaps>,
     deprecated_cheatcodes: &mut HashMap<&'static str, Option<&'static str>>,
     progress: Option<&ProgressBar>,
     early_exit: &EarlyExit,
@@ -189,6 +195,7 @@ pub fn replay_error<FEN: FoundryEvmNetwork>(
         traces,
         debug_bytecodes,
         line_coverage,
+        instrumented_coverage,
         deprecated_cheatcodes,
         &calls,
         config.show_solidity,
@@ -208,5 +215,76 @@ fn set_up_inner_replay<FEN: FoundryEvmNetwork>(
     {
         call_generator.last_sequence = Arc::new(RwLock::new(inner_sequence.to_owned()));
         call_generator.set_replay(true);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::executors::ExecutorBuilder;
+    use alloy_json_abi::JsonAbi;
+    use alloy_primitives::{Address, B256};
+    use foundry_evm_core::{EvmEnv, backend::Backend, evm::EthEvmNetwork};
+    use foundry_evm_coverage::FOUNDRY_COVERAGE_ADDRESS;
+    use foundry_evm_fuzz::CallDetails;
+    use revm::{bytecode::Bytecode, context::TxEnv};
+
+    #[test]
+    fn replayed_sequence_retains_instrumented_hits() {
+        let mut executor = ExecutorBuilder::<EthEvmNetwork>::default()
+            .inspectors(|stack| stack.instrumented_coverage(true))
+            .gas_limit(1_000_000)
+            .build(
+                EvmEnv::default(),
+                TxEnv::default(),
+                Backend::spawn(None).unwrap(),
+                Default::default(),
+            );
+        executor.evm_env_mut().cfg_env.disable_nonce_check = true;
+        let target = Address::repeat_byte(0x11);
+        let invariant_address = Address::repeat_byte(0x22);
+        let mut code = vec![0x60, 0x01, 0x5f, 0x52, 0x5f, 0x5f, 0x60, 0x20, 0x5f, 0x73];
+        code.extend_from_slice(FOUNDRY_COVERAGE_ADDRESS.as_slice());
+        code.extend_from_slice(&[0x5a, 0xfa, 0x50, 0x00]);
+        executor.set_code(target, Bytecode::new_raw(code.into())).unwrap();
+        executor
+            .set_code(invariant_address, Bytecode::new_raw(Bytes::from_static(&[0x00])))
+            .unwrap();
+        let function = Function::parse("invariant_ok()").unwrap();
+        let abi = JsonAbi::new();
+        let contract = InvariantContract::new(
+            invariant_address,
+            "InvariantTest",
+            vec![(&function, false)],
+            0,
+            false,
+            &abi,
+        );
+        let tx = BasicTxDetails {
+            warp: None,
+            roll: None,
+            sender: Address::ZERO,
+            call_details: CallDetails { target, calldata: Bytes::new(), value: None },
+        };
+        let mut hits = None;
+        replay_run(
+            &contract,
+            &function,
+            executor,
+            &Default::default(),
+            Default::default(),
+            &mut vec![],
+            &mut vec![],
+            &mut Default::default(),
+            &mut None,
+            &mut hits,
+            &mut Default::default(),
+            &[tx.clone(), tx],
+            false,
+        )
+        .unwrap();
+        let hits = hits.expect("invariant replay lost its coverage");
+        assert_eq!(hits.0.len(), 1);
+        assert_eq!(hits.0.get(&B256::with_last_byte(1)), Some(&2));
     }
 }

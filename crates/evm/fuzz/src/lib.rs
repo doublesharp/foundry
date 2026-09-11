@@ -15,7 +15,7 @@ use alloy_primitives::{
 };
 use foundry_common::{calc, contracts::ContractsByAddress};
 use foundry_evm_core::Breakpoints;
-use foundry_evm_coverage::HitMaps;
+use foundry_evm_coverage::{HitMaps, InstrumentedHitMaps};
 use foundry_evm_traces::{CallTraceArena, SparsedTraceArena};
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
@@ -376,6 +376,9 @@ pub struct FuzzTestResult {
 
     /// Raw line coverage info
     pub line_coverage: Option<HitMaps>,
+
+    /// Raw instrumented coverage info.
+    pub instrumented_coverage: Option<InstrumentedHitMaps>,
 
     /// Breakpoints for debugger. Correspond to the same fuzz case as `traces`.
     pub breakpoints: Option<Breakpoints>,

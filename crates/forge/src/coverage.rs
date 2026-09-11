@@ -18,6 +18,8 @@ use std::{
 
 pub use foundry_evm::coverage::*;
 
+pub(crate) mod instrumented;
+
 /// A coverage reporter.
 pub trait CoverageReporter {
     /// Returns a debug string for the reporter.
@@ -258,15 +260,16 @@ impl CoverageAttributionReporter {
     }
 
     /// Writes per-test coverage attribution for the provided outcome.
-    pub fn report(
+    pub(crate) fn report(
         &self,
         report: &CoverageReport,
         outcome: &TestOutcome,
         resolved_hit_maps: &ResolvedHitMaps,
+        instrumented_index: Option<&instrumented::InstrumentedCoverageTagIndex>,
     ) -> eyre::Result<()> {
         let payload = AttributionReport {
             version: 1,
-            tests: AttributionTests { report, outcome, resolved_hit_maps },
+            tests: AttributionTests { report, outcome, resolved_hit_maps, instrumented_index },
         };
         let mut out = std::io::BufWriter::new(fs::create_file(&self.path)?);
         serde_json::to_writer(&mut out, &payload)?;
@@ -274,6 +277,104 @@ impl CoverageAttributionReporter {
         out.flush()?;
 
         sh_println!("Wrote coverage attribution report.")?;
+
+        Ok(())
+    }
+}
+
+/// Writes the coverage report in Istanbul's JSON coverage-map format.
+pub struct JsonReporter {
+    root: PathBuf,
+    path: PathBuf,
+}
+
+impl JsonReporter {
+    /// Create a new JSON reporter.
+    pub const fn new(root: PathBuf, path: PathBuf) -> Self {
+        Self { root, path }
+    }
+}
+
+impl CoverageReporter for JsonReporter {
+    fn name(&self) -> &'static str {
+        "json"
+    }
+
+    fn report(&mut self, report: &CoverageReport) -> eyre::Result<()> {
+        let mut coverage = BTreeMap::new();
+        let mut locations = SourcePositionCache::new(self.root.clone());
+
+        for (path, items) in report.items_by_file() {
+            let mut file = IstanbulFileCoverage {
+                path: path.display().to_string(),
+                statement_map: BTreeMap::new(),
+                function_map: BTreeMap::new(),
+                branch_map: BTreeMap::new(),
+                statements: BTreeMap::new(),
+                functions: BTreeMap::new(),
+                branches: BTreeMap::new(),
+            };
+
+            let mut statement_index = 0usize;
+            let mut function_index = 0usize;
+            let mut branch_groups = BTreeMap::<u32, Vec<&CoverageItem>>::new();
+
+            for item in &items {
+                match &item.kind {
+                    CoverageItemKind::Statement => {
+                        let id = statement_index.to_string();
+                        statement_index += 1;
+                        file.statement_map.insert(id.clone(), locations.location(path, &item.loc)?);
+                        file.statements.insert(id, item.hits);
+                    }
+                    CoverageItemKind::Function { name } => {
+                        let id = function_index.to_string();
+                        function_index += 1;
+                        let loc = locations.location(path, &item.loc)?;
+                        file.function_map.insert(
+                            id.clone(),
+                            IstanbulFunction {
+                                name: name.to_string(),
+                                decl: loc.clone(),
+                                loc,
+                                line: item.loc.lines.start,
+                            },
+                        );
+                        file.functions.insert(id, item.hits);
+                    }
+                    CoverageItemKind::Branch { branch_id, .. } => {
+                        branch_groups.entry(*branch_id).or_default().push(item);
+                    }
+                    CoverageItemKind::Line => {}
+                }
+            }
+
+            for (branch_index, branch_items) in branch_groups.values_mut().enumerate() {
+                branch_items.sort_by_key(|item| match item.kind {
+                    CoverageItemKind::Branch { path_id, .. } => path_id,
+                    _ => unreachable!(),
+                });
+
+                let id = branch_index.to_string();
+                let loc = locations.location(path, &branch_items[0].loc)?;
+                let mut branch_locations = Vec::with_capacity(branch_items.len());
+                let mut hits = Vec::with_capacity(branch_items.len());
+                for item in branch_items {
+                    branch_locations.push(locations.location(path, &item.loc)?);
+                    hits.push(item.hits);
+                }
+                file.branch_map.insert(
+                    id.clone(),
+                    IstanbulBranch { loc, branch_type: "branch", locations: branch_locations },
+                );
+                file.branches.insert(id, hits);
+            }
+
+            coverage.insert(path.display().to_string(), file);
+        }
+
+        serde_json::to_writer_pretty(fs::create_file(&self.path)?, &coverage)?;
+        sh_println!("Wrote JSON coverage report.")?;
 
         Ok(())
     }
@@ -324,6 +425,7 @@ struct AttributionTests<'a> {
     report: &'a CoverageReport,
     outcome: &'a TestOutcome,
     resolved_hit_maps: &'a ResolvedHitMaps,
+    instrumented_index: Option<&'a instrumented::InstrumentedCoverageTagIndex>,
 }
 
 impl Serialize for AttributionTests<'_> {
@@ -341,7 +443,12 @@ impl Serialize for AttributionTests<'_> {
                     test: test.clone(),
                     status: test_status_name(result.status),
                     kind: test_kind_name(&result.kind),
-                    covered: attributed_items(self.report, self.resolved_hit_maps, result),
+                    covered: attributed_items(
+                        self.report,
+                        self.resolved_hit_maps,
+                        self.instrumented_index,
+                        result,
+                    ),
                 })?;
             }
         }
@@ -353,6 +460,7 @@ impl Serialize for AttributionTests<'_> {
 fn attributed_items(
     report: &CoverageReport,
     resolved_hit_maps: &ResolvedHitMaps,
+    instrumented_index: Option<&instrumented::InstrumentedCoverageTagIndex>,
     result: &TestResult,
 ) -> Vec<AttributionItem> {
     type AttributionItemKey = (
@@ -369,41 +477,31 @@ fn attributed_items(
     );
 
     let mut items = BTreeMap::<AttributionItemKey, AttributionItem>::new();
-    let Some(hit_maps) = result.line_coverage.as_ref() else { return Vec::new() };
-
-    for (code_hash, map) in &hit_maps.0 {
-        let Some(resolved) = resolved_hit_maps.get(code_hash) else { continue };
-
-        for (item, hits) in
-            report.hit_items_for_hit_map(&resolved.contract_id, map, resolved.is_deployed_code)
-        {
-            let Some(source_path) =
-                report.get_source_path(&resolved.contract_id.build_id, item.loc.source_id)
-            else {
-                continue;
-            };
-
-            let source = source_path.display().to_string();
-            let contract = item.loc.contract_name.to_string();
-            let (kind, function, branch_id, path_id) = coverage_item_kind_fields(&item.kind);
-            let line_start = item.loc.lines.start;
-            let line_end = item.loc.lines.end;
-            let byte_start = item.loc.bytes.start;
-            let byte_end = item.loc.bytes.end;
-            let key = (
-                source.clone(),
-                contract.clone(),
-                kind,
-                line_start,
-                line_end,
-                byte_start,
-                byte_end,
-                function.clone(),
-                branch_id,
-                path_id,
-            );
-
-            items.entry(key).and_modify(|item| item.hits += hits).or_insert(AttributionItem {
+    let mut add_item = |build_id: &str, item: &CoverageItem, hits: u32| {
+        let Some(source_path) = report.get_source_path(build_id, item.loc.source_id) else {
+            return;
+        };
+        let source = source_path.display().to_string();
+        let contract = item.loc.contract_name.to_string();
+        let (kind, function, branch_id, path_id) = coverage_item_kind_fields(&item.kind);
+        let line_start = item.loc.lines.start;
+        let line_end = item.loc.lines.end;
+        let byte_start = item.loc.bytes.start;
+        let byte_end = item.loc.bytes.end;
+        let key = (
+            source.clone(),
+            contract.clone(),
+            kind,
+            line_start,
+            line_end,
+            byte_start,
+            byte_end,
+            function.clone(),
+            branch_id,
+            path_id,
+        );
+        items.entry(key).and_modify(|item| item.hits = item.hits.saturating_add(hits)).or_insert(
+            AttributionItem {
                 source,
                 contract,
                 kind,
@@ -415,7 +513,28 @@ fn attributed_items(
                 function,
                 branch_id,
                 path_id,
-            });
+            },
+        );
+    };
+
+    if let Some(index) = instrumented_index {
+        if let Some(hits) = &result.instrumented_coverage {
+            for ((build_id, item_id), hits) in instrumented::item_hits(index, hits) {
+                if let Some(analysis) = report.analyses.get(build_id)
+                    && let Some(item) = analysis.all_items().get(item_id as usize)
+                {
+                    add_item(build_id, item, hits);
+                }
+            }
+        }
+    } else if let Some(hit_maps) = &result.line_coverage {
+        for (code_hash, map) in &hit_maps.0 {
+            let Some(resolved) = resolved_hit_maps.get(code_hash) else { continue };
+            for (item, hits) in
+                report.hit_items_for_hit_map(&resolved.contract_id, map, resolved.is_deployed_code)
+            {
+                add_item(&resolved.contract_id.build_id, item, hits);
+            }
         }
     }
 
@@ -452,6 +571,51 @@ const fn test_kind_name(kind: &TestKind) -> &'static str {
         TestKind::Symbolic { .. } => "symbolic",
         TestKind::Replay { .. } => "replay",
     }
+}
+
+#[derive(Serialize)]
+struct IstanbulFileCoverage {
+    path: String,
+    #[serde(rename = "statementMap")]
+    statement_map: BTreeMap<String, IstanbulLocation>,
+    #[serde(rename = "fnMap")]
+    function_map: BTreeMap<String, IstanbulFunction>,
+    #[serde(rename = "branchMap")]
+    branch_map: BTreeMap<String, IstanbulBranch>,
+    #[serde(rename = "s")]
+    statements: BTreeMap<String, u32>,
+    #[serde(rename = "f")]
+    functions: BTreeMap<String, u32>,
+    #[serde(rename = "b")]
+    branches: BTreeMap<String, Vec<u32>>,
+}
+
+#[derive(Clone, Serialize)]
+struct IstanbulLocation {
+    start: IstanbulPosition,
+    end: IstanbulPosition,
+}
+
+#[derive(Clone, Serialize)]
+struct IstanbulPosition {
+    line: u32,
+    column: u32,
+}
+
+#[derive(Serialize)]
+struct IstanbulFunction {
+    name: String,
+    decl: IstanbulLocation,
+    loc: IstanbulLocation,
+    line: u32,
+}
+
+#[derive(Serialize)]
+struct IstanbulBranch {
+    loc: IstanbulLocation,
+    #[serde(rename = "type")]
+    branch_type: &'static str,
+    locations: Vec<IstanbulLocation>,
 }
 
 /// A super verbose reporter for debugging coverage while it is still unstable.
@@ -507,6 +671,59 @@ impl CoverageReporter for DebugReporter {
         }
 
         Ok(())
+    }
+}
+
+/// Cache line/column offsets for Istanbul JSON source locations.
+struct SourcePositionCache {
+    root: PathBuf,
+    line_offsets: HashMap<PathBuf, Vec<usize>>,
+}
+
+impl SourcePositionCache {
+    fn new(root: PathBuf) -> Self {
+        Self { root, line_offsets: HashMap::default() }
+    }
+
+    fn location(&mut self, path: &Path, loc: &SourceLocation) -> eyre::Result<IstanbulLocation> {
+        Ok(IstanbulLocation {
+            start: self.position(path, loc.bytes.start as usize, loc.lines.start)?,
+            end: self.position(path, loc.bytes.end as usize, loc.lines.end.saturating_sub(1))?,
+        })
+    }
+
+    fn position(
+        &mut self,
+        path: &Path,
+        offset: usize,
+        fallback_line: u32,
+    ) -> eyre::Result<IstanbulPosition> {
+        let line_offsets = match self.line_offsets.entry(path.to_path_buf()) {
+            hash_map::Entry::Occupied(o) => o.into_mut(),
+            hash_map::Entry::Vacant(v) => {
+                let source_path =
+                    if path.is_absolute() { path.to_path_buf() } else { self.root.join(path) };
+                let text = fs::read_to_string(source_path)?;
+                let mut line_offsets = vec![0];
+                for (idx, byte) in text.bytes().enumerate() {
+                    if byte == b'\n' {
+                        line_offsets.push(idx + 1);
+                    }
+                }
+                v.insert(line_offsets)
+            }
+        };
+
+        let line_index = match line_offsets.binary_search(&offset) {
+            Ok(index) => index,
+            Err(0) => {
+                return Ok(IstanbulPosition { line: fallback_line.max(1), column: 0 });
+            }
+            Err(index) => index - 1,
+        };
+        let line = line_index as u32 + 1;
+        let column = offset.saturating_sub(line_offsets[line_index]) as u32;
+        Ok(IstanbulPosition { line, column })
     }
 }
 
