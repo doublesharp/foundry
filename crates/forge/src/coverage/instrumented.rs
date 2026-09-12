@@ -54,7 +54,11 @@ pub(crate) fn prepare(
     exclude_tests: bool,
 ) -> Result<(CoverageReport, InstrumentedCoverageTagIndex)> {
     let mut report = CoverageReport::default();
-    let mut grouped = BTreeMap::<(String, u32), Vec<&InstrumentedCoverageProbe>>::new();
+    let mut probes_by_source = HashMap::<_, Vec<_>>::default();
+    for probe in &instrumentation.probes {
+        probes_by_source.entry((&probe.version, probe.path.as_path())).or_default().push(probe);
+    }
+    let mut grouped = HashMap::<&str, BTreeMap<u32, &[&InstrumentedCoverageProbe]>>::default();
     let mut seen_sources = BTreeSet::new();
 
     for (path, sources) in &output.output().sources.0 {
@@ -68,7 +72,7 @@ pub(crate) fn prepare(
 
         for source in sources {
             let source_file = &source.source_file;
-            if !seen_sources.insert((source.version.clone(), path.clone(), source_file.id)) {
+            if !seen_sources.insert((&source.version, path, source_file.id)) {
                 continue;
             }
 
@@ -80,65 +84,53 @@ pub(crate) fn prepare(
                 continue;
             }
 
-            let probes = instrumentation
-                .probes
-                .iter()
-                .filter(|probe| probe.version == source.version && probe.path == *path)
-                .collect::<Vec<_>>();
-            if !probes.is_empty() {
-                grouped.insert((source.build_id.clone(), source_file.id), probes);
+            if let Some(probes) = probes_by_source.get(&(&source.version, path.as_path())) {
+                grouped.entry(&source.build_id).or_default().insert(source_file.id, probes);
             }
         }
     }
 
-    let mut by_build = HashMap::<String, Vec<(u32, Vec<CoverageItem>)>>::default();
-    for ((build_id, source_id), probes) in &grouped {
-        let items = build_source_items(*source_id, probes);
-        by_build.entry(build_id.clone()).or_default().push((*source_id, items));
-    }
-
     let mut tag_index = InstrumentedCoverageTagIndex::default();
-    for (build_id, sourced_items) in by_build {
-        let analysis = SourceAnalysis::from_sourced_items(sourced_items);
-        let mut indexed_sources = BTreeSet::new();
+    for (build_id, sources) in grouped {
+        let analysis = SourceAnalysis::from_sourced_items(
+            sources
+                .iter()
+                .map(|(&source_id, probes)| (source_id, build_source_items(source_id, probes)))
+                .collect(),
+        );
         let mut line_item_ids = HashMap::<(u32, u32, u32), u32>::default();
         let mut statement_item_ids = HashMap::<(u32, u32, u32), u32>::default();
         let mut branch_item_ids = HashMap::<(u32, u32, u32), u32>::default();
         let mut function_item_ids = HashMap::<(u32, u32, u32), u32>::default();
 
-        for ((probe_build_id, source_id), probes) in &grouped {
-            if *probe_build_id != build_id {
-                continue;
-            }
-            if indexed_sources.insert(*source_id) {
-                for (item_id, item) in analysis.items_for_source_enumerated(*source_id) {
-                    match item.kind {
-                        CoverageItemKind::Line => {
-                            line_item_ids.insert(
-                                (*source_id, item.loc.lines.start, item.loc.lines.end),
-                                item_id,
-                            );
-                        }
-                        CoverageItemKind::Statement => {
-                            statement_item_ids.insert(
-                                (*source_id, item.loc.bytes.start, item.loc.bytes.end),
-                                item_id,
-                            );
-                        }
-                        CoverageItemKind::Branch { branch_id, path_id, .. } => {
-                            branch_item_ids.insert((*source_id, branch_id, path_id), item_id);
-                        }
-                        CoverageItemKind::Function { .. } => {
-                            function_item_ids.insert(
-                                (*source_id, item.loc.bytes.start, item.loc.bytes.end),
-                                item_id,
-                            );
-                        }
+        for (source_id, probes) in &sources {
+            for (item_id, item) in analysis.items_for_source_enumerated(*source_id) {
+                match item.kind {
+                    CoverageItemKind::Line => {
+                        line_item_ids.insert(
+                            (*source_id, item.loc.lines.start, item.loc.lines.end),
+                            item_id,
+                        );
+                    }
+                    CoverageItemKind::Statement => {
+                        statement_item_ids.insert(
+                            (*source_id, item.loc.bytes.start, item.loc.bytes.end),
+                            item_id,
+                        );
+                    }
+                    CoverageItemKind::Branch { branch_id, path_id, .. } => {
+                        branch_item_ids.insert((*source_id, branch_id, path_id), item_id);
+                    }
+                    CoverageItemKind::Function { .. } => {
+                        function_item_ids.insert(
+                            (*source_id, item.loc.bytes.start, item.loc.bytes.end),
+                            item_id,
+                        );
                     }
                 }
             }
 
-            for probe in probes {
+            for probe in *probes {
                 let line_item_id =
                     line_item_ids.get(&(*source_id, probe.lines.start, probe.lines.end)).copied();
                 if let Some(line_item_id) = line_item_id {
@@ -193,7 +185,7 @@ pub(crate) fn prepare(
                     tag_index.0.insert(
                         probe.tag,
                         InstrumentedCoverageItemIds {
-                            build_id: build_id.clone(),
+                            build_id: build_id.to_owned(),
                             line_item_id,
                             statement_item_id,
                             branch_item_id,
@@ -204,7 +196,7 @@ pub(crate) fn prepare(
                 }
             }
         }
-        report.add_analysis(build_id, analysis);
+        report.add_analysis(build_id.to_owned(), analysis);
     }
 
     Ok((report, tag_index))
@@ -302,7 +294,7 @@ pub(crate) fn add_hits(
     index: &InstrumentedCoverageTagIndex,
     hits: &InstrumentedHitMaps,
 ) {
-    for ((build_id, item_id), hits) in item_hits(index, hits) {
+    for ((build_id, item_id), hits) in item_hits(index, std::iter::once(hits)) {
         if let Some(analysis) = report.analyses.get_mut(build_id)
             && let Some(item) = analysis.all_items_mut().get_mut(item_id as usize)
         {
@@ -312,43 +304,57 @@ pub(crate) fn add_hits(
 }
 
 /// Resolves runtime tags to item hits for either a whole run or one test.
-pub(crate) fn item_hits<'a>(
+pub(crate) fn item_hits<'a, 'b>(
     index: &'a InstrumentedCoverageTagIndex,
-    hits: &InstrumentedHitMaps,
+    hits: impl IntoIterator<Item = &'b InstrumentedHitMaps, IntoIter: Clone>,
 ) -> BTreeMap<(&'a str, u32), u32> {
     let mut items = BTreeMap::<(&str, u32), u32>::new();
+    let maps = hits.into_iter();
     let mut require_hits = BTreeMap::<(&str, u32, u32), InstrumentedRequireBranchHits>::new();
 
-    for (tag, hit_count) in &hits.0 {
-        let Some(item_ids) = index.0.get(tag) else { continue };
-        let build_id = item_ids.build_id.as_str();
-        let hit_count = (*hit_count).min(u32::MAX as u64) as u32;
-        for item_id in [item_ids.statement_item_id, item_ids.branch_item_id].into_iter().flatten() {
-            let count = items.entry((build_id, item_id)).or_default();
-            *count = count.saturating_add(hit_count);
-        }
-        if let Some(require_branch) = &item_ids.require_branch {
-            let entry = require_hits
-                .entry((build_id, require_branch.false_item_id, require_branch.true_item_id))
-                .or_insert_with(|| InstrumentedRequireBranchHits {
-                    false_item_id: require_branch.false_item_id,
-                    true_item_id: require_branch.true_item_id,
-                    ..Default::default()
-                });
-            match require_branch.role {
-                InstrumentedRequireProbeRole::Pre => {
-                    entry.pre = entry.pre.saturating_add(hit_count);
-                }
-                InstrumentedRequireProbeRole::Post => {
-                    entry.post = entry.post.saturating_add(hit_count);
+    for (map_index, map) in maps.clone().enumerate() {
+        for (tag, hit_count) in &map.0 {
+            if maps.clone().take(map_index).any(|previous| previous.0.contains_key(tag)) {
+                continue;
+            }
+            let Some(item_ids) = index.0.get(tag) else { continue };
+            let build_id = item_ids.build_id.as_str();
+            // Merge each tag across shared setup and test maps before reducing line maxima or
+            // require pre/post differences, without cloning the underlying hit maps.
+            let hit_count = maps
+                .clone()
+                .skip(map_index + 1)
+                .fold(*hit_count, |count, map| count + map.0.get(tag).copied().unwrap_or_default())
+                .min(u32::MAX as u64) as u32;
+            for item_id in
+                [item_ids.statement_item_id, item_ids.branch_item_id].into_iter().flatten()
+            {
+                let count = items.entry((build_id, item_id)).or_default();
+                *count = count.saturating_add(hit_count);
+            }
+            if let Some(require_branch) = &item_ids.require_branch {
+                let entry = require_hits
+                    .entry((build_id, require_branch.false_item_id, require_branch.true_item_id))
+                    .or_insert_with(|| InstrumentedRequireBranchHits {
+                        false_item_id: require_branch.false_item_id,
+                        true_item_id: require_branch.true_item_id,
+                        ..Default::default()
+                    });
+                match require_branch.role {
+                    InstrumentedRequireProbeRole::Pre => {
+                        entry.pre = entry.pre.saturating_add(hit_count);
+                    }
+                    InstrumentedRequireProbeRole::Post => {
+                        entry.post = entry.post.saturating_add(hit_count);
+                    }
                 }
             }
-        }
-        for item_id in
-            [item_ids.function_item_id, Some(item_ids.line_item_id)].into_iter().flatten()
-        {
-            let count = items.entry((build_id, item_id)).or_default();
-            *count = (*count).max(hit_count);
+            for item_id in
+                [item_ids.function_item_id, Some(item_ids.line_item_id)].into_iter().flatten()
+            {
+                let count = items.entry((build_id, item_id)).or_default();
+                *count = (*count).max(hit_count);
+            }
         }
     }
 
@@ -358,4 +364,165 @@ pub(crate) fn item_hits<'a>(
     }
     items.retain(|_, hits| *hits != 0);
     items
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        coverage::{AttributionIndex, ResolvedHitMaps, attributed_items},
+        result::TestResult,
+    };
+    use alloy_primitives::B256;
+    use foundry_compilers::{Project, artifacts::SourceFile, output::sources::VersionedSourceFile};
+    use semver::Version;
+    use std::{path::Path, sync::Arc};
+
+    fn probe(version: u64, path: &str, tag: u8, line: u32) -> InstrumentedCoverageProbe {
+        InstrumentedCoverageProbe {
+            version: Version::new(0, 8, version),
+            path: path.into(),
+            contract_name: "Counter".into(),
+            tag: B256::repeat_byte(tag),
+            kind: InstrumentedCoverageProbeKind::Statement,
+            bytes: line * 10..line * 10 + 5,
+            lines: line..line + 1,
+        }
+    }
+
+    #[test]
+    fn prepare_preserves_sources_versions_and_probe_order() {
+        let root = tempfile::tempdir().unwrap();
+        let mut output = Project::builder()
+            .paths(ProjectPathsConfig::builder().build_with_root(root.path()))
+            .ephemeral()
+            .no_artifacts()
+            .build(Default::default())
+            .unwrap()
+            .compile()
+            .unwrap();
+        for (path, version, build_id, source_id) in [
+            ("src/Counter.sol", 20, "older", 4),
+            ("src/Counter.sol", 21, "newer", 1),
+            ("src/Other.sol", 21, "newer", 2),
+            ("src/Counter.sol", 21, "duplicate", 1),
+            ("src/Empty.sol", 21, "newer", 3),
+        ] {
+            output.output_mut().sources.0.entry(path.into()).or_default().push(
+                VersionedSourceFile {
+                    source_file: SourceFile { id: source_id, ast: None },
+                    version: Version::new(0, 8, version),
+                    build_id: build_id.into(),
+                    profile: "default".into(),
+                },
+            );
+        }
+        let mut first = probe(21, "src/Counter.sol", 1, 2);
+        first.contract_name = "First".into();
+        let mut duplicate = first.clone();
+        duplicate.contract_name = "Second".into();
+        duplicate.tag = B256::repeat_byte(2);
+        let metadata = InstrumentedCoverageMetadata {
+            probes: vec![
+                first,
+                probe(20, "src/Counter.sol", 3, 4),
+                probe(21, "src/Other.sol", 4, 3),
+                duplicate,
+                probe(22, "src/Counter.sol", 5, 5),
+                probe(21, "src/Unknown.sol", 6, 6),
+            ],
+        };
+        let paths = ProjectPathsConfig::builder().build_with_root(Path::new("."));
+        let (report, index) = prepare(&paths, &output, &metadata, true, false).unwrap();
+        assert_eq!(report.analyses.len(), 2);
+        assert_eq!(report.source_paths["newer"].len(), 3);
+        assert!(!report.source_paths.contains_key("duplicate"));
+        let newer = report.analyses["newer"].all_items();
+        assert_eq!(newer.len(), 4);
+        assert_eq!(newer[0].loc.contract_name.as_ref(), "First");
+        assert_eq!(newer[1].loc.contract_name.as_ref(), "First");
+        assert_eq!(newer[2].loc.source_id, 2);
+        assert_eq!(report.analyses["older"].all_items()[0].loc.lines, 4..5);
+        assert_eq!(index.0.len(), 4);
+        assert_eq!(index.0[&B256::repeat_byte(1)].statement_item_id, Some(1));
+        assert_eq!(index.0[&B256::repeat_byte(2)].statement_item_id, Some(1));
+        assert_eq!(index.0[&B256::repeat_byte(4)].statement_item_id, Some(3));
+    }
+    #[test]
+    fn item_hits_resolves_combined_tags_before_lines_and_require_branches() {
+        let mut index = InstrumentedCoverageTagIndex::default();
+        for (tag, require_branch) in [
+            (1, Some(InstrumentedRequireProbeRole::Pre)),
+            (2, Some(InstrumentedRequireProbeRole::Post)),
+            (3, None),
+        ] {
+            index.0.insert(
+                B256::repeat_byte(tag),
+                InstrumentedCoverageItemIds {
+                    build_id: "build".into(),
+                    line_item_id: 0,
+                    statement_item_id: (tag == 3).then_some(1),
+                    branch_item_id: None,
+                    require_branch: require_branch.map(|role| InstrumentedRequireBranchIds {
+                        role,
+                        false_item_id: 2,
+                        true_item_id: 3,
+                    }),
+                    function_item_id: None,
+                },
+            );
+        }
+        let setup = InstrumentedHitMaps(
+            [(B256::repeat_byte(1), 2), (B256::repeat_byte(2), 1), (B256::repeat_byte(3), 4)]
+                .into_iter()
+                .collect(),
+        );
+        let delta = InstrumentedHitMaps(
+            [(B256::repeat_byte(1), 3), (B256::repeat_byte(2), 4), (B256::repeat_byte(3), 2)]
+                .into_iter()
+                .collect(),
+        );
+        let mut merged = setup.clone();
+        merged.merge_ref(&delta);
+        assert_eq!(item_hits(&index, [&setup, &delta]), item_hits(&index, [&merged]));
+        assert_eq!(
+            item_hits(&index, [&merged]),
+            BTreeMap::from([(("build", 0), 6), (("build", 1), 6), (("build", 3), 5)])
+        );
+        let mut report = CoverageReport::default();
+        report.add_source("build".into(), 0, "src/Counter.sol".into());
+        let items = [
+            CoverageItemKind::Line,
+            CoverageItemKind::Statement,
+            CoverageItemKind::Branch { branch_id: 0, path_id: 0, is_first_opcode: false },
+            CoverageItemKind::Branch { branch_id: 0, path_id: 1, is_first_opcode: false },
+        ]
+        .into_iter()
+        .map(|kind| CoverageItem {
+            kind,
+            loc: SourceLocation {
+                source_id: 0,
+                contract_name: "Counter".into(),
+                bytes: 10..15,
+                lines: 2..3,
+            },
+            anchor_loc: None,
+            hits: 0,
+        })
+        .collect();
+        report.add_analysis("build".into(), SourceAnalysis::from_sourced_items(vec![(0, items)]));
+        let result = TestResult {
+            setup_instrumented_coverage: Some(Arc::new(setup)),
+            instrumented_coverage: Some(delta),
+            ..Default::default()
+        };
+        let paths = AttributionIndex::source_paths(&report);
+        let metadata = AttributionIndex::new(&report, &paths);
+        let attributed =
+            attributed_items(&metadata, &ResolvedHitMaps::default(), Some(&index), &result);
+        assert_eq!(
+            attributed.iter().map(|item| (item.kind, item.path_id, item.hits)).collect::<Vec<_>>(),
+            vec![("branch", Some(1), 5), ("line", None, 6), ("statement", None, 6)]
+        );
+    }
 }

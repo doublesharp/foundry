@@ -33,7 +33,7 @@ use std::{
     collections::{BTreeMap, HashMap as Map},
     fmt::{self, Write},
     path::PathBuf,
-    sync::OnceLock,
+    sync::{Arc, OnceLock},
     time::Duration,
 };
 use yansi::Paint;
@@ -1331,9 +1331,13 @@ pub struct TestResult {
     #[serde(skip)]
     pub line_coverage: Option<HitMaps>,
 
-    /// Raw instrumented coverage info.
+    /// Raw instrumented coverage collected during this test.
     #[serde(skip)]
     pub instrumented_coverage: Option<InstrumentedHitMaps>,
+
+    /// Setup hits shared by all tests in this suite.
+    #[serde(skip)]
+    pub setup_instrumented_coverage: Option<Arc<InstrumentedHitMaps>>,
 
     /// Labeled addresses
     #[serde(rename = "labeled_addresses")] // Backwards compatibility.
@@ -1611,9 +1615,17 @@ impl TestResult {
             debug_bytecodes: setup.debug_bytecodes.clone(),
             line_coverage: setup.coverage.clone(),
             fork_block_number: setup.fork_block_number,
-            instrumented_coverage: setup.instrumented_coverage.clone(),
+            setup_instrumented_coverage: setup.instrumented_coverage.clone(),
             ..Default::default()
         }
+    }
+
+    /// Returns shared setup hits followed by this test's execution hits.
+    pub fn instrumented_coverage(&self) -> impl Iterator<Item = &InstrumentedHitMaps> + Clone {
+        self.setup_instrumented_coverage
+            .as_deref()
+            .into_iter()
+            .chain(self.instrumented_coverage.as_ref())
     }
 
     /// Creates a failed test result with given reason.
@@ -1630,7 +1642,7 @@ impl TestResult {
             traces: setup.traces,
             debug_bytecodes: setup.debug_bytecodes,
             line_coverage: setup.coverage,
-            instrumented_coverage: setup.instrumented_coverage,
+            setup_instrumented_coverage: setup.instrumented_coverage,
             labels: setup.labels,
             fork_block_number: setup.fork_block_number,
             ..Default::default()
@@ -2142,8 +2154,8 @@ pub struct TestSetup {
     pub debug_bytecodes: AddressHashMap<Bytes>,
     /// Coverage info during setup.
     pub coverage: Option<HitMaps>,
-    /// Instrumented coverage info during setup.
-    pub instrumented_coverage: Option<InstrumentedHitMaps>,
+    /// Instrumented coverage info shared with each test after setup finishes.
+    pub instrumented_coverage: Option<Arc<InstrumentedHitMaps>>,
     /// Addresses of external libraries deployed during setup.
     pub deployed_libs: Vec<Address>,
     /// The active fork's block number after setup, if any.
@@ -2181,7 +2193,12 @@ impl TestSetup {
     }
 
     pub fn merge_instrumented_coverages(&mut self, other_coverage: Option<InstrumentedHitMaps>) {
-        InstrumentedHitMaps::merge_opt(&mut self.instrumented_coverage, other_coverage);
+        let Some(other) = other_coverage else { return };
+        if let Some(hits) = &mut self.instrumented_coverage {
+            Arc::make_mut(hits).merge(other);
+        } else {
+            self.instrumented_coverage = Some(Arc::new(other));
+        }
     }
 }
 
@@ -2196,6 +2213,61 @@ const fn symbolic_result_schema_version() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_results_share_setup_instrumented_hits() {
+        let mut hits = InstrumentedHitMaps::default();
+        hits.0.insert(B256::ZERO, 3);
+        let setup = TestSetup { instrumented_coverage: Some(Arc::new(hits)), ..Default::default() };
+        let first = TestResult::new(&setup);
+        let second = TestResult::new(&setup);
+        assert!(Arc::ptr_eq(
+            first.setup_instrumented_coverage.as_ref().unwrap(),
+            second.setup_instrumented_coverage.as_ref().unwrap(),
+        ));
+    }
+
+    #[test]
+    fn instrumented_setup_and_test_hits_remain_independent() {
+        let tag = B256::ZERO;
+        let mut setup_hits = InstrumentedHitMaps::default();
+        setup_hits.0.insert(tag, 3);
+        let mut setup =
+            TestSetup { instrumented_coverage: Some(Arc::new(setup_hits)), ..Default::default() };
+        let mut first = TestResult::new(&setup);
+        let second = TestResult::new(&setup);
+        let mut execution = InstrumentedHitMaps::default();
+        execution.0.insert(tag, 5);
+        first.merge_instrumented_coverages(Some(execution));
+        let total = |result: &TestResult| {
+            result
+                .instrumented_coverage()
+                .map(|hits| hits.0.get(&tag).copied().unwrap_or(0))
+                .sum::<u64>()
+        };
+        assert_eq!(total(&first), 8);
+        assert_eq!(total(&second), 3);
+        assert_eq!(setup.instrumented_coverage.as_ref().unwrap().0[&tag], 3);
+
+        let mut additional_setup = InstrumentedHitMaps::default();
+        additional_setup.0.insert(tag, 2);
+        setup.merge_instrumented_coverages(Some(additional_setup));
+        assert_eq!(total(&first), 8);
+        assert_eq!(total(&second), 3);
+        assert_eq!(total(&TestResult::new(&setup)), 5);
+        assert_eq!(total(&TestResult::setup_result(setup)), 5);
+
+        let mut aggregate = InstrumentedHitMaps::default();
+        for result in [&first, &second] {
+            for hits in result.instrumented_coverage() {
+                aggregate.merge_ref(hits);
+            }
+        }
+        assert_eq!(aggregate.0[&tag], 11);
+        let serialized = serde_json::to_value(first).unwrap();
+        assert!(serialized.get("instrumented_coverage").is_none());
+        assert!(serialized.get("setup_instrumented_coverage").is_none());
+    }
 
     const SYMBOLIC_RESULT_SCHEMA: &str =
         include_str!("../../evm/symbolic/assets/symbolic-result.schema.json");

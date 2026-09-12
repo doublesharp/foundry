@@ -111,6 +111,105 @@ fn format_cell(hits: usize, total: usize) -> Cell {
 mod tests {
     use super::*;
 
+    use alloy_primitives::{B256, Bytes};
+    use foundry_evm::coverage::analysis::SourceAnalysis;
+
+    #[test]
+    fn attribution_merges_builds_preserving_metadata_order_and_saturation() {
+        let mut report = CoverageReport::default();
+        let mut resolved = ResolvedHitMaps::default();
+        let mut hit_maps = HitMaps::default();
+        for (build_id, source_id, tag, count) in [("older", 4, 1, u32::MAX), ("newer", 1, 2, 3)] {
+            report.add_source(build_id.into(), source_id, "src/Counter.sol".into());
+            let kinds = [
+                CoverageItemKind::Statement,
+                CoverageItemKind::Function { name: "z()".into() },
+                CoverageItemKind::Branch { branch_id: 7, path_id: 1, is_first_opcode: true },
+                CoverageItemKind::Branch { branch_id: 7, path_id: 0, is_first_opcode: false },
+                CoverageItemKind::Function { name: "a()".into() },
+            ];
+            let items = kinds
+                .into_iter()
+                .map(|kind| CoverageItem {
+                    kind,
+                    loc: SourceLocation {
+                        source_id,
+                        contract_name: "Counter".into(),
+                        bytes: 10..15,
+                        lines: 2..3,
+                    },
+                    anchor_loc: None,
+                    hits: 0,
+                })
+                .collect();
+            report.add_analysis(
+                build_id.into(),
+                SourceAnalysis::from_sourced_items(vec![(source_id as u32, items)]),
+            );
+            let contract_id = ContractId {
+                version: Version::new(0, 8, 20 + tag),
+                build_id: build_id.into(),
+                source_id,
+                contract_name: "Counter".into(),
+            };
+            report.add_anchors([(
+                contract_id.clone(),
+                (
+                    (0..5).map(|item_id| ItemAnchor { instruction: item_id, item_id }).collect(),
+                    Vec::new(),
+                ),
+            )]);
+            let mut hits = HitMap::new(Bytes::new());
+            for instruction in 0..5 {
+                hits.hits(instruction, count);
+            }
+            let hash = B256::repeat_byte(tag as u8);
+            hit_maps.0.insert(hash, hits);
+            resolved.insert(hash, ResolvedHitMap { contract_id, is_deployed_code: false });
+        }
+        let result = TestResult { line_coverage: Some(hit_maps), ..Default::default() };
+        let source_paths = AttributionIndex::source_paths(&report);
+        let metadata = AttributionIndex::new(&report, &source_paths);
+        assert_eq!(source_paths.len(), 1);
+        assert_eq!(metadata.items.len(), 5);
+        let attributed = attributed_items(&metadata, &resolved, None, &result);
+        let actual = serde_json::to_value(&attributed).unwrap();
+        let common = serde_json::json!({"source":"src/Counter.sol","contract":"Counter","kind":"statement","line_start":2,"line_end":3,"byte_start":10,"byte_end":15,"hits":u32::MAX});
+        let mut expected = Vec::new();
+        for (kind, function, path_id) in [
+            ("branch", None, Some(0)),
+            ("branch", None, Some(1)),
+            ("function", Some("a()"), None),
+            ("function", Some("z()"), None),
+            ("statement", None, None),
+        ] {
+            let mut item = common.clone();
+            item["kind"] = kind.into();
+            if let Some(name) = function {
+                item["function"] = name.into();
+            }
+            if let Some(path_id) = path_id {
+                item["branch_id"] = 7.into();
+                item["path_id"] = path_id.into();
+            }
+            expected.push(item);
+        }
+        assert_eq!(actual, serde_json::json!(expected));
+        for item in &attributed {
+            assert!(
+                report.analyses.values().flat_map(|analysis| analysis.all_items()).any(
+                    |original| { original.loc.contract_name.as_ptr() == item.contract.as_ptr() }
+                ),
+                "attribution must borrow canonical contract metadata"
+            );
+            if let Some(function) = &item.function {
+                assert!(report.analyses.values().flat_map(|analysis| analysis.all_items()).any(|original| {
+                    matches!(&original.kind, CoverageItemKind::Function { name } if name.as_ptr() == function.as_ptr())
+                }), "attribution must borrow canonical function metadata");
+            }
+        }
+    }
+
     #[test]
     fn empty_summary_cell_is_not_applicable() {
         assert_eq!(
@@ -389,19 +488,19 @@ struct AttributionReport<'a> {
 
 /// Coverage attributed to a single executed test.
 #[derive(Serialize)]
-struct AttributionTest {
-    suite: String,
-    test: String,
+struct AttributionTest<'a> {
+    suite: &'a str,
+    test: &'a str,
     status: &'static str,
     kind: &'static str,
-    covered: Vec<AttributionItem>,
+    covered: Vec<AttributionItem<'a>>,
 }
 
 /// A source range covered by a test, with hit counts and item metadata.
-#[derive(Serialize)]
-struct AttributionItem {
-    source: String,
-    contract: String,
+#[derive(Clone, Copy, Serialize)]
+struct AttributionItem<'a> {
+    source: &'a str,
+    contract: &'a str,
     kind: &'static str,
     /// The start of a 1-based, half-open line range.
     line_start: u32,
@@ -413,7 +512,7 @@ struct AttributionItem {
     byte_end: u32,
     hits: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
-    function: Option<String>,
+    function: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     branch_id: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -435,16 +534,18 @@ impl Serialize for AttributionTests<'_> {
     {
         let len = self.outcome.results.values().map(|suite| suite.test_results.len()).sum();
         let mut seq = serializer.serialize_seq(Some(len))?;
+        let source_paths = AttributionIndex::source_paths(self.report);
+        let metadata = AttributionIndex::new(self.report, &source_paths);
 
         for (suite, suite_result) in &self.outcome.results {
             for (test, result) in &suite_result.test_results {
                 seq.serialize_element(&AttributionTest {
-                    suite: suite.clone(),
-                    test: test.clone(),
+                    suite,
+                    test,
                     status: test_status_name(result.status),
                     kind: test_kind_name(&result.kind),
                     covered: attributed_items(
-                        self.report,
+                        &metadata,
                         self.resolved_hit_maps,
                         self.instrumented_index,
                         result,
@@ -457,74 +558,113 @@ impl Serialize for AttributionTests<'_> {
     }
 }
 
-fn attributed_items(
-    report: &CoverageReport,
+type AttributionItemKey<'a> =
+    (&'a str, &'a str, &'static str, u32, u32, u32, u32, Option<&'a str>, Option<u32>, Option<u32>);
+
+impl<'a> AttributionItem<'a> {
+    fn new(source: &'a str, item: &'a CoverageItem) -> Self {
+        let (kind, function, branch_id, path_id) = coverage_item_kind_fields(&item.kind);
+        Self {
+            source,
+            contract: &item.loc.contract_name,
+            kind,
+            line_start: item.loc.lines.start,
+            line_end: item.loc.lines.end,
+            byte_start: item.loc.bytes.start,
+            byte_end: item.loc.bytes.end,
+            hits: 0,
+            function,
+            branch_id,
+            path_id,
+        }
+    }
+
+    const fn key(&self) -> AttributionItemKey<'a> {
+        (
+            self.source,
+            self.contract,
+            self.kind,
+            self.line_start,
+            self.line_end,
+            self.byte_start,
+            self.byte_end,
+            self.function,
+            self.branch_id,
+            self.path_id,
+        )
+    }
+}
+
+/// Canonical metadata shared by every test, with IDs in the JSON item sort order.
+struct AttributionIndex<'a> {
+    report: &'a CoverageReport,
+    source_paths: &'a HashMap<&'a Path, String>,
+    items: Vec<AttributionItem<'a>>,
+    item_ids: HashMap<AttributionItemKey<'a>, usize>,
+}
+
+impl<'a> AttributionIndex<'a> {
+    fn source_paths(report: &CoverageReport) -> HashMap<&Path, String> {
+        let mut paths = HashMap::default();
+        for source_paths in report.source_paths.values() {
+            for path in source_paths.values() {
+                paths.entry(path.as_path()).or_insert_with(|| path.display().to_string());
+            }
+        }
+        paths
+    }
+
+    fn new(report: &'a CoverageReport, source_paths: &'a HashMap<&'a Path, String>) -> Self {
+        let mut canonical = BTreeMap::new();
+        for (build_id, analysis) in &report.analyses {
+            for item in analysis.all_items() {
+                if let Some(path) = report.get_source_path(build_id, item.loc.source_id)
+                    && let Some(source) = source_paths.get(path)
+                {
+                    let item = AttributionItem::new(source, item);
+                    canonical.entry(item.key()).or_insert(item);
+                }
+            }
+        }
+        let mut items = Vec::with_capacity(canonical.len());
+        let mut item_ids = HashMap::with_capacity_and_hasher(canonical.len(), Default::default());
+        for (key, item) in canonical {
+            item_ids.insert(key, items.len());
+            items.push(item);
+        }
+        Self { report, source_paths, items, item_ids }
+    }
+
+    fn item_id(&self, build_id: &str, item: &CoverageItem) -> Option<usize> {
+        let path = self.report.get_source_path(build_id, item.loc.source_id)?;
+        let source = self.source_paths.get(path)?;
+        self.item_ids.get(&AttributionItem::new(source, item).key()).copied()
+    }
+}
+
+fn attributed_items<'a>(
+    metadata: &AttributionIndex<'a>,
     resolved_hit_maps: &ResolvedHitMaps,
     instrumented_index: Option<&instrumented::InstrumentedCoverageTagIndex>,
     result: &TestResult,
-) -> Vec<AttributionItem> {
-    type AttributionItemKey = (
-        String,
-        String,
-        &'static str,
-        u32,
-        u32,
-        u32,
-        u32,
-        Option<String>,
-        Option<u32>,
-        Option<u32>,
-    );
-
-    let mut items = BTreeMap::<AttributionItemKey, AttributionItem>::new();
+) -> Vec<AttributionItem<'a>> {
+    let report = metadata.report;
+    let mut items = BTreeMap::<usize, u32>::new();
     let mut add_item = |build_id: &str, item: &CoverageItem, hits: u32| {
-        let Some(source_path) = report.get_source_path(build_id, item.loc.source_id) else {
-            return;
-        };
-        let source = source_path.display().to_string();
-        let contract = item.loc.contract_name.to_string();
-        let (kind, function, branch_id, path_id) = coverage_item_kind_fields(&item.kind);
-        let line_start = item.loc.lines.start;
-        let line_end = item.loc.lines.end;
-        let byte_start = item.loc.bytes.start;
-        let byte_end = item.loc.bytes.end;
-        let key = (
-            source.clone(),
-            contract.clone(),
-            kind,
-            line_start,
-            line_end,
-            byte_start,
-            byte_end,
-            function.clone(),
-            branch_id,
-            path_id,
-        );
-        items.entry(key).and_modify(|item| item.hits = item.hits.saturating_add(hits)).or_insert(
-            AttributionItem {
-                source,
-                contract,
-                kind,
-                line_start,
-                line_end,
-                byte_start,
-                byte_end,
-                hits,
-                function,
-                branch_id,
-                path_id,
-            },
-        );
+        if let Some(id) = metadata.item_id(build_id, item) {
+            let count = items.entry(id).or_default();
+            *count = count.saturating_add(hits);
+        }
     };
 
     if let Some(index) = instrumented_index {
-        if let Some(hits) = &result.instrumented_coverage {
-            for ((build_id, item_id), hits) in instrumented::item_hits(index, hits) {
-                if let Some(analysis) = report.analyses.get(build_id)
-                    && let Some(item) = analysis.all_items().get(item_id as usize)
-                {
-                    add_item(build_id, item, hits);
-                }
+        for ((build_id, item_id), hits) in
+            instrumented::item_hits(index, result.instrumented_coverage())
+        {
+            if let Some(analysis) = report.analyses.get(build_id)
+                && let Some(item) = analysis.all_items().get(item_id as usize)
+            {
+                add_item(build_id, item, hits);
             }
         }
     } else if let Some(hit_maps) = &result.line_coverage {
@@ -538,19 +678,19 @@ fn attributed_items(
         }
     }
 
-    items.into_values().collect()
+    items.into_iter().map(|(id, hits)| AttributionItem { hits, ..metadata.items[id] }).collect()
 }
 
 fn coverage_item_kind_fields(
     kind: &CoverageItemKind,
-) -> (&'static str, Option<String>, Option<u32>, Option<u32>) {
+) -> (&'static str, Option<&str>, Option<u32>, Option<u32>) {
     match kind {
         CoverageItemKind::Line => ("line", None, None, None),
         CoverageItemKind::Statement => ("statement", None, None, None),
         CoverageItemKind::Branch { branch_id, path_id, .. } => {
             ("branch", None, Some(*branch_id), Some(*path_id))
         }
-        CoverageItemKind::Function { name } => ("function", Some(name.to_string()), None, None),
+        CoverageItemKind::Function { name } => ("function", Some(name), None, None),
     }
 }
 

@@ -119,7 +119,11 @@ impl InstrumentedHitMaps {
     /// Merge `other` into `target`.
     pub fn merge_opt(target: &mut Option<Self>, other: Option<Self>) {
         let Some(other) = other else { return };
-        target.get_or_insert_default().merge(other);
+        if let Some(target) = target {
+            target.merge(other);
+        } else {
+            *target = Some(other);
+        }
     }
 
     /// Merge `other` into this map.
@@ -232,5 +236,37 @@ impl<CTX: ContextTr> Inspector<CTX> for InstrumentedCoverageCollector {
             Bytes::new()
         };
         self.set_frame_return_data(Self::frame_depth(_context), output);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn first_instrumented_merge_retains_allocation() {
+        let mut incoming = InstrumentedHitMaps::default();
+        incoming.hit(B256::ZERO);
+        let allocation = incoming.0.get(&B256::ZERO).unwrap() as *const u64;
+        let mut target = None;
+        InstrumentedHitMaps::merge_opt(&mut target, Some(incoming));
+        let merged = target.unwrap();
+        assert_eq!(merged.0.get(&B256::ZERO), Some(&1));
+        assert_eq!(merged.0.get(&B256::ZERO).unwrap() as *const u64, allocation);
+    }
+
+    #[test]
+    fn instrumented_merge_sums_overlapping_tags() {
+        let mut target = InstrumentedHitMaps::default();
+        target.hit(B256::ZERO);
+        let mut incoming = InstrumentedHitMaps::default();
+        incoming.hit(B256::ZERO);
+        incoming.hit(B256::with_last_byte(1));
+        let mut target = Some(target);
+        InstrumentedHitMaps::merge_opt(&mut target, Some(incoming));
+        InstrumentedHitMaps::merge_opt(&mut target, None);
+        let merged = target.unwrap();
+        assert_eq!(merged.0.get(&B256::ZERO), Some(&2));
+        assert_eq!(merged.0.get(&B256::with_last_byte(1)), Some(&1));
     }
 }

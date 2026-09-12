@@ -518,7 +518,7 @@ impl CoverageArgs {
             let mut aggregated_hits = InstrumentedHitMaps::default();
             for suite in outcome.results.values() {
                 for result in suite.test_results.values() {
-                    if let Some(hits) = &result.instrumented_coverage {
+                    for hits in result.instrumented_coverage() {
                         aggregated_hits.merge_ref(hits);
                     }
                 }
