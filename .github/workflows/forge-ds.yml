@@ -1,11 +1,16 @@
 name: forge-ds
 
-# Builds the `forge-ds` binary and publishes it to a rolling `forge-ds` prerelease
-# so other workflows can download it instead of compiling Foundry:
+# Builds the `forge-ds` binary and publishes it so other workflows can download it
+# instead of compiling Foundry. Each build is published to two prereleases:
 #
-#   curl -fsSL https://github.com/<owner>/foundry/releases/download/forge-ds/forge-ds_linux_amd64.tar.gz | tar -xz
+# - `forge-ds-<sha7>`: fixed to the built commit. Once published, its assets are
+#   never replaced, so consumers should pin this tag and verify the `.sha256`.
+# - `forge-ds`: rolling, moved to the branch head on every push build.
 #
-# The release tag is moved to the commit each successful build came from.
+#   curl -fsSL https://github.com/<owner>/foundry/releases/download/forge-ds-<sha7>/forge-ds_linux_amd64.tar.gz | tar -xz
+#
+# Run the workflow manually with `ref` to publish a fixed release for an older
+# commit without moving the rolling release.
 
 permissions: {}
 
@@ -19,9 +24,14 @@ on:
       - "Cargo.lock"
       - ".github/workflows/forge-ds.yml"
   workflow_dispatch:
+    inputs:
+      ref:
+        description: Commit to build. Defaults to the selected branch head.
+        required: false
+        default: ""
 
 concurrency:
-  group: forge-ds-${{ github.ref }}
+  group: forge-ds-${{ github.ref }}-${{ inputs.ref }}
   cancel-in-progress: true
 
 env:
@@ -29,8 +39,25 @@ env:
   RELEASE_TAG: forge-ds
 
 jobs:
-  build:
+  resolve:
     if: github.repository != 'foundry-rs/foundry'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      sha: ${{ steps.resolve.outputs.sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.ref || github.sha }}
+      - name: Resolve commit
+        id: resolve
+        run: printf 'sha=%s\n' "$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: resolve
     name: build ${{ matrix.platform }}-${{ matrix.arch }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 120
@@ -57,6 +84,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          ref: ${{ needs.resolve.outputs.sha }}
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
         with:
           toolchain: stable
@@ -112,7 +140,7 @@ jobs:
 
   publish:
     name: publish release
-    needs: build
+    needs: [resolve, build]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -124,7 +152,26 @@ jobs:
           path: dist
           merge-multiple: true
 
+      - name: Publish fixed release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          SHA: ${{ needs.resolve.outputs.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="$RELEASE_TAG-${SHA:0:7}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "Release $tag already exists; leaving its assets unchanged."
+            exit 0
+          fi
+          gh release create "$tag" dist/* --prerelease --latest=false \
+            --target "$SHA" --title "forge-ds (${SHA:0:12})" \
+            --notes "forge-ds built at $SHA. Assets are never replaced."
+
       - name: Publish rolling release
+        # Only branch-head builds move the rolling release.
+        if: needs.resolve.outputs.sha == github.sha
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
@@ -133,7 +180,7 @@ jobs:
         run: |
           set -euo pipefail
           short_sha="${GITHUB_SHA:0:12}"
-          notes="forge-ds built from \`${REF_NAME}\` at ${GITHUB_SHA}."
+          notes="forge-ds built from \`${REF_NAME}\` at ${GITHUB_SHA}. Rolling; pin \`forge-ds-${GITHUB_SHA:0:7}\` instead."
 
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
             # Move the existing tag to this commit, then replace the assets.
