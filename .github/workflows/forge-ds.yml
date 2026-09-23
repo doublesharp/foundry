@@ -3,15 +3,17 @@ name: forge-ds
 # Builds the `forge-ds` binary and publishes it so other workflows can download it
 # instead of compiling Foundry. Builds run only on demand:
 #
-# - Pushing a `forge-ds-*` tag publishes a release under that tag and moves the
-#   rolling `forge-ds` release to it. The tagged commit must contain this workflow.
-# - Running the workflow manually with `ref` publishes `forge-ds-<sha7>` for any
-#   commit, including ones older than this workflow, without moving `forge-ds`.
+# - Pushing any `forge-ds-*` tag builds the tagged commit and moves the rolling
+#   `forge-ds` release to it. The tagged commit must contain this workflow.
+# - Running the workflow manually with `ref` builds any commit, including ones
+#   older than this workflow, without moving `forge-ds`.
 #
-# Fixed releases are never replaced once published, so consumers should pin one
-# and verify its `.sha256`:
+# Either way the build is published to the fixed release `forge-ds-<sha7>`, whose
+# assets are never replaced. Downstream setup actions derive that URL from the
+# pinned commit and check the `.sha256` and `Commit SHA` in `forge-ds --version`,
+# so keep the tag format, asset names, and checksum format stable:
 #
-#   curl -fsSL https://github.com/<owner>/foundry/releases/download/<tag>/forge-ds_linux_amd64.tar.gz | tar -xz
+#   curl -fsSL https://github.com/<owner>/foundry/releases/download/forge-ds-<sha7>/forge-ds_linux_amd64.tar.gz | tar -xz
 
 permissions: {}
 
@@ -51,19 +53,11 @@ jobs:
           ref: ${{ inputs.ref || github.sha }}
       - name: Resolve commit
         id: resolve
-        env:
-          EVENT_NAME: ${{ github.event_name }}
-          REF_NAME: ${{ github.ref_name }}
         shell: bash
         run: |
           set -euo pipefail
           sha="$(git rev-parse HEAD)"
-          if [[ "$EVENT_NAME" == "push" ]]; then
-            tag="$REF_NAME"
-          else
-            tag="$RELEASE_TAG-${sha:0:7}"
-          fi
-          printf 'sha=%s\ntag=%s\n' "$sha" "$tag" >> "$GITHUB_OUTPUT"
+          printf 'sha=%s\ntag=%s\n' "$sha" "$RELEASE_TAG-${sha:0:7}" >> "$GITHUB_OUTPUT"
 
   build:
     needs: resolve
