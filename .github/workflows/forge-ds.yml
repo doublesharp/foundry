@@ -3,21 +3,28 @@ name: forge-ds
 # Builds the `forge-ds` binary and publishes it so other workflows can download it
 # instead of compiling Foundry. Builds run only on demand:
 #
-# - Pushing any `forge-ds-*` tag builds the tagged commit and moves the rolling
-#   `forge-ds` release to it. The tagged commit must contain this workflow.
+# - Pushing any `forge-ds-*` tag builds the tagged commit and updates the latest
+#   assets. The tagged commit must contain this workflow.
 # - Running the workflow manually with `ref` builds any commit, including ones
-#   older than this workflow, without moving `forge-ds` unless `rolling` is set.
+#   older than this workflow, and updates the latest assets only if `rolling`.
+#
+# Every build is uploaded to the single `forge-ds` release, whose tag never moves:
+#
+# - `forge-ds-<sha7>_<platform>_<arch>.tar.gz` (+ `.sha256`): fixed to one commit
+#   and never replaced. Downstream setup actions derive this name from the pinned
+#   commit and check the `.sha256` and `Commit SHA` in `forge-ds --version`, so
+#   keep the names and the `sha256sum` output format stable.
+# - `forge-ds_<platform>_<arch>.tar.gz` (+ `.sha256`) and `forge-ds_latest.txt`:
+#   the most recent rolling build and its commit.
+#
+# Uploading assets avoids creating releases or moving tags, which the workflow
+# token may not do for commits whose workflow files differ from the running one.
+#
+#   curl -fsSL https://github.com/<owner>/foundry/releases/download/forge-ds/forge-ds-<sha7>_linux_amd64.tar.gz | tar -xz
 #
 # GitHub scopes caches to the ref a run starts on, and a tag run cannot read a
 # branch's caches. A tag push therefore only dispatches the build on
 # `CACHE_BRANCH`, so every build shares one sccache and one Cargo registry cache.
-#
-# Either way the build is published to the fixed release `forge-ds-<sha7>`, whose
-# assets are never replaced. Downstream setup actions derive that URL from the
-# pinned commit and check the `.sha256` and `Commit SHA` in `forge-ds --version`,
-# so keep the tag format, asset names, and checksum format stable:
-#
-#   curl -fsSL https://github.com/<owner>/foundry/releases/download/forge-ds-<sha7>/forge-ds_linux_amd64.tar.gz | tar -xz
 
 permissions: {}
 
@@ -32,7 +39,7 @@ on:
         required: false
         default: ""
       rolling:
-        description: Also move the rolling `forge-ds` release to this build.
+        description: Also update the latest `forge-ds` assets to this build.
         type: boolean
         default: false
 
@@ -70,7 +77,7 @@ jobs:
       contents: read
     outputs:
       sha: ${{ steps.resolve.outputs.sha }}
-      tag: ${{ steps.resolve.outputs.tag }}
+      prefix: ${{ steps.resolve.outputs.prefix }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -82,7 +89,7 @@ jobs:
         run: |
           set -euo pipefail
           sha="$(git rev-parse HEAD)"
-          printf 'sha=%s\ntag=%s\n' "$sha" "$RELEASE_TAG-${sha:0:7}" >> "$GITHUB_OUTPUT"
+          printf 'sha=%s\nprefix=%s\n' "$sha" "$RELEASE_TAG-${sha:0:7}" >> "$GITHUB_OUTPUT"
 
   build:
     needs: resolve
@@ -156,7 +163,7 @@ jobs:
       - name: Archive binary
         env:
           TARGET: ${{ matrix.target }}
-          FILE_NAME: forge-ds_${{ matrix.platform }}_${{ matrix.arch }}.tar.gz
+          FILE_NAME: ${{ needs.resolve.outputs.prefix }}_${{ matrix.platform }}_${{ matrix.arch }}.tar.gz
         shell: bash
         run: |
           set -euo pipefail
@@ -171,7 +178,7 @@ jobs:
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: forge-ds_${{ matrix.platform }}_${{ matrix.arch }}
-          path: forge-ds_${{ matrix.platform }}_${{ matrix.arch }}.tar.gz*
+          path: ${{ needs.resolve.outputs.prefix }}_${{ matrix.platform }}_${{ matrix.arch }}.tar.gz*
           retention-days: 7
           if-no-files-found: error
 
@@ -189,45 +196,38 @@ jobs:
           path: dist
           merge-multiple: true
 
-      - name: Publish fixed release
+      - name: Upload fixed assets
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
-          SHA: ${{ needs.resolve.outputs.sha }}
-          TAG: ${{ needs.resolve.outputs.tag }}
         shell: bash
         run: |
           set -euo pipefail
-          tag="$TAG"
-          if gh release view "$tag" >/dev/null 2>&1; then
-            echo "Release $tag already exists; leaving its assets unchanged."
-            exit 0
-          fi
-          gh release create "$tag" dist/* --prerelease --latest=false \
-            --target "$SHA" --title "forge-ds (${SHA:0:12})" \
-            --notes "forge-ds built at $SHA. Assets are never replaced."
+          existing="$(gh release view "$RELEASE_TAG" --json assets --jq '.assets[].name')"
+          for file in dist/*; do
+            if grep -qxF "$(basename "$file")" <<< "$existing"; then
+              echo "$(basename "$file") already exists; leaving it unchanged."
+            else
+              gh release upload "$RELEASE_TAG" "$file"
+            fi
+          done
 
-      - name: Publish rolling release
+      - name: Update latest assets
         if: inputs.rolling
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
+          PREFIX: ${{ needs.resolve.outputs.prefix }}
           SHA: ${{ needs.resolve.outputs.sha }}
-          TAG: ${{ needs.resolve.outputs.tag }}
         shell: bash
         run: |
           set -euo pipefail
-          short_sha="${SHA:0:12}"
-          notes="forge-ds built at ${SHA}. Rolling; pin \`${TAG}\` instead."
-
-          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
-            # Move the existing tag to this commit, then replace the assets.
-            gh api -X PATCH "repos/$GH_REPO/git/refs/tags/$RELEASE_TAG" \
-              -f sha="$SHA" -F force=true >/dev/null
-            gh release edit "$RELEASE_TAG" --prerelease \
-              --title "forge-ds ($short_sha)" --notes "$notes"
-            gh release upload "$RELEASE_TAG" dist/* --clobber
-          else
-            gh release create "$RELEASE_TAG" dist/* --prerelease --latest=false \
-              --target "$SHA" --title "forge-ds ($short_sha)" --notes "$notes"
-          fi
+          mkdir latest
+          cd dist
+          for file in "$PREFIX"_*.tar.gz; do
+            name="$RELEASE_TAG${file#"$PREFIX"}"
+            cp "$file" "../latest/$name"
+            (cd ../latest && sha256sum "$name" > "$name.sha256")
+          done
+          printf '%s\n' "$SHA" > ../latest/forge-ds_latest.txt
+          gh release upload "$RELEASE_TAG" ../latest/* --clobber
