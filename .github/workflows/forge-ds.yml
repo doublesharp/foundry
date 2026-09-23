@@ -6,7 +6,11 @@ name: forge-ds
 # - Pushing any `forge-ds-*` tag builds the tagged commit and moves the rolling
 #   `forge-ds` release to it. The tagged commit must contain this workflow.
 # - Running the workflow manually with `ref` builds any commit, including ones
-#   older than this workflow, without moving `forge-ds`.
+#   older than this workflow, without moving `forge-ds` unless `rolling` is set.
+#
+# GitHub scopes caches to the ref a run starts on, and a tag run cannot read a
+# branch's caches. A tag push therefore only dispatches the build on
+# `CACHE_BRANCH`, so every build shares one sccache and one Cargo registry cache.
 #
 # Either way the build is published to the fixed release `forge-ds-<sha7>`, whose
 # assets are never replaced. Downstream setup actions derive that URL from the
@@ -27,6 +31,10 @@ on:
         description: Commit to build. Defaults to the selected branch head.
         required: false
         default: ""
+      rolling:
+        description: Also move the rolling `forge-ds` release to this build.
+        type: boolean
+        default: false
 
 concurrency:
   group: forge-ds-${{ github.ref }}-${{ inputs.ref }}
@@ -35,10 +43,27 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RELEASE_TAG: forge-ds
+  CACHE_BRANCH: feature/viair-instrumented-coverage
 
 jobs:
+  dispatch:
+    if: github.repository != 'foundry-rs/foundry' && github.event_name == 'push'
+    name: dispatch build on ${{ github.ref_name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: write
+    steps:
+      - name: Dispatch cached build
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh workflow run forge-ds.yml --ref "$CACHE_BRANCH" \
+            -f ref="$GITHUB_SHA" -f rolling=true
+
   resolve:
-    if: github.repository != 'foundry-rs/foundry'
+    if: github.repository != 'foundry-rs/foundry' && github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -93,10 +118,16 @@ jobs:
           toolchain: stable
           targets: ${{ matrix.target }}
       - uses: rui314/setup-mold@7e4f20ad28a2e8ca6fd0892ccf72e2abb706b9c3 # v1
+      # sccache stores every compiled crate, including Foundry's own, so a build
+      # only recompiles crates whose inputs changed. rust-cache keeps only the
+      # Cargo registry, since sccache already covers the compiled output.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: forge-ds-${{ matrix.target }}
-          cache-on-failure: true
+          cache-targets: false
+      - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        with:
+          version: v0.18.0
 
       - name: Apple Silicon setup
         if: matrix.target == 'aarch64-apple-darwin'
@@ -107,6 +138,8 @@ jobs:
       - name: Build forge-ds
         env:
           TARGET: ${{ matrix.target }}
+          RUSTC_WRAPPER: sccache
+          SCCACHE_GHA_ENABLED: "true"
         shell: bash
         run: |
           set -euo pipefail
@@ -118,6 +151,7 @@ jobs:
           cargo build --locked --release --target "$TARGET" \
             -p forge --bin forge-ds --no-default-features --features "$features"
           "target/$TARGET/release/forge-ds" --version
+          sccache --show-stats
 
       - name: Archive binary
         env:
@@ -174,26 +208,26 @@ jobs:
             --notes "forge-ds built at $SHA. Assets are never replaced."
 
       - name: Publish rolling release
-        # Only tag pushes move the rolling release.
-        if: github.event_name == 'push'
+        if: inputs.rolling
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
-          REF_NAME: ${{ github.ref_name }}
+          SHA: ${{ needs.resolve.outputs.sha }}
+          TAG: ${{ needs.resolve.outputs.tag }}
         shell: bash
         run: |
           set -euo pipefail
-          short_sha="${GITHUB_SHA:0:12}"
-          notes="forge-ds built from \`${REF_NAME}\` at ${GITHUB_SHA}. Rolling; pin \`${REF_NAME}\` instead."
+          short_sha="${SHA:0:12}"
+          notes="forge-ds built at ${SHA}. Rolling; pin \`${TAG}\` instead."
 
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
             # Move the existing tag to this commit, then replace the assets.
             gh api -X PATCH "repos/$GH_REPO/git/refs/tags/$RELEASE_TAG" \
-              -f sha="$GITHUB_SHA" -F force=true >/dev/null
+              -f sha="$SHA" -F force=true >/dev/null
             gh release edit "$RELEASE_TAG" --prerelease \
               --title "forge-ds ($short_sha)" --notes "$notes"
             gh release upload "$RELEASE_TAG" dist/* --clobber
           else
             gh release create "$RELEASE_TAG" dist/* --prerelease --latest=false \
-              --target "$GITHUB_SHA" --title "forge-ds ($short_sha)" --notes "$notes"
+              --target "$SHA" --title "forge-ds ($short_sha)" --notes "$notes"
           fi
