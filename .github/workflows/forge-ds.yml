@@ -1,28 +1,24 @@
 name: forge-ds
 
 # Builds the `forge-ds` binary and publishes it so other workflows can download it
-# instead of compiling Foundry. Each build is published to two prereleases:
+# instead of compiling Foundry. Builds run only on demand:
 #
-# - `forge-ds-<sha7>`: fixed to the built commit. Once published, its assets are
-#   never replaced, so consumers should pin this tag and verify the `.sha256`.
-# - `forge-ds`: rolling, moved to the branch head on every push build.
+# - Pushing a `forge-ds-*` tag publishes a release under that tag and moves the
+#   rolling `forge-ds` release to it. The tagged commit must contain this workflow.
+# - Running the workflow manually with `ref` publishes `forge-ds-<sha7>` for any
+#   commit, including ones older than this workflow, without moving `forge-ds`.
 #
-#   curl -fsSL https://github.com/<owner>/foundry/releases/download/forge-ds-<sha7>/forge-ds_linux_amd64.tar.gz | tar -xz
+# Fixed releases are never replaced once published, so consumers should pin one
+# and verify its `.sha256`:
 #
-# Run the workflow manually with `ref` to publish a fixed release for an older
-# commit without moving the rolling release.
+#   curl -fsSL https://github.com/<owner>/foundry/releases/download/<tag>/forge-ds_linux_amd64.tar.gz | tar -xz
 
 permissions: {}
 
 on:
   push:
-    branches:
-      - feature/viair-instrumented-coverage
-    paths:
-      - "crates/**"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - ".github/workflows/forge-ds.yml"
+    tags:
+      - "forge-ds-*"
   workflow_dispatch:
     inputs:
       ref:
@@ -47,6 +43,7 @@ jobs:
       contents: read
     outputs:
       sha: ${{ steps.resolve.outputs.sha }}
+      tag: ${{ steps.resolve.outputs.tag }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -54,7 +51,19 @@ jobs:
           ref: ${{ inputs.ref || github.sha }}
       - name: Resolve commit
         id: resolve
-        run: printf 'sha=%s\n' "$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          sha="$(git rev-parse HEAD)"
+          if [[ "$EVENT_NAME" == "push" ]]; then
+            tag="$REF_NAME"
+          else
+            tag="$RELEASE_TAG-${sha:0:7}"
+          fi
+          printf 'sha=%s\ntag=%s\n' "$sha" "$tag" >> "$GITHUB_OUTPUT"
 
   build:
     needs: resolve
@@ -157,10 +166,11 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
           SHA: ${{ needs.resolve.outputs.sha }}
+          TAG: ${{ needs.resolve.outputs.tag }}
         shell: bash
         run: |
           set -euo pipefail
-          tag="$RELEASE_TAG-${SHA:0:7}"
+          tag="$TAG"
           if gh release view "$tag" >/dev/null 2>&1; then
             echo "Release $tag already exists; leaving its assets unchanged."
             exit 0
@@ -170,8 +180,8 @@ jobs:
             --notes "forge-ds built at $SHA. Assets are never replaced."
 
       - name: Publish rolling release
-        # Only branch-head builds move the rolling release.
-        if: needs.resolve.outputs.sha == github.sha
+        # Only tag pushes move the rolling release.
+        if: github.event_name == 'push'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
@@ -180,7 +190,7 @@ jobs:
         run: |
           set -euo pipefail
           short_sha="${GITHUB_SHA:0:12}"
-          notes="forge-ds built from \`${REF_NAME}\` at ${GITHUB_SHA}. Rolling; pin \`forge-ds-${GITHUB_SHA:0:7}\` instead."
+          notes="forge-ds built from \`${REF_NAME}\` at ${GITHUB_SHA}. Rolling; pin \`${REF_NAME}\` instead."
 
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
             # Move the existing tag to this commit, then replace the assets.
