@@ -129,7 +129,7 @@ jobs:
       # sccache was tried and dropped: most of its GitHub cache writes failed.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          key: forge-ds-${{ matrix.target }}
+          key: forge-ds-v2-${{ matrix.target }}
           cache-on-failure: true
 
       - name: Apple Silicon setup
