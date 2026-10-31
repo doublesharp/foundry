@@ -22,6 +22,9 @@ use foundry_wallets::{TempoAccountsWallet, WalletSigner};
 use std::{path::PathBuf, str::FromStr};
 use tempo_alloy::TempoNetwork;
 
+#[cfg(feature = "base")]
+use base_common_network::Base;
+
 /// CLI arguments for `cast mktx`.
 #[derive(Debug, Parser)]
 pub struct MakeTxArgs {
@@ -110,10 +113,16 @@ impl MakeTxArgs {
         let (network, signer, access_key) =
             tempo::resolve_transaction_network_and_signer(&self.tx.tempo, &self.eth).await?;
         if network.is_tempo() {
-            self.run_generic::<TempoNetwork>(signer, access_key).await
-        } else {
-            self.run_generic::<Ethereum>(signer, None).await
+            return self.run_generic::<TempoNetwork>(signer, access_key).await;
         }
+
+        #[cfg(feature = "base")]
+        if network.is_base() {
+            super::validate_base_transaction_options(&self.tx)?;
+            return self.run_generic::<Base>(signer, None).await;
+        }
+
+        self.run_generic::<Ethereum>(signer, None).await
     }
 
     async fn run_generic<N: Network>(
@@ -210,8 +219,7 @@ impl MakeTxArgs {
                 };
                 (tx, signer.address())
             };
-            let hash =
-                tempo::sponsor_hash(fee_provider, chain, &mut tx, from, sponsor_fee_payer).await?;
+            let hash = tempo::sponsor_hash(fee_provider, &mut tx, from, sponsor_fee_payer).await?;
             return print_scalar(format!("{hash:?}"));
         }
 
@@ -237,14 +245,8 @@ impl MakeTxArgs {
             else {
                 return Ok(());
             };
-            tempo::apply_fee_payment::<N, _>(
-                tempo_sponsor.as_ref(),
-                fee_provider,
-                chain,
-                &mut tx,
-                from,
-            )
-            .await?;
+            tempo::apply_fee_payment::<N, _>(tempo_sponsor.as_ref(), fee_provider, &mut tx, from)
+                .await?;
             return print_scalar(hex::encode_prefixed(tx.build_unsigned()?.encoded_for_signing()));
         }
 
@@ -255,14 +257,8 @@ impl MakeTxArgs {
             else {
                 return Ok(());
             };
-            tempo::apply_fee_payment::<N, _>(
-                tempo_sponsor.as_ref(),
-                fee_provider,
-                chain,
-                &mut tx,
-                from,
-            )
-            .await?;
+            tempo::apply_fee_payment::<N, _>(tempo_sponsor.as_ref(), fee_provider, &mut tx, from)
+                .await?;
 
             let tx = tx.build_unsigned()?;
             let recovered = signature.recover_address_from_prehash(&tx.signature_hash())?;
@@ -287,7 +283,6 @@ impl MakeTxArgs {
             tempo::apply_fee_payment::<N, _>(
                 tempo_sponsor.as_ref(),
                 fee_provider,
-                chain,
                 &mut tx,
                 config.sender,
             )
@@ -305,7 +300,6 @@ impl MakeTxArgs {
             tempo::apply_fee_payment::<N, _>(
                 tempo_sponsor.as_ref(),
                 fee_provider,
-                chain,
                 &mut tx,
                 prepared.account(),
             )
@@ -317,14 +311,8 @@ impl MakeTxArgs {
             else {
                 return Ok(());
             };
-            tempo::apply_fee_payment::<N, _>(
-                tempo_sponsor.as_ref(),
-                fee_provider,
-                chain,
-                &mut tx,
-                from,
-            )
-            .await?;
+            tempo::apply_fee_payment::<N, _>(tempo_sponsor.as_ref(), fee_provider, &mut tx, from)
+                .await?;
             tx.build(&EthereumWallet::new(signer)).await?.encoded_2718()
         };
 

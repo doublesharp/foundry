@@ -1,9 +1,9 @@
 use super::*;
 
 impl SymbolicExecutor {
-    pub(super) fn create<FEN: FoundryEvmNetwork>(
+    pub(super) fn create(
         &mut self,
-        executor: &Executor<FEN>,
+        executor: &ExecutorView<'_>,
         state: &mut PathState,
         worklist: &mut VecDeque<PathState>,
         completed_paths: &mut usize,
@@ -11,7 +11,7 @@ impl SymbolicExecutor {
     ) -> Result<StepOutcome, SymbolicError> {
         if state.is_static {
             state.return_data = SymReturnData::empty(&mut self.cx);
-            return Ok(StepOutcome::Revert);
+            return Ok(StepOutcome::ExceptionalHalt);
         }
 
         let offset = state.stack.peek(1)?.clone();
@@ -31,18 +31,12 @@ impl SymbolicExecutor {
             }
             None => {
                 let max_limit = self.config.max_calldata_bytes as usize;
-                let max_size = state
-                    .upper_bound_usize(&mut self.cx, &size)
-                    .filter(|size| *size <= max_limit)
-                    .map(Ok)
-                    .unwrap_or_else(|| {
-                        self.solver_upper_bound_usize(
-                            state,
-                            &size,
-                            max_limit,
-                            "symbolic CREATE initcode size",
-                        )
-                    })?;
+                let max_size = self.solver_upper_bound_usize(
+                    state,
+                    &size,
+                    max_limit,
+                    "symbolic CREATE initcode size",
+                )?;
                 BoundedCopySize::Symbolic { size, max_size }
             }
         };
@@ -110,9 +104,15 @@ impl SymbolicExecutor {
         );
         frame.address_word = created_word.clone();
         frame.caller_word = state.address_word.clone();
+        // Isolation runs a CREATE, but not a CREATE2, as its own transaction.
+        let isolated =
+            matches!(kind, CreateKind::Create) && state.starts_isolated_transaction(executor);
         let mut child = state.child(frame);
         let pending_expected_creates = std::mem::take(&mut child.expected_creates);
         child.world = failure_world.clone();
+        if isolated {
+            child.world.clear_transient_storage();
+        }
         child.world.mark_current_transaction_created(created);
         child.world.set_nonce(created, 1);
         child.world.transfer(&mut self.cx, executor, state.address, created, value);
@@ -123,52 +123,75 @@ impl SymbolicExecutor {
         }
 
         let mut parents = VecDeque::with_capacity(outcomes.len());
-        for outcome in outcomes {
-            match self.join_call_outcome(state, outcome, created)? {
-                JoinedCallOutcome::Rejected => {}
+        for mut outcome in outcomes {
+            let runtime = &outcome.state.frame.return_data;
+            let spec_id = executor.spec_id;
+            let mut rejected_runtime = false;
+            if matches!(outcome.status, CallStatus::Success) {
+                if runtime_exceeds_code_size_limit(executor.max_code_size, spec_id, runtime) {
+                    outcome.status = CallStatus::Revert;
+                    outcome.state.frame.return_data = SymReturnData::empty(&mut self.cx);
+                } else if runtime_has_rejected_prefix(&mut self.cx, spec_id, runtime)? {
+                    outcome.status = CallStatus::Revert;
+                    rejected_runtime = true;
+                }
+            }
+            // Like Forge's `create_end`, a CREATE leaves `vm.assumeNoRevert` for the next call.
+            match self.join_call_outcome(executor, state, outcome, created, None)? {
                 JoinedCallOutcome::Failure(mut parent) => {
                     parent.return_data = SymReturnData::empty(&mut self.cx);
                     *state = parent;
                     return Ok(StepOutcome::Failure);
                 }
-                JoinedCallOutcome::ExpectedRevert { mut parent, child } => {
+                JoinedCallOutcome::ExceptionalHalt(mut parent) => {
                     parent.return_data = SymReturnData::empty(&mut self.cx);
-                    parent.expected_calls = child.expected_calls;
-                    parent.expected_creates = pending_expected_creates.clone();
-                    parent.call_mocks = child.call_mocks;
-                    parent.function_mocks = child.function_mocks;
                     parent.world = failure_world.clone();
-                    parent.stack.push(created_word.clone())?;
+                    parent.stack.push(SymExpr::zero(&mut self.cx))?;
                     parents.push_back(parent);
                 }
-                JoinedCallOutcome::Success { mut parent, child } => {
+                JoinedCallOutcome::ExpectedRevert { mut parent, .. } => {
                     parent.return_data = SymReturnData::empty(&mut self.cx);
-                    parent.world = child.world;
-                    parent.block = child.block;
-                    parent.expected_emit = child.expected_emit;
-                    parent.expected_calls = child.expected_calls;
                     parent.expected_creates = pending_expected_creates.clone();
-                    parent.call_mocks = child.call_mocks;
-                    parent.function_mocks = child.function_mocks;
-                    self.observe_expected_create(
-                        &mut parent,
-                        state.address,
-                        kind,
-                        &child.frame.return_data,
-                    )?;
+                    parent.world = failure_world.clone();
+                    let address = address_word(DUMMY_CREATE_ADDRESS);
+                    parent.stack.push(SymExpr::constant(&mut self.cx, address))?;
+                    parents.push_back(parent);
+                }
+                JoinedCallOutcome::Success { mut parent, child, unmet_expected_revert } => {
+                    parent.return_data = SymReturnData::empty(&mut self.cx);
+                    let runtime = &child.frame.return_data;
+                    parent.world = child.world;
+                    if isolated {
+                        parent.world.restore_transient_storage(&failure_world);
+                    }
+                    parent.expected_emit = child.expected_emit;
+                    parent.expected_creates = pending_expected_creates.clone();
+                    // Under an unmet `vm.expectRevert`, the caller sees a failed CREATE, but the
+                    // code stays deployed and `expectCreate` does not count it.
+                    if !unmet_expected_revert {
+                        self.observe_expected_create(&mut parent, state.address, kind, runtime)?;
+                    }
                     if !parent.world.is_destroyed(created) {
-                        parent
-                            .world
-                            .install_code(created, child.frame.return_data.to_code(&mut self.cx)?);
+                        parent.world.install_code(created, runtime.to_code(&mut self.cx)?);
                         parent.world.set_nonce(created, 1);
                     }
-                    parent.stack.push(created_word.clone())?;
+                    if unmet_expected_revert {
+                        parent.return_data = error_string_return_data(
+                            &mut self.cx,
+                            "next call did not revert as expected",
+                        );
+                        parent.stack.push(SymExpr::zero(&mut self.cx))?;
+                    } else {
+                        parent.stack.push(created_word.clone())?;
+                    }
                     parents.push_back(parent);
                 }
                 JoinedCallOutcome::Revert { mut parent, child } => {
                     parent.return_data = SymReturnData::empty(&mut self.cx);
                     parent.world = failure_world.clone();
-                    parent.return_data = child.frame.return_data;
+                    if !rejected_runtime {
+                        parent.return_data = child.frame.return_data;
+                    }
                     parent.stack.push(SymExpr::zero(&mut self.cx))?;
                     parents.push_back(parent);
                 }
@@ -178,9 +201,9 @@ impl SymbolicExecutor {
         Ok(self.resume_parent_paths(state, worklist, parents))
     }
 
-    pub(super) fn execute_external_call<FEN: FoundryEvmNetwork>(
+    pub(super) fn execute_external_call(
         &mut self,
-        executor: &Executor<FEN>,
+        executor: &ExecutorView<'_>,
         initial: PathState,
         code: &SymCode,
         completed_paths: &mut usize,
@@ -196,4 +219,29 @@ impl SymbolicExecutor {
             CallPathKind::External,
         )
     }
+}
+
+fn runtime_exceeds_code_size_limit(
+    max_code_size: usize,
+    spec_id: SpecId,
+    runtime: &SymReturnData,
+) -> bool {
+    spec_id >= SpecId::SPURIOUS_DRAGON
+        && runtime.len_word.as_const().is_some()
+        && runtime.len() > max_code_size
+}
+
+fn runtime_has_rejected_prefix(
+    cx: &mut SymCx,
+    spec_id: SpecId,
+    runtime: &SymReturnData,
+) -> Result<bool, SymbolicError> {
+    if spec_id < SpecId::LONDON || runtime.len() == 0 {
+        return Ok(false);
+    }
+    let first_byte = runtime.byte(cx, 0);
+    let Some(first_byte) = first_byte.as_const() else {
+        return Err(SymbolicError::Unsupported("CREATE with symbolic runtime prefix not modeled"));
+    };
+    Ok(first_byte == U256::from(0xef))
 }

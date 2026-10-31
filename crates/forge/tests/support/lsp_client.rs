@@ -1,24 +1,61 @@
 use async_lsp::{
     LanguageServer, MainLoop, ServerSocket,
-    lsp_types::notification::{self, Notification},
+    lsp_types::{
+        PublishDiagnosticsParams, Url,
+        notification::{self, Notification},
+    },
     router::Router,
 };
 use futures::{
     future::{Either, select},
+    io::{AsyncRead, AsyncWrite},
     pin_mut,
 };
 use std::{
+    io,
     path::Path,
+    pin::Pin,
     process::{Child, Command, Stdio},
     sync::mpsc::{self, Receiver, RecvTimeoutError},
+    task::{Context, Poll},
     thread::{self, JoinHandle},
     time::Duration,
 };
-use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
+use tokio::io::ReadBuf;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
-struct Stop;
+/// Adapts a tokio I/O type to the `futures` I/O traits.
+struct Compat<T>(T);
+
+impl<T: tokio::io::AsyncRead + Unpin> AsyncRead for Compat<T> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<io::Result<usize>> {
+        let mut buf = ReadBuf::new(buf);
+        Pin::new(&mut self.0).poll_read(cx, &mut buf).map_ok(|()| buf.filled().len())
+    }
+}
+
+impl<T: tokio::io::AsyncWrite + Unpin> AsyncWrite for Compat<T> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.0).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.0).poll_flush(cx)
+    }
+
+    fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.0).poll_shutdown(cx)
+    }
+}
 
 pub struct LspClient {
     child: Option<Child>,
@@ -26,6 +63,7 @@ pub struct LspClient {
     pub(crate) server: ServerSocket,
     main_loop: Option<JoinHandle<async_lsp::Result<()>>>,
     notifications: Receiver<String>,
+    diagnostics: Receiver<PublishDiagnosticsParams>,
 }
 
 impl LspClient {
@@ -48,6 +86,7 @@ impl LspClient {
         let stdin = child.stdin.take().unwrap();
 
         let (notification_sender, notifications) = mpsc::channel();
+        let (diagnostic_sender, diagnostics) = mpsc::channel();
         let (main_loop, server) = MainLoop::new_client(move |_| {
             let mut router = Router::new(());
             let log_sender = notification_sender.clone();
@@ -55,12 +94,14 @@ impl LspClient {
                 let _ = log_sender.send(notification::LogMessage::METHOD.to_owned());
                 std::ops::ControlFlow::Continue(())
             });
-            router
-                .unhandled_notification(move |_, notification| {
-                    let _ = notification_sender.send(notification.method);
-                    std::ops::ControlFlow::Continue(())
-                })
-                .event::<Stop>(|_, _| std::ops::ControlFlow::Break(Ok(())));
+            router.notification::<notification::PublishDiagnostics>(move |_, params| {
+                let _ = diagnostic_sender.send(params);
+                std::ops::ControlFlow::Continue(())
+            });
+            router.unhandled_notification(move |_, notification| {
+                let _ = notification_sender.send(notification.method);
+                std::ops::ControlFlow::Continue(())
+            });
             router
         });
 
@@ -70,11 +111,18 @@ impl LspClient {
             runtime.block_on(async move {
                 let stdout = tokio::process::ChildStdout::from_std(stdout).unwrap();
                 let stdin = tokio::process::ChildStdin::from_std(stdin).unwrap();
-                main_loop.run_buffered(stdout.compat(), stdin.compat_write()).await
+                main_loop.run_buffered(Compat(stdout), Compat(stdin)).await
             })
         });
 
-        Self { child: Some(child), runtime, server, main_loop: Some(main_loop), notifications }
+        Self {
+            child: Some(child),
+            runtime,
+            server,
+            main_loop: Some(main_loop),
+            notifications,
+            diagnostics,
+        }
     }
 
     pub fn wait_for_log_message(&self) {
@@ -95,15 +143,42 @@ impl LspClient {
         }
     }
 
+    pub fn wait_for_diagnostics(
+        &self,
+        uri: &Url,
+        matches: impl Fn(&PublishDiagnosticsParams) -> bool,
+    ) -> PublishDiagnosticsParams {
+        let deadline = std::time::Instant::now() + REQUEST_TIMEOUT;
+        let mut observed = Vec::new();
+        loop {
+            let timeout = deadline.saturating_duration_since(std::time::Instant::now());
+            match self.diagnostics.recv_timeout(timeout) {
+                Ok(params) if params.uri == *uri && matches(&params) => return params,
+                Ok(params) => observed.push(params),
+                Err(RecvTimeoutError::Timeout) => {
+                    panic!(
+                        "timed out waiting for LSP diagnostics for {uri}; observed: {observed:?}"
+                    )
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    panic!("LSP client stopped before receiving diagnostics for {uri}")
+                }
+            }
+        }
+    }
+
     pub fn shutdown(mut self) {
         let future = self.server.shutdown(());
         request(&self.runtime, future);
         self.server.exit(()).unwrap();
-        self.server.emit(Stop).unwrap();
 
+        // The server closes stdout after exit; let EOF finish the transport.
         let main_loop = self.main_loop.take().unwrap();
         let result = main_loop.join().unwrap();
-        assert!(result.is_ok(), "LSP client transport failed: {result:?}");
+        assert!(
+            matches!(result, Err(async_lsp::Error::Eof)),
+            "LSP client transport failed: {result:?}"
+        );
 
         let mut child = self.child.take().unwrap();
         let status = child.wait().unwrap();

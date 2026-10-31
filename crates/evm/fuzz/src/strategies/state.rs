@@ -26,6 +26,9 @@ use revm::{
 };
 use std::{cell::RefCell, fmt, rc::Rc, sync::Arc};
 
+#[cfg(test)]
+use revm::database::InMemoryDB;
+
 /// The maximum number of bytes we will look at in bytecodes to find push bytes (24 KiB).
 ///
 /// This is to limit the performance impact of fuzz tests that might deploy arbitrarily sized
@@ -66,12 +69,7 @@ pub(crate) trait DictionaryRead: Clone + 'static {
 impl EvmFuzzState {
     #[cfg(test)]
     pub(crate) fn test() -> Self {
-        Self::new(
-            &[],
-            &CacheDB::<revm::database::EmptyDB>::default(),
-            FuzzDictionaryConfig::default(),
-            None,
-        )
+        Self::new(&[], &InMemoryDB::default(), FuzzDictionaryConfig::default(), None)
     }
 
     pub fn new<DB: DatabaseRef>(
@@ -499,7 +497,10 @@ impl FuzzDictionary {
         targets: &TargetedContracts,
         mapping_slots: Option<&AddressMap<MappingSlots>>,
     ) {
-        for (address, account) in state_changeset {
+        // Sort accounts before inserting to ensure deterministic dictionary.
+        let mut accounts = state_changeset.iter().collect::<Vec<_>>();
+        accounts.sort_unstable_by_key(|(address, _)| **address);
+        for (address, account) in accounts {
             if is_history_storage_address(address) {
                 continue;
             }
@@ -524,14 +525,17 @@ impl FuzzDictionary {
                     mapping_slots.is_some_and(|m| m.contains_key(address))
                 );
                 let mapping_slots = mapping_slots.and_then(|m| m.get(address));
-                for (slot, value) in &account.storage {
+                // Sort storage values before inserting to ensure deterministic dictionary.
+                let mut storage = account.storage.iter().collect::<Vec<_>>();
+                storage.sort_unstable_by_key(|(slot, _)| **slot);
+                for (slot, value) in storage {
                     let slot_info = slot_identifier_key.and_then(|key| {
                         let slot = B256::from(*slot);
-                        let value_word = B256::from(value.present_value);
+                        let value_word = B256::from(value.present_value());
                         self.identify_storage_slot(key, slot, mapping_slots)
                             .filter(|slot_info| slot_info.decode(value_word).is_some())
                     });
-                    self.insert_storage_value(slot, &value.present_value, slot_info);
+                    self.insert_storage_value(slot, &value.present_value(), slot_info);
                 }
             }
         }
@@ -578,7 +582,7 @@ impl FuzzDictionary {
         if self.values_full() {
             return;
         }
-        if self.push_bytecode_hashes.insert(account_info.code_hash) {
+        if self.push_bytecode_hashes.insert(account_info.code_hash()) {
             self.collect_push_bytes(ignore_metadata_hash(code.original_byte_slice()));
         }
     }
@@ -594,7 +598,7 @@ impl FuzzDictionary {
             // Don't add 0 to the dictionary as it's already present.
             if !inst.immediate.is_empty()
                 && let Some(push_value) = U256::try_from_be_slice(inst.immediate)
-                && push_value != U256::ZERO
+                && !push_value.is_zero()
             {
                 self.insert_push_value_u256(push_value, &mut seen);
             }
@@ -709,7 +713,7 @@ impl FuzzDictionary {
 
     fn insert_value_u256(&mut self, value: U256) -> bool {
         // Also add the value below and above the push value to the dictionary.
-        let one = U256::from(1);
+        let one = U256::ONE;
         let mut inserted = self.insert_value(value.into());
         if !self.values_full() {
             inserted |= self.insert_value((value.wrapping_sub(one)).into());
@@ -722,7 +726,7 @@ impl FuzzDictionary {
 
     fn insert_push_value_u256(&mut self, value: U256, seen: &mut HashSet<B256>) -> bool {
         // Also add the value below and above the push value to the dictionary.
-        let one = U256::from(1);
+        let one = U256::ONE;
         let mut inserted = false;
         for value in [value, value.wrapping_sub(one), value.wrapping_add(one)] {
             if self.values_full() {
@@ -837,19 +841,17 @@ impl FuzzDictionary {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
     use alloy_json_abi::{Event, JsonAbi};
-    use alloy_primitives::keccak256;
     use foundry_evm_core::eip2935::HISTORY_STORAGE_ADDRESS;
-    use revm::{bytecode::Bytecode, database::EmptyDB};
+    use revm::{
+        bytecode::Bytecode,
+        state::{Account, EvmStorageSlot, TransactionId},
+    };
 
     fn account_with_code(raw: &'static [u8]) -> AccountInfo {
-        let code = Bytecode::new_raw(Bytes::from_static(raw));
-        AccountInfo {
-            code_hash: keccak256(code.original_byte_slice()),
-            code: Some(code),
-            ..Default::default()
-        }
+        AccountInfo::default().with_code(Bytecode::new_raw(Bytes::from_static(raw)))
     }
 
     #[test]
@@ -864,11 +866,7 @@ mod tests {
         let contract = TargetedContract::new("Target".to_string(), abi);
         let matched_events = contract.event_lookup.by_topic(&selector, 0).unwrap();
         let word: B256 = U256::from(42).into();
-        let log = Log::new_unchecked(
-            Address::ZERO,
-            vec![selector],
-            Bytes::copy_from_slice(word.as_slice()),
-        );
+        let log = Log::new_unchecked(Address::ZERO, vec![selector], Bytes::from(word));
         let mut samples = Vec::new();
 
         assert!(FuzzDictionary::decode_log_events(
@@ -892,11 +890,11 @@ mod tests {
 
         dictionary.collect_push_bytes(&[0x60, 0x01, 0x60, 0x03]);
 
-        assert_eq!(dictionary.state_values.len(), 3);
-        assert!(dictionary.state_values.contains(&B256::from(U256::ZERO)));
-        assert!(dictionary.state_values.contains(&B256::from(U256::from(1))));
-        assert!(dictionary.state_values.contains(&B256::from(U256::from(2))));
-        assert!(!dictionary.state_values.contains(&B256::from(U256::from(3))));
+        assert_eq!(dictionary.len(), 3);
+        assert!(dictionary.state_values.contains(&B256::ZERO));
+        assert!(dictionary.state_values.contains(&B256::with_last_byte(1)));
+        assert!(dictionary.state_values.contains(&B256::with_last_byte(2)));
+        assert!(!dictionary.state_values.contains(&B256::with_last_byte(3)));
     }
 
     #[test]
@@ -908,7 +906,7 @@ mod tests {
 
         assert_eq!(dictionary.config.max_fuzz_dictionary_values, 1);
         assert_eq!(dictionary.state_values.as_slice(), &[B256::ZERO]);
-        assert!(!dictionary.insert_value(B256::from(U256::from(1))));
+        assert!(!dictionary.insert_value(B256::with_last_byte(1)));
         assert_eq!(dictionary.state_values.as_slice(), &[B256::ZERO]);
     }
 
@@ -918,9 +916,9 @@ mod tests {
 
         dictionary.collect_push_bytes(&[0x60, 0x01, 0x60, 0x01]);
 
-        assert!(dictionary.state_values.contains(&B256::from(U256::ZERO)));
-        assert!(dictionary.state_values.contains(&B256::from(U256::from(1))));
-        assert!(dictionary.state_values.contains(&B256::from(U256::from(2))));
+        assert!(dictionary.state_values.contains(&B256::ZERO));
+        assert!(dictionary.state_values.contains(&B256::with_last_byte(1)));
+        assert!(dictionary.state_values.contains(&B256::with_last_byte(2)));
         assert_eq!(dictionary.hits, 1);
     }
 
@@ -949,8 +947,8 @@ mod tests {
 
         assert_eq!(dictionary.addresses.len(), 1);
         assert_eq!(dictionary.push_bytecode_hashes.len(), 2);
-        assert!(dictionary.state_values.contains(&B256::from(U256::from(1))));
-        assert!(dictionary.state_values.contains(&B256::from(U256::from(4))));
+        assert!(dictionary.state_values.contains(&B256::with_last_byte(1)));
+        assert!(dictionary.state_values.contains(&B256::with_last_byte(4)));
     }
 
     #[test]
@@ -968,7 +966,7 @@ mod tests {
 
         assert!(dictionary.addresses.contains(&address));
         assert_eq!(dictionary.push_bytecode_hashes.len(), 1);
-        assert!(dictionary.state_values.contains(&B256::from(U256::from(4))));
+        assert!(dictionary.state_values.contains(&B256::with_last_byte(4)));
     }
 
     #[test]
@@ -987,7 +985,7 @@ mod tests {
 
         dictionary.insert_push_bytes_values(&Address::repeat_byte(0x22), &account);
         assert_eq!(dictionary.push_bytecode_hashes.len(), 1);
-        assert!(dictionary.state_values.contains(&B256::from(U256::from(1))));
+        assert!(dictionary.state_values.contains(&B256::with_last_byte(1)));
     }
 
     #[test]
@@ -1034,16 +1032,9 @@ mod tests {
 
     #[test]
     fn history_storage_account_is_excluded_from_initial_dictionary() {
-        let mut db = CacheDB::<EmptyDB>::default();
+        let mut db = InMemoryDB::default();
         let code = Bytecode::new_raw(Bytes::from_static(&[0x61, 0x01, 0x23, 0x00]));
-        db.insert_account_info(
-            HISTORY_STORAGE_ADDRESS,
-            AccountInfo {
-                code_hash: keccak256(code.original_byte_slice()),
-                code: Some(code),
-                ..Default::default()
-            },
-        );
+        db.insert_account_info(HISTORY_STORAGE_ADDRESS, AccountInfo::default().with_code(code));
         db.insert_account_storage(HISTORY_STORAGE_ADDRESS, U256::from(7), U256::from(0xdead_u64))
             .unwrap();
 
@@ -1052,7 +1043,7 @@ mod tests {
         state.with_dictionary(|dict| {
             assert!(!dict.values().contains(&HISTORY_STORAGE_ADDRESS.into_word()));
             assert!(!dict.values().contains(&B256::from(U256::from(0x123))));
-            assert!(!dict.values().contains(&B256::from(U256::from(7))));
+            assert!(!dict.values().contains(&B256::with_last_byte(7)));
             assert!(!dict.values().contains(&B256::from(U256::from(0xdead_u64))));
         });
     }
@@ -1081,5 +1072,38 @@ mod tests {
             assert!(dict.persistent_values.contains(&persistent));
             assert!(dict.sample_values[&DynSolType::Uint(8)].contains(&persistent));
         });
+    }
+
+    #[test]
+    fn new_state_values_are_inserted_in_sorted_order() {
+        // Account `i` holds slots `i * 0x100 + j` with values `i * 0x10000 + j * 0x10`, so no
+        // address, slot, or value (+/- 1) collides with another.
+        let entry =
+            |i: u64, j: u64| (U256::from(i * 0x100 + j), U256::from(i * 0x10000 + j * 0x10));
+        let address = |i: u64| Address::repeat_byte(i as u8 * 0x11);
+
+        let mut state_changeset = StateChangeset::default();
+        for i in [3, 1, 4, 2] {
+            let storage = [3, 1, 2].map(|j| {
+                let (slot, value) = entry(i, j);
+                (slot, EvmStorageSlot::new(value, TransactionId::ZERO))
+            });
+            state_changeset
+                .insert(address(i), Account::default().with_storage(storage.into_iter()));
+        }
+
+        let mut dictionary = FuzzDictionary::default();
+        dictionary.insert_new_state_values(&state_changeset, &TargetedContracts::new(), None);
+
+        let mut expected = vec![B256::ZERO];
+        for i in 1..=4 {
+            expected.push(address(i).into_word());
+            for j in 1..=3 {
+                let (slot, value) = entry(i, j);
+                expected
+                    .extend([slot, value, value - U256::ONE, value + U256::ONE].map(B256::from));
+            }
+        }
+        assert_eq!(dictionary.state_values.as_slice(), expected.as_slice());
     }
 }

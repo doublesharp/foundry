@@ -1,7 +1,8 @@
 use super::{
-    Cheatcodes, CheatsConfig, ChiselState, CmpOperands, CustomPrintTracer, EdgeCovConfig,
-    EdgeCovInspector, EdgeCoverage, Fuzzer, InstrumentedCoverageCollector, LineCoverageCollector,
-    LogCollector, RevertDiagnostic, ScriptExecutionInspector, TempoLabels, TracingInspector,
+    Cheatcodes, CheatsConfig, ChiselState, CmpOperands, CustomPrintTracer, DebugRecorder,
+    EdgeCovConfig, EdgeCovInspector, EdgeCoverage, Fuzzer, InstrumentedCoverageCollector,
+    LineCoverageCollector, LogCollector, RevertDiagnostic, ScriptExecutionInspector, TempoLabels,
+    TracingInspector,
 };
 use alloy_primitives::{
     Address, B256, Bytes, Log, TxKind, U256, keccak256,
@@ -19,38 +20,40 @@ use foundry_evm_core::{
     evm::{
         BlockEnvFor, ChainFor, EthEvmNetwork, EvmEnvFor, EvmFactoryFor, FoundryContextFor,
         FoundryEvmFactory, FoundryEvmNetwork, TxEnvFor, get_create2_factory_call_inputs,
-        with_cloned_context,
+        merge_child_state, prepare_child_state, with_inherited_evm,
     },
     precompiles::P256_VERIFY,
-    refresh_chain_journal,
 };
 use foundry_evm_coverage::{FOUNDRY_COVERAGE_ADDRESS, HitMaps, InstrumentedHitMaps};
 use foundry_evm_networks::{NetworkConfigs, arbitrum};
 use foundry_evm_traces::{SparsedTraceArena, TraceRequirements};
 use revm::{
-    Inspector,
+    Inspector, JournalEntry,
     context::{
         Block, Cfg, ContextTr, JournalTr, Transaction, TransactionType,
         result::{EVMError, ExecutionResult, Output},
     },
-    context_interface::CreateScheme,
+    context_interface::{CreateScheme, journaled_state::JournalCheckpoint},
     handler::FrameResult,
     interpreter::{
         CallInputs, CallOutcome, CallScheme, CreateInputs, CreateOutcome, FrameInput, Gas,
         InstructionResult, Interpreter, InterpreterResult,
         bytecode::opcode as op,
-        interpreter_types::{InputsTr, Jumps},
+        interpreter_types::{InputsTr, Jumps, LoopControl},
         return_ok,
     },
     primitives::KECCAK_EMPTY,
-    state::{Account, AccountStatus},
+    state::Account,
 };
 use std::{
     ops::{Deref, DerefMut},
     sync::Arc,
 };
 
-use crate::executors::{EarlyExit, EvmExecutionCancellation, calculate_stipend};
+use crate::executors::{EarlyExit, EvmExecutionCancellation, calculate_initial_gas};
+
+#[cfg(feature = "monad")]
+use foundry_evm_core::evm::refresh_chain_journal;
 
 #[derive(Clone, Debug)]
 #[must_use = "builders do nothing unless you call `build` on them"]
@@ -288,11 +291,11 @@ impl<BLOCK: Clone> InspectorStackBuilder<BLOCK> {
             // Set analysis capabilities if they are provided
             if let Some(analysis) = analysis {
                 stack.set_analysis(analysis.clone());
-                cheatcodes.set_analysis(CheatcodeAnalysis::new(analysis));
+                cheatcodes.core.set_analysis(CheatcodeAnalysis::new(analysis));
             }
             // Set wallets if they are provided
             if let Some(wallets) = wallets {
-                cheatcodes.set_wallets(wallets);
+                cheatcodes.core.set_wallets(wallets);
             }
             stack.set_cheatcodes(cheatcodes);
         }
@@ -376,6 +379,8 @@ pub struct InnerContextData {
     original_origin: Address,
     /// Accounts that were created locally before entering the nested EVM context.
     locally_created_accounts: AddressHashSet,
+    /// Depth of the isolated root frame in the surrounding trace.
+    root_depth: usize,
 }
 
 /// Gas accounting carried across an isolated frame's synthetic transaction boundary.
@@ -434,6 +439,15 @@ struct PendingCallTrace {
     executed_address: Option<Address>,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct IsolatedFrameCheckpoint {
+    checkpoint: JournalCheckpoint,
+    restore_len: usize,
+    return_depth: usize,
+    is_create: bool,
+    failed: bool,
+}
+
 /// All used inspectors besides [Cheatcodes].
 ///
 /// See [`InspectorStack`].
@@ -446,6 +460,7 @@ pub struct InspectorStackInner {
     // These are boxed to reduce the size of the struct and slightly improve performance of the
     // `if let Some` checks.
     pub chisel_state: Option<Box<ChiselState>>,
+    pub debug_recorder: Option<Box<DebugRecorder>>,
     pub edge_coverage: Option<Box<EdgeCovInspector>>,
     pub fuzzer: Option<Box<Fuzzer>>,
     /// Collects source-instrumented coverage before other inspectors observe probe calls.
@@ -476,14 +491,21 @@ pub struct InspectorStackInner {
     pub top_frame_journal: AddressMap<Account>,
     /// Whether the top-level frame failed before inspector result rewriting.
     top_level_frame_failed_before_rewrite: bool,
+    /// Fee policy to restore when an isolated call explicitly executes another transaction.
+    outer_disable_fee_charge: Option<bool>,
     /// Whether the root call of the active isolated transaction executed as a precompile.
     isolated_call_was_precompile: Option<bool>,
+    /// Synthetic CREATE depth corresponding to an outer top-level deployment.
+    synthetic_create_depth: Option<usize>,
     /// Address that reverted the call, if any.
     pub reverter: Option<Address>,
     /// LIFO stack tracking CREATE2 frames that were redirected to the CREATE2 factory.
     pending_create2_redirects: Vec<PendingCreate2Redirect>,
     /// LIFO stack tracking the effective address of traced calls delegated to the EVM provider.
     pending_call_traces: Vec<PendingCallTrace>,
+    /// LIFO stack used to unwind snapshot restoration across reverted frames of the tracked
+    /// transaction: an isolated call, or the top-level transaction when isolation is disabled.
+    isolated_frame_checkpoints: Vec<IsolatedFrameCheckpoint>,
     /// Pending CREATE2 deployer validation error, deferred from `frame_start` to `create` so
     /// it goes through the normal inspector lifecycle (tracing, etc.).
     pub pending_create2_error: Option<CreateOutcome>,
@@ -520,62 +542,75 @@ impl<FEN: FoundryEvmNetwork> CheatcodesExecutor<FEN> for InspectorStackInner {
         ecx: &mut FoundryContextFor<'_, FEN>,
         f: NestedEvmClosureFor<'_, FEN>,
     ) -> Result<(), EVMError<DatabaseError>> {
+        let previous = self.synthetic_create_depth;
+        let create2_redirects = self.pending_create2_redirects.len();
+        let snapshot_checkpoints = self.isolated_frame_checkpoints.len();
+        let snapshot_restores = cheats.isolated_snapshot_restores.len();
+        let pending_snapshot_journal = cheats
+            .track_isolated_snapshots
+            .then(|| cheats.pending_isolated_snapshot_journal.clone());
+        let capture_snapshot_restore = cheats.capture_isolated_snapshot_restore;
+        self.synthetic_create_depth = (ecx.journal().depth() == 1).then_some(2);
         let mut inspector = InspectorStackRefMut { cheatcodes: Some(cheats), inner: self };
-        let factory = FEN::EvmFactory::default();
-        let chain_context = ecx.chain().clone();
-        #[cfg(feature = "monad")]
-        let state = foundry_evm_core::FoundryJournal::capture_reserve_balance(ecx.journal());
-        let mut nested_chain_context = None;
-        #[cfg(feature = "monad")]
-        let mut reserve_balance = None;
-        with_cloned_context(ecx, |db, evm_env, journaled_state| {
-            let mut evm = factory.create_nested_evm_with_inspector(db, evm_env, &mut inspector);
-            *evm.chain_mut() = chain_context;
-            *evm.journal_inner_mut() = journaled_state;
-            #[cfg(feature = "monad")]
-            {
-                foundry_evm_core::FoundryJournal::restore_reserve_balance(evm.journal_mut(), state);
-                foundry_evm_core::evm::refresh_nested_chain_journal(&mut *evm);
-            }
-            f(&mut *evm)?;
-            nested_chain_context = Some(evm.chain_mut().clone());
-            #[cfg(feature = "monad")]
-            {
-                reserve_balance = Some(foundry_evm_core::FoundryJournal::capture_reserve_balance(
-                    evm.journal_mut(),
-                ));
-            }
-            let sub_inner = evm.journal_inner_mut().clone();
-            let sub_evm_env = evm.to_evm_env();
-            Ok((sub_evm_env, sub_inner))
-        })?;
-        *ecx.chain_mut() = nested_chain_context.expect("nested EVM chain context was captured");
-        #[cfg(feature = "monad")]
-        foundry_evm_core::FoundryJournal::restore_reserve_balance(
-            ecx.journal_mut(),
-            reserve_balance.expect("nested EVM state was captured"),
-        );
-        refresh_chain_journal(ecx);
-        Ok(())
+        let result = with_inherited_evm::<FEN::EvmFactory, _>(ecx, &mut inspector, f);
+        self.synthetic_create_depth = previous;
+        // Drop redirects left behind if nested execution aborted before their frames ended.
+        self.pending_create2_redirects.truncate(create2_redirects);
+        if result.is_err()
+            && let Some(pending_snapshot_journal) = pending_snapshot_journal
+        {
+            self.isolated_frame_checkpoints.truncate(snapshot_checkpoints);
+            cheats.isolated_snapshot_restores.truncate(snapshot_restores);
+            cheats.pending_isolated_snapshot_journal = pending_snapshot_journal;
+            cheats.capture_isolated_snapshot_restore = capture_snapshot_restore;
+        }
+        result
     }
 
     fn with_fresh_nested_evm(
         &mut self,
         cheats: &mut Cheatcodes<FEN>,
-        db: &mut <FoundryContextFor<'_, FEN> as ContextTr>::Db,
-        evm_env: EvmEnvFor<FEN>,
+        ecx: &mut FoundryContextFor<'_, FEN>,
         chain_context: ChainFor<FEN>,
         f: NestedEvmClosureFor<'_, FEN>,
     ) -> Result<EvmEnvFor<FEN>, EVMError<DatabaseError>> {
-        let mut inspector = InspectorStackRefMut { cheatcodes: Some(cheats), inner: self };
-        let mut evm = FEN::EvmFactory::default().create_nested_evm_with_inspector(
-            db,
-            evm_env,
-            &mut inspector,
-        );
-        *evm.chain_mut() = chain_context;
-        f(&mut *evm)?;
-        Ok(evm.to_evm_env())
+        self.with_snapshot_tracking(cheats, |inner, cheats| {
+            let depth = ecx.journal().depth();
+            let previous_inner_context = inner.in_inner_context;
+            let previous_inner_context_data = inner.inner_context_data.replace(InnerContextData {
+                original_origin: ecx.tx().caller(),
+                locally_created_accounts: AddressHashSet::default(),
+                root_depth: depth,
+            });
+            let previous_precompile = inner.isolated_call_was_precompile.take();
+            inner.in_inner_context = true;
+            let mut evm_env = ecx.evm_clone();
+            let (db, _) = ecx.db_journal_inner_mut();
+            let inherited_disable_fee_charge = evm_env.cfg_env.disable_fee_charge;
+            if let Some(disable_fee_charge) = inner.outer_disable_fee_charge {
+                evm_env.cfg_env.disable_fee_charge = disable_fee_charge;
+            }
+            let mut inspector = InspectorStackRefMut { cheatcodes: Some(cheats), inner };
+            let mut evm = FEN::EvmFactory::default().create_nested_evm_with_inspector(
+                db,
+                evm_env,
+                &mut inspector,
+            );
+            *evm.chain_mut() = chain_context;
+            // The fresh root duplicates the suspended frame; its children share the existing
+            // tracer.
+            evm.journal_inner_mut().depth = depth;
+            let result = f(&mut *evm).map(|()| {
+                let mut evm_env = evm.to_evm_env();
+                evm_env.cfg_env.disable_fee_charge = inherited_disable_fee_charge;
+                evm_env
+            });
+            drop(evm);
+            inner.in_inner_context = previous_inner_context;
+            inner.inner_context_data = previous_inner_context_data;
+            inner.isolated_call_was_precompile = previous_precompile;
+            result
+        })
     }
 
     fn transact_on_db(
@@ -585,11 +620,16 @@ impl<FEN: FoundryEvmNetwork> CheatcodesExecutor<FEN> for InspectorStackInner {
         fork_id: Option<U256>,
         transaction: B256,
     ) -> eyre::Result<ContextUpdateFor<EvmFactoryFor<FEN>>> {
-        let evm_env = ecx.evm_clone();
-        let outer_tx_env = ecx.tx_clone();
-        let mut inspector = InspectorStackRefMut { cheatcodes: Some(cheats), inner: self };
-        let (db, inner) = ecx.db_journal_inner_mut();
-        db.transact(fork_id, transaction, evm_env, &outer_tx_env, inner, &mut inspector)
+        self.with_snapshot_tracking(cheats, |inner, cheats| {
+            let mut evm_env = ecx.evm_clone();
+            if let Some(disable_fee_charge) = inner.outer_disable_fee_charge {
+                evm_env.cfg_env.disable_fee_charge = disable_fee_charge;
+            }
+            let outer_tx_env = ecx.tx_clone();
+            let mut inspector = InspectorStackRefMut { cheatcodes: Some(cheats), inner };
+            let (db, inner) = ecx.db_journal_inner_mut();
+            db.transact(fork_id, transaction, evm_env, &outer_tx_env, inner, &mut inspector)
+        })
     }
 
     fn transact_from_tx_on_db(
@@ -598,10 +638,15 @@ impl<FEN: FoundryEvmNetwork> CheatcodesExecutor<FEN> for InspectorStackInner {
         ecx: &mut FoundryContextFor<'_, FEN>,
         tx_env: TxEnvFor<FEN>,
     ) -> eyre::Result<()> {
-        let evm_env = ecx.evm_clone();
-        let mut inspector = InspectorStackRefMut { cheatcodes: Some(cheats), inner: self };
-        let (db, inner) = ecx.db_journal_inner_mut();
-        db.transact_from_tx(tx_env, evm_env, inner, &mut inspector)
+        self.with_snapshot_tracking(cheats, |inner, cheats| {
+            let mut evm_env = ecx.evm_clone();
+            if let Some(disable_fee_charge) = inner.outer_disable_fee_charge {
+                evm_env.cfg_env.disable_fee_charge = disable_fee_charge;
+            }
+            let mut inspector = InspectorStackRefMut { cheatcodes: Some(cheats), inner };
+            let (db, inner) = ecx.db_journal_inner_mut();
+            db.transact_from_tx(tx_env, evm_env, inner, &mut inspector)
+        })
     }
 
     fn console_log(&mut self, msg: &str) {
@@ -612,14 +657,6 @@ impl<FEN: FoundryEvmNetwork> CheatcodesExecutor<FEN> for InspectorStackInner {
 
     fn tracing_inspector(&mut self) -> Option<&mut TracingInspector> {
         self.tracer.as_deref_mut()
-    }
-
-    fn set_in_inner_context(&mut self, enabled: bool, original_origin: Option<Address>) {
-        self.in_inner_context = enabled;
-        self.inner_context_data = enabled.then(|| InnerContextData {
-            original_origin: original_origin.expect("origin required when enabling inner ctx"),
-            locally_created_accounts: AddressHashSet::default(),
-        });
     }
 }
 
@@ -649,7 +686,7 @@ impl<FEN: FoundryEvmNetwork> InspectorStack<FEN> {
     /// Set the cancellation state checked during EVM execution.
     #[inline]
     pub(crate) fn set_early_exit(&mut self, early_exit: EarlyExit) {
-        self.execution_cancellation = Some(EvmExecutionCancellation::early_exit(early_exit));
+        self.set_execution_cancellation(EvmExecutionCancellation::early_exit(early_exit));
     }
 
     /// Set the complete cancellation state checked during EVM execution.
@@ -731,8 +768,14 @@ impl<FEN: FoundryEvmNetwork> InspectorStack<FEN> {
     /// Set whether to enable the edge coverage collector with default config.
     #[inline]
     pub fn collect_edge_coverage(&mut self, yes: bool) {
-        self.edge_coverage =
-            yes.then(|| EdgeCovInspector::with_config(EdgeCovConfig::default()).into());
+        self.edge_coverage = yes.then(|| EdgeCovInspector::default().into());
+        self.refresh_static_step_dispatch();
+    }
+
+    /// Enable edge coverage with an explicit configuration.
+    #[inline]
+    pub fn collect_edge_coverage_with_edge_config(&mut self, config: EdgeCovConfig) {
+        self.edge_coverage = Some(EdgeCovInspector::with_config(config).into());
         self.refresh_static_step_dispatch();
     }
 
@@ -835,6 +878,11 @@ impl<FEN: FoundryEvmNetwork> InspectorStack<FEN> {
         } else {
             self.tracer = None;
         }
+        if requirements.debug_recording() {
+            self.debug_recorder.get_or_insert_with(Default::default);
+        } else {
+            self.debug_recorder = None;
+        }
         self.refresh_static_opcode_dispatch();
     }
 
@@ -862,6 +910,7 @@ impl<FEN: FoundryEvmNetwork> InspectorStack<FEN> {
                 InspectorStackInner {
                     chisel_state,
                     instrumented_coverage,
+                    mut debug_recorder,
                     line_coverage,
                     edge_coverage,
                     log_collector,
@@ -891,7 +940,12 @@ impl<FEN: FoundryEvmNetwork> InspectorStack<FEN> {
                 })
                 .unwrap_or_default();
 
-            SparsedTraceArena { arena, ignored, diagnostics: trace_diagnostics }
+            SparsedTraceArena {
+                arena,
+                ignored,
+                diagnostics: trace_diagnostics,
+                debug_steps: debug_recorder.as_deref_mut().map(DebugRecorder::finish),
+            }
         });
 
         let (edge_coverage, evm_cmp_values) = edge_coverage
@@ -904,7 +958,8 @@ impl<FEN: FoundryEvmNetwork> InspectorStack<FEN> {
         InspectorData {
             logs: log_collector.and_then(|logs| logs.into_captured_logs()).unwrap_or_default(),
             labels: {
-                let mut labels = cheatcodes.as_ref().map(|c| c.labels.clone()).unwrap_or_default();
+                let mut labels =
+                    cheatcodes.as_ref().map(|c| c.core.labels.clone()).unwrap_or_default();
                 if let Some(tempo_labels) = tempo_labels {
                     labels.extend(tempo_labels.labels);
                 }
@@ -986,7 +1041,13 @@ impl<FEN: FoundryEvmNetwork> InspectorStackRefMut<'_, FEN> {
         let result = outcome.result.result;
         call_inspectors!(
             #[ret]
-            [&mut self.tracer, &mut self.cheatcodes, &mut self.printer, &mut self.revert_diag],
+            [
+                &mut self.tracer,
+                &mut self.debug_recorder,
+                &mut self.cheatcodes,
+                &mut self.printer,
+                &mut self.revert_diag
+            ],
             |inspector| {
                 let previous_output = outcome.output().clone();
                 inspector.call_end(ecx, inputs, outcome);
@@ -1002,7 +1063,7 @@ impl<FEN: FoundryEvmNetwork> InspectorStackRefMut<'_, FEN> {
 
         // Record first address that reverted the call.
         if result.is_revert() && self.reverter.is_none() {
-            self.reverter = Some(inputs.target_address);
+            self.reverter = Some(inputs.transfer_to());
         }
     }
 
@@ -1015,7 +1076,13 @@ impl<FEN: FoundryEvmNetwork> InspectorStackRefMut<'_, FEN> {
         let result = outcome.result.result;
         call_inspectors!(
             #[ret]
-            [&mut self.line_coverage, &mut self.tracer, &mut self.cheatcodes, &mut self.printer],
+            [
+                &mut self.line_coverage,
+                &mut self.tracer,
+                &mut self.debug_recorder,
+                &mut self.cheatcodes,
+                &mut self.printer
+            ],
             |inspector| {
                 let previous_output = outcome.output().clone();
                 inspector.create_end(ecx, call, outcome);
@@ -1040,24 +1107,35 @@ impl<FEN: FoundryEvmNetwork> InspectorStackRefMut<'_, FEN> {
         value: U256,
     ) -> (InterpreterResult, Option<Address>, bool) {
         let IsolatedGas { regular_limit, reservoir, precharged_state } = gas;
+        let source_fork_id = ecx.db().active_fork_id();
         let cached_evm_env = ecx.evm_clone();
         let cached_tx_env = ecx.tx_clone();
         self.isolated_call_was_precompile = None;
 
         ecx.block_mut().set_basefee(0);
+        ecx.cfg_env_mut().disable_fee_charge = true;
 
         let chain_id = ecx.cfg().chain_id();
         ecx.tx_mut().set_chain_id(Some(chain_id));
         ecx.tx_mut().set_caller(caller);
         ecx.tx_mut().set_kind(kind);
         ecx.tx_mut().set_data(input);
+        ecx.tx_mut().set_enveloped_tx(Bytes::new());
         ecx.tx_mut().set_value(value);
-        let initial_gas = calculate_stipend(ecx.tx(), ecx.cfg());
+        let initial_gas = calculate_initial_gas(ecx.tx(), ecx.cfg());
         // Preserve the frame's regular gas and reservoir across the synthetic transaction
         // boundary. The extra state gas offsets the account-creation charge already paid by the
         // outer opcode.
-        let regular_gas_limit = regular_limit.saturating_add(initial_gas);
+        let regular_gas_limit = regular_limit.saturating_add(initial_gas.initial_total_gas());
         ecx.cfg_env_mut().tx_gas_limit_cap = Some(regular_gas_limit);
+        // revm rejects transactions whose gas limit is below the EIP-7623 calldata floor. Raising
+        // the limit would give the frame more gas than it was forwarded, so skip that check and
+        // apply the floor to the transaction result instead.
+        let floor_gas =
+            (initial_gas.floor_gas() > regular_gas_limit).then_some(initial_gas.floor_gas());
+        if floor_gas.is_some() {
+            ecx.cfg_env_mut().disable_eip7623 = true;
+        }
         let mut tx_gas_limit = regular_gas_limit.saturating_add(reservoir);
         if let Some(precharged_state) = precharged_state {
             tx_gas_limit = tx_gas_limit.saturating_add(precharged_state);
@@ -1089,44 +1167,32 @@ impl<FEN: FoundryEvmNetwork> InspectorStackRefMut<'_, FEN> {
             .iter()
             .filter_map(|(addr, acc)| acc.is_created_locally().then_some(*addr))
             .collect();
+        let root_depth = ecx.journal().depth();
         self.inner_context_data = Some(InnerContextData {
             original_origin: cached_tx_env.caller(),
             locally_created_accounts,
+            root_depth,
         });
+        self.outer_disable_fee_charge = Some(cached_evm_env.cfg_env.disable_fee_charge);
         self.in_inner_context = true;
 
         // Tell cheatcodes we're entering the synthetic inner transaction so
         // env-mutating cheatcodes route through `env_overrides` instead of
         // fighting with the fee-accounting zeroing above. See `EnvOverrides`.
         if let Some(cheats) = self.cheatcodes.as_deref_mut() {
+            cheats.pending_isolated_snapshot_journal = None;
+            cheats.track_isolated_snapshots = true;
+            cheats.isolated_snapshot_restores.clear();
             cheats.in_isolation_context = true;
         }
+        self.inner.isolated_frame_checkpoints.clear();
 
         let evm_env = ecx.evm_clone();
         let tx_env = ecx.tx_clone();
         let factory = FEN::EvmFactory::default();
         let chain_context = ecx.chain().clone();
 
-        let isolated_state = {
-            let journal = ecx.journal_inner();
-            let mut state = journal.state.clone();
-            for (addr, acc_mut) in &mut state {
-                // Preserve revm's per-transaction creation flag for accounts created in
-                // the parent context in initialize_interp. A cold load in the nested
-                // context clears local flags, but keeping accounts cold preserves gas
-                // accounting for isolated calls.
-                if journal.warm_addresses.is_cold(addr) {
-                    acc_mut.mark_cold();
-                }
-
-                // Mark all slots cold.
-                for slot_mut in acc_mut.storage.values_mut() {
-                    slot_mut.is_cold = true;
-                    slot_mut.original_value = slot_mut.present_value;
-                }
-            }
-            state
-        };
+        let isolated_state = prepare_child_state(ecx.journal_inner());
 
         #[cfg(feature = "monad")]
         let state = foundry_evm_core::FoundryJournal::capture_reserve_balance(ecx.journal());
@@ -1151,8 +1217,8 @@ impl<FEN: FoundryEvmNetwork> InspectorStackRefMut<'_, FEN> {
                         true,
                     );
                 }
-                // Set depth to 1 to make sure traces are collected correctly.
-                evm.journal_inner_mut().depth = 1;
+                // Preserve the surrounding trace depth, including a synthetic CREATE frame.
+                evm.journal_inner_mut().depth = root_depth;
                 let res = evm.transact_raw(tx_env);
                 nested_chain_context = Some(evm.chain_mut().clone());
                 #[cfg(feature = "monad")]
@@ -1165,11 +1231,13 @@ impl<FEN: FoundryEvmNetwork> InspectorStackRefMut<'_, FEN> {
                 (res, evm.to_evm_env())
             };
 
-            // Restore env, preserving cheatcode cfg/block changes from the nested EVM
-            // but restoring the original tx and basefee (which we zeroed for the nested call).
+            // Restore env, preserving cheatcode cfg/block changes from the nested EVM but restoring
+            // the original tx and temporary fee overrides used for the nested call.
             let mut restored_evm_env = nested_env;
             restored_evm_env.block_env.set_basefee(cached_evm_env.block_env.basefee());
+            restored_evm_env.cfg_env.disable_fee_charge = cached_evm_env.cfg_env.disable_fee_charge;
             restored_evm_env.cfg_env.tx_gas_limit_cap = cached_evm_env.cfg_env.tx_gas_limit_cap;
+            restored_evm_env.cfg_env.disable_eip7623 = cached_evm_env.cfg_env.disable_eip7623;
             ecx.set_evm(restored_evm_env);
             ecx.set_tx(cached_tx_env);
 
@@ -1179,22 +1247,30 @@ impl<FEN: FoundryEvmNetwork> InspectorStackRefMut<'_, FEN> {
 
         self.in_inner_context = false;
         self.inner_context_data = None;
+        self.outer_disable_fee_charge = None;
 
         // Reset the cheatcodes isolation flag now that the synthetic inner
         // transaction has finished.
         if let Some(cheats) = self.cheatcodes.as_deref_mut() {
             cheats.in_isolation_context = false;
+            cheats.track_isolated_snapshots = false;
         }
 
         let mut gas = Gas::new_with_regular_gas_and_reservoir(regular_limit, reservoir);
         let was_precompile_called = self.isolated_call_was_precompile.take().unwrap_or(false);
 
         let Ok(res) = res else {
+            if let Some(cheats) = self.cheatcodes.as_deref_mut() {
+                cheats.pending_isolated_snapshot_journal = None;
+                cheats.isolated_snapshot_restores.clear();
+            }
+            self.inner.isolated_frame_checkpoints.clear();
             #[cfg(feature = "monad")]
             foundry_evm_core::FoundryJournal::restore_reserve_balance(
                 ecx.journal_mut(),
                 reserve_balance.expect("isolated transaction state was captured"),
             );
+            #[cfg(feature = "monad")]
             refresh_chain_journal(ecx);
             // Should we match, encode and propagate error as a revert reason?
             let result =
@@ -1202,57 +1278,62 @@ impl<FEN: FoundryEvmNetwork> InspectorStackRefMut<'_, FEN> {
             return (result, None, was_precompile_called);
         };
 
-        let transaction_gas = res.result.gas();
-        let mut state_gas_used = transaction_gas.block_state_gas_used();
-        if let Some(precharged_state) = precharged_state {
-            state_gas_used = state_gas_used.saturating_sub(precharged_state);
+        let mut transaction_gas = *res.result.gas();
+        if let Some(floor_gas) = floor_gas {
+            transaction_gas = transaction_gas.with_floor_gas(floor_gas);
         }
-        if state_gas_used == 0 {
-            let mut snapshot_gas = Gas::new(regular_limit);
-            let _ = snapshot_gas.record_regular_cost(transaction_gas.tx_gas_used());
-            if let Some(cheats) = self.cheatcodes.as_deref_mut() {
-                cheats.gas_metering.set_isolated_snapshot_gas_used(snapshot_gas.total_gas_spent());
-            }
+        let tx_state_gas_used = transaction_gas.block_state_gas_used();
+        // A failed frame refunds the account-creation charge to the outer opcode, and its
+        // transaction does not charge that state gas either.
+        let precharged_state = precharged_state.map_or(0, |gas| gas.min(tx_state_gas_used));
+        let state_gas_used = tx_state_gas_used - precharged_state;
+        if let Some(cheats) = self.cheatcodes.as_deref_mut() {
+            cheats
+                .gas_metering
+                .set_isolated_snapshot_gas_used(transaction_gas.tx_gas_used(), precharged_state);
         }
-        let _ = gas.record_state_cost(state_gas_used);
-        let _ = gas.record_regular_cost(transaction_gas.block_regular_gas_used());
+        // The transaction also pays its intrinsic gas and calldata floor, which can exceed the
+        // gas forwarded to the frame. The frame then consumes its whole regular budget, as on an
+        // exceptional halt.
+        if !(gas.record_state_cost(state_gas_used)
+            && gas.record_regular_cost(transaction_gas.block_regular_gas_used()))
+        {
+            gas.spend_all();
+        }
 
         let rolled_back = !res.result.is_success();
 
-        for (addr, mut acc) in res.state {
-            let Some(acc_mut) = ecx.journal_mut().evm_state_mut().get_mut(&addr) else {
-                ecx.journal_mut().evm_state_mut().insert(addr, acc);
-                continue;
-            };
-
-            // make sure accounts that were warmed earlier do not become cold
-            if acc.status.contains(AccountStatus::Cold)
-                && !acc_mut.status.contains(AccountStatus::Cold)
-            {
-                acc.status -= AccountStatus::Cold;
-            }
-            acc_mut.info = acc.info;
-            acc_mut.status |= acc.status;
-
-            for (key, val) in acc.storage {
-                let Some(slot_mut) = acc_mut.storage.get_mut(&key) else {
-                    acc_mut.storage.insert(key, val);
-                    continue;
-                };
-                slot_mut.present_value = val.present_value;
-                slot_mut.is_cold &= val.is_cold;
-            }
+        let restored_journal = self
+            .cheatcodes
+            .as_deref_mut()
+            .and_then(|cheats| cheats.pending_isolated_snapshot_journal.take());
+        if let Some(cheats) = self.cheatcodes.as_deref_mut() {
+            cheats.isolated_snapshot_restores.clear();
+        }
+        self.inner.isolated_frame_checkpoints.clear();
+        let restored_snapshot = if !rolled_back && let Some(restored_journal) = restored_journal {
+            let (_, journaled_state) = ecx.db_journal_inner_mut();
+            journaled_state.journal = restored_journal;
+            true
+        } else {
+            false
+        };
+        if source_fork_id == ecx.db().active_fork_id() {
+            merge_child_state(ecx.journal_mut().evm_state_mut(), res.state, restored_snapshot);
+        } else {
+            *ecx.journal_mut().evm_state_mut() = res.state;
         }
         #[cfg(feature = "monad")]
         foundry_evm_core::FoundryJournal::restore_reserve_balance(
             ecx.journal_mut(),
             reserve_balance.expect("isolated transaction state was captured"),
         );
+        #[cfg(feature = "monad")]
         refresh_chain_journal(ecx);
 
         let (result, address, output) = match res.result {
-            ExecutionResult::Success { reason, gas: result_gas, logs: _, output } => {
-                gas.set_refund(result_gas.final_refunded() as i64);
+            ExecutionResult::Success { reason, gas: _, logs: _, output } => {
+                gas.set_refund(transaction_gas.final_refunded() as i64);
                 let address = match output {
                     Output::Create(_, address) => address,
                     Output::Call(_) => None,
@@ -1264,6 +1345,7 @@ impl<FEN: FoundryEvmNetwork> InspectorStackRefMut<'_, FEN> {
             }
             ExecutionResult::Revert { output, .. } => (InstructionResult::Revert, None, output),
         };
+        #[cfg(feature = "monad")]
         if rolled_back {
             refresh_chain_journal(ecx);
         }
@@ -1276,7 +1358,7 @@ impl<FEN: FoundryEvmNetwork> InspectorStackRefMut<'_, FEN> {
         let mut cheatcodes = self
             .cheatcodes
             .as_deref_mut()
-            .map(|cheats| core::mem::replace(cheats, Cheatcodes::new(cheats.config.clone())));
+            .map(|cheats| core::mem::replace(cheats, Cheatcodes::new(cheats.core.config.clone())));
         let mut inner = std::mem::take(self.inner);
 
         // Save pending CREATE2 redirects so frame_end in the nested EVM doesn't consume them.
@@ -1299,6 +1381,7 @@ impl<FEN: FoundryEvmNetwork> InspectorStackRefMut<'_, FEN> {
     fn top_level_frame_start(&mut self, ecx: &mut FoundryContextFor<'_, FEN>) {
         self.locally_created_accounts.clear();
         self.top_level_frame_failed_before_rewrite = false;
+        warm_arbitrum_system_contract::<FEN>(ecx);
         if let Some(cheatcodes) = &mut self.cheatcodes {
             cheatcodes.clear_storage_hook_mapping_slots();
         }
@@ -1330,6 +1413,7 @@ impl<FEN: FoundryEvmNetwork> InspectorStackRefMut<'_, FEN> {
             *ecx.journal_mut().evm_state_mut() = std::mem::take(&mut self.top_frame_journal);
         }
 
+        #[cfg(feature = "monad")]
         refresh_chain_journal(ecx);
     }
 
@@ -1405,6 +1489,7 @@ impl<FEN: FoundryEvmNetwork> InspectorStackRefMut<'_, FEN> {
                         &mut self.revert_diag,
                         &mut self.script_execution_inspector,
                         &mut self.tracer,
+                        &mut self.debug_recorder,
                     ],
                     |inspector| (**inspector).step(interpreter, ecx),
                 );
@@ -1422,6 +1507,15 @@ impl<FEN: FoundryEvmNetwork> InspectorStackRefMut<'_, FEN> {
                 cheats.step(interpreter, ecx);
             }
         }
+
+        // revm skips `step_end` if an inspector halted the frame in `step`. A recorder makes the
+        // dispatch general, so other dispatches skip the check.
+        if matches!(self.static_step_dispatch, OpcodeStepDispatch::General)
+            && let Some(recorder) = self.inner.debug_recorder.as_deref_mut()
+            && interpreter.bytecode.is_end()
+        {
+            recorder.end_step_not_run(interpreter);
+        }
     }
 
     #[inline(always)]
@@ -1438,6 +1532,7 @@ impl<FEN: FoundryEvmNetwork> InspectorStackRefMut<'_, FEN> {
                     &mut self.printer,
                     &mut self.revert_diag,
                     &mut self.tracer,
+                    &mut self.debug_recorder,
                 ],
                 |inspector| (**inspector).step_end(interpreter, ecx),
             );
@@ -1456,6 +1551,39 @@ impl<FEN: FoundryEvmNetwork> InspectorStackRefMut<'_, FEN> {
             cheats.step_end(interpreter, ecx);
         }
     }
+
+    fn finish_isolated_snapshot_frame(&mut self, ecx: &mut FoundryContextFor<'_, FEN>) {
+        let Some(frame) = self.inner.isolated_frame_checkpoints.pop() else { return };
+
+        if frame.failed
+            && let Some(cheats) = self.cheatcodes.as_deref_mut()
+            && cheats.isolated_snapshot_restores.len() > frame.restore_len
+        {
+            cheats.isolated_snapshot_restores.truncate(frame.restore_len + 1);
+            let mut journal = cheats.isolated_snapshot_restores.pop().unwrap();
+            journal.checkpoint_revert(frame.checkpoint);
+            journal.depth = frame.return_depth;
+            if cheats.isolated_snapshot_restores.is_empty() {
+                cheats.pending_isolated_snapshot_journal = None;
+            }
+            ecx.set_journal_inner(journal);
+        }
+
+        // The caller only needs the first restoration made since it started, so drop the ones a
+        // finished call captured after it. This bounds their count by call depth; each retained
+        // journal can still contain all loaded account state.
+        if let Some(caller) = self.inner.isolated_frame_checkpoints.last()
+            && let Some(cheats) = self.cheatcodes.as_deref_mut()
+        {
+            cheats.isolated_snapshot_restores.truncate(caller.restore_len + 1);
+        }
+
+        if let Some(cheats) = self.cheatcodes.as_deref_mut()
+            && cheats.pending_isolated_snapshot_journal.is_some()
+        {
+            cheats.pending_isolated_snapshot_journal = Some(ecx.journal_inner().journal.clone());
+        }
+    }
 }
 
 impl<FEN: FoundryEvmNetwork> Inspector<FoundryContextFor<'_, FEN>>
@@ -1466,6 +1594,16 @@ impl<FEN: FoundryEvmNetwork> Inspector<FoundryContextFor<'_, FEN>>
         interpreter: &mut Interpreter,
         ecx: &mut FoundryContextFor<'_, FEN>,
     ) {
+        if self.cheatcodes.as_deref().is_some_and(|cheats| cheats.track_isolated_snapshots)
+            && let Some(frame) = self.inner.isolated_frame_checkpoints.last_mut()
+            && frame.is_create
+            && let Some(offset) = ecx.journal_inner().journal[frame.checkpoint.journal_i..]
+                .iter()
+                .position(|entry| matches!(entry, JournalEntry::AccountCreated { .. }))
+        {
+            frame.checkpoint.journal_i += offset;
+        }
+
         let address = interpreter.input.target_address();
         let should_mark_created_locally = self.locally_created_accounts.contains(&address)
             || self
@@ -1474,6 +1612,7 @@ impl<FEN: FoundryEvmNetwork> Inspector<FoundryContextFor<'_, FEN>>
                 .is_some_and(|ctx| ctx.locally_created_accounts.contains(&address));
         if should_mark_created_locally
             && let Some(account) = ecx.journal_mut().evm_state_mut().get_mut(&address)
+            && account.is_created()
         {
             account.mark_created_locally();
         }
@@ -1539,6 +1678,43 @@ impl<FEN: FoundryEvmNetwork> Inspector<FoundryContextFor<'_, FEN>>
         ecx: &mut FoundryContextFor<'_, FEN>,
         frame_input: &mut FrameInput,
     ) -> Option<FrameResult> {
+        // A non-isolated top-level transaction needs the same restore tracking as an isolated call.
+        if !self.enable_isolation
+            && !self.in_inner_context
+            && ecx.journal().depth() == 0
+            && let Some(cheats) = self.cheatcodes.as_deref_mut()
+        {
+            cheats.pending_isolated_snapshot_journal = None;
+            cheats.track_isolated_snapshots = true;
+            cheats.isolated_snapshot_restores.clear();
+            self.inner.isolated_frame_checkpoints.clear();
+        }
+        if let Some(cheats) = self.cheatcodes.as_deref_mut()
+            && cheats.track_isolated_snapshots
+        {
+            let journal = ecx.journal_inner();
+            let restore_len = cheats.isolated_snapshot_restores.len();
+            // Unwinding a frame only needs the first restoration made inside it, so a restoration
+            // requested by this call is captured only if none was captured since its caller
+            // started.
+            cheats.capture_isolated_snapshot_restore = self
+                .inner
+                .isolated_frame_checkpoints
+                .last()
+                .is_none_or(|caller| caller.restore_len == restore_len);
+            self.inner.isolated_frame_checkpoints.push(IsolatedFrameCheckpoint {
+                checkpoint: JournalCheckpoint {
+                    log_i: journal.logs.len(),
+                    journal_i: journal.journal.len(),
+                    selfdestructed_i: journal.selfdestructed_addresses.len(),
+                },
+                restore_len,
+                return_depth: journal.depth,
+                is_create: matches!(frame_input, FrameInput::Create(_)),
+                failed: false,
+            });
+        }
+
         if let FrameInput::Create(inputs) = frame_input
             && self.should_use_create2_factory(ecx.journal().depth(), inputs)
         {
@@ -1624,12 +1800,22 @@ impl<FEN: FoundryEvmNetwork> Inspector<FoundryContextFor<'_, FEN>>
     ) {
         let depth = ecx.journal().depth();
         self.finish_create2_redirect(depth, frame_result);
+        if self.cheatcodes.as_deref().is_some_and(|cheats| cheats.track_isolated_snapshots) {
+            self.finish_isolated_snapshot_frame(ecx);
+        }
 
         let result = frame_result.instruction_result();
         if !self.in_inner_context && depth == 0 {
             let failed = std::mem::take(&mut self.inner.top_level_frame_failed_before_rewrite)
                 || !result.is_ok();
             self.top_level_frame_end(ecx, failed);
+            if !self.enable_isolation {
+                if let Some(cheats) = self.cheatcodes.as_deref_mut() {
+                    cheats.track_isolated_snapshots = false;
+                    cheats.isolated_snapshot_restores.clear();
+                }
+                self.inner.isolated_frame_checkpoints.clear();
+            }
         }
     }
 
@@ -1638,8 +1824,13 @@ impl<FEN: FoundryEvmNetwork> Inspector<FoundryContextFor<'_, FEN>>
         ecx: &mut FoundryContextFor<'_, FEN>,
         call: &mut CallInputs,
     ) -> Option<CallOutcome> {
-        if self.in_inner_context && ecx.journal().depth() == 1 {
+        if self.is_inner_context_root(ecx.journal().depth()) {
             self.adjust_evm_data_for_inner_context(ecx);
+            warm_arbitrum_system_contract::<FEN>(ecx);
+            // Transaction call inputs use the original target, so resolve function mocks here too.
+            if let Some(cheatcodes) = self.cheatcodes.as_deref() {
+                apply_mocked_function(cheatcodes, ecx, call);
+            }
             return None;
         }
 
@@ -1693,6 +1884,9 @@ impl<FEN: FoundryEvmNetwork> Inspector<FoundryContextFor<'_, FEN>>
                 return output;
             }
         }
+        if let Some(recorder) = self.debug_recorder.as_deref_mut() {
+            recorder.call(ecx, call);
+        }
 
         call_inspectors!(
             #[ret]
@@ -1718,37 +1912,35 @@ impl<FEN: FoundryEvmNetwork> Inspector<FoundryContextFor<'_, FEN>>
         // and broadcasts. Keep the trace lifecycle ordering, but remember the node so its caller
         // can be synchronized with the inputs that are actually executed.
         let trace_idx = self.tracer.as_ref().map(|tracer| tracer.traces().nodes().len() - 1);
+        // Also isolate a synthetic `deployCode` create that was rewritten to a CREATE2 factory
+        // call.
+        let isolate = self.enable_isolation
+            && !self.in_inner_context
+            && (ecx.journal().depth() == 1
+                || self.inner.synthetic_create_depth == Some(ecx.journal().depth()));
         let mut cheatcode_outcome = None;
         if let Some(cheatcodes) = self.cheatcodes.as_deref_mut() {
-            // Handle mocked functions, replace bytecode address with mock if matched.
-            if let Some(mocks) = cheatcodes.mocked_functions.get(&call.bytecode_address) {
-                let input_bytes = call.input.bytes(ecx);
-                // Check if any mock function set for call data or if catch-all mock function set
-                // for selector.
-                if let Some(target) = mocks
-                    .get(&input_bytes)
-                    .or_else(|| input_bytes.get(..4).and_then(|selector| mocks.get(selector)))
-                {
-                    call.bytecode_address = *target;
+            apply_mocked_function(cheatcodes, ecx, call);
 
-                    let target = ecx
-                        .journal_mut()
-                        .load_account_with_code(*target)
-                        .expect("failed to load account");
-                    call.known_bytecode =
-                        (target.info.code_hash, target.info.code.clone().unwrap_or_default());
-                }
+            let execution_disable_fee_charge = ecx.cfg_env().disable_fee_charge;
+            if let Some(disable_fee_charge) = self.inner.outer_disable_fee_charge {
+                ecx.cfg_env_mut().disable_fee_charge = disable_fee_charge;
             }
-
-            cheatcode_outcome = cheatcodes.call_with_executor(ecx, call, self.inner);
+            cheatcode_outcome = cheatcodes.call_with_executor(
+                ecx,
+                call,
+                self.inner,
+                isolate && call.scheme.is_call(),
+            );
+            ecx.cfg_env_mut().disable_fee_charge = execution_disable_fee_charge;
         }
 
         if let Some(trace_idx) = trace_idx
             && let Some(tracer) = self.tracer.as_deref_mut()
         {
             let caller = match call.scheme {
-                CallScheme::DelegateCall | CallScheme::CallCode => call.target_address,
-                CallScheme::Call | CallScheme::StaticCall => call.caller,
+                CallScheme::DelegateCall | CallScheme::CallCode => call.transfer_to(),
+                CallScheme::Call | CallScheme::StaticCall => call.transfer_from(),
             };
             let node = &mut tracer.traces_mut().nodes_mut()[trace_idx];
             debug_assert_eq!(node.trace.depth, ecx.journal().depth());
@@ -1767,7 +1959,7 @@ impl<FEN: FoundryEvmNetwork> Inspector<FoundryContextFor<'_, FEN>>
             pending.executed_address = Some(call.bytecode_address);
         }
 
-        if self.enable_isolation && !self.in_inner_context && ecx.journal().depth() == 1 {
+        if isolate {
             match call.scheme {
                 // Isolate CALLs
                 CallScheme::Call => {
@@ -1777,8 +1969,8 @@ impl<FEN: FoundryEvmNetwork> Inspector<FoundryContextFor<'_, FEN>>
                         .then_some(ecx.cfg().gas_params().new_account_state_gas());
                     let (result, _, was_precompile_called) = self.transact_inner(
                         ecx,
-                        TxKind::Call(call.target_address),
-                        call.caller,
+                        TxKind::Call(call.transfer_to()),
+                        call.transfer_from(),
                         input,
                         IsolatedGas {
                             regular_limit: call.gas_limit,
@@ -1830,9 +2022,15 @@ impl<FEN: FoundryEvmNetwork> Inspector<FoundryContextFor<'_, FEN>>
         inputs: &CallInputs,
         outcome: &mut CallOutcome,
     ) {
+        if self.cheatcodes.as_deref().is_some_and(|cheats| cheats.track_isolated_snapshots)
+            && let Some(frame) = self.inner.isolated_frame_checkpoints.last_mut()
+        {
+            frame.failed |= !outcome.result.result.is_ok();
+        }
+
         // We are processing inner context outputs in the outer context, so need to avoid processing
         // twice.
-        if self.in_inner_context && ecx.journal().depth() == 1 {
+        if self.is_inner_context_root(ecx.journal().depth()) {
             self.isolated_call_was_precompile = Some(outcome.was_precompile_called);
             return;
         }
@@ -1876,8 +2074,9 @@ impl<FEN: FoundryEvmNetwork> Inspector<FoundryContextFor<'_, FEN>>
         ecx: &mut FoundryContextFor<'_, FEN>,
         create: &mut CreateInputs,
     ) -> Option<CreateOutcome> {
-        if self.in_inner_context && ecx.journal().depth() == 1 {
+        if self.is_inner_context_root(ecx.journal().depth()) {
             self.adjust_evm_data_for_inner_context(ecx);
+            warm_arbitrum_system_contract::<FEN>(ecx);
             return None;
         }
 
@@ -1902,6 +2101,9 @@ impl<FEN: FoundryEvmNetwork> Inspector<FoundryContextFor<'_, FEN>>
             if output.is_some() {
                 return output;
             }
+        }
+        if let Some(recorder) = self.debug_recorder.as_deref_mut() {
+            recorder.create(ecx, create);
         }
 
         call_inspectors!(
@@ -1937,7 +2139,8 @@ impl<FEN: FoundryEvmNetwork> Inspector<FoundryContextFor<'_, FEN>>
         if !matches!(create.scheme(), CreateScheme::Create2 { .. })
             && self.enable_isolation
             && !self.in_inner_context
-            && ecx.journal().depth() == 1
+            && (ecx.journal().depth() == 1
+                || self.synthetic_create_depth == Some(ecx.journal().depth()))
         {
             // In isolation mode, transact_inner returns None for the address on revert; pre-compute
             // the would-be deployed address so create_end can enforce expected_revert reverter
@@ -1981,6 +2184,12 @@ impl<FEN: FoundryEvmNetwork> Inspector<FoundryContextFor<'_, FEN>>
         call: &CreateInputs,
         outcome: &mut CreateOutcome,
     ) {
+        if self.cheatcodes.as_deref().is_some_and(|cheats| cheats.track_isolated_snapshots)
+            && let Some(frame) = self.inner.isolated_frame_checkpoints.last_mut()
+        {
+            frame.failed |= !outcome.result.result.is_ok();
+        }
+
         if outcome.result.result.is_ok()
             && let Some(address) = outcome.address
         {
@@ -1995,7 +2204,7 @@ impl<FEN: FoundryEvmNetwork> Inspector<FoundryContextFor<'_, FEN>>
 
         // We are processing inner context outputs in the outer context, so need to avoid processing
         // twice.
-        if self.in_inner_context && ecx.journal().depth() == 1 {
+        if self.is_inner_context_root(ecx.journal().depth()) {
             return;
         }
 
@@ -2022,11 +2231,23 @@ impl<FEN: FoundryEvmNetwork> Inspector<FoundryContextFor<'_, FEN>>
     }
 }
 
+fn warm_arbitrum_system_contract<FEN: FoundryEvmNetwork>(ecx: &mut FoundryContextFor<'_, FEN>) {
+    if !arbitrum::is_arbitrum_chain(ecx.cfg().chain_id()) {
+        return;
+    }
+
+    // Nitro warms ArbSys like a precompile. Use the access list so other selectors can still
+    // execute code at the address.
+    let mut access_list = ecx.journal_inner().warm_addresses.access_list().clone();
+    access_list.entry(arbitrum::ARB_SYS_ADDRESS).or_default();
+    ecx.journal_mut().warm_access_list(access_list);
+}
+
 fn handle_arbitrum_system_call<FEN: FoundryEvmNetwork>(
     ecx: &mut FoundryContextFor<'_, FEN>,
     call: &CallInputs,
 ) -> Option<CallOutcome> {
-    if call.target_address != arbitrum::ARB_SYS_ADDRESS
+    if call.transfer_to() != arbitrum::ARB_SYS_ADDRESS
         || call.bytecode_address != arbitrum::ARB_SYS_ADDRESS
         || !arbitrum::is_arbitrum_chain(ecx.cfg().chain_id())
     {
@@ -2038,7 +2259,12 @@ fn handle_arbitrum_system_call<FEN: FoundryEvmNetwork>(
         return None;
     }
 
-    let block_number = ecx.db().active_fork_block_number()?;
+    // Forks report their L2 block, which the block env lacks on Arbitrum because `NUMBER` returns
+    // the L1 block there. Without a fork the block env is read here to follow `vm.roll`.
+    let block_number = match ecx.db().active_fork_block_number() {
+        Some(block_number) => block_number,
+        None => ecx.block().number().saturating_to(),
+    };
     let Some((gas_cost, output)) = arbitrum::arb_block_number_call(call.gas_limit, block_number)
     else {
         return Some(arbitrum_call_outcome(
@@ -2249,6 +2475,7 @@ impl InspectorStackInner {
             && self.revert_diag.is_none()
             && self.script_execution_inspector.is_none()
             && self.tracer.is_none()
+            && self.debug_recorder.is_none()
         {
             if self.fuzzer.is_some() {
                 OpcodeStepDispatch::FuzzerOnly
@@ -2265,7 +2492,8 @@ impl InspectorStackInner {
         self.has_static_step_end_inspectors = self.chisel_state.is_some()
             || self.printer.is_some()
             || self.revert_diag.is_some()
-            || self.tracer.is_some();
+            || self.tracer.is_some()
+            || self.debug_recorder.is_some();
     }
 
     /// Derive the next `--batch` CREATE2 salt and advance the per-batch counter.
@@ -2275,6 +2503,34 @@ impl InspectorStackInner {
         let counter = self.batch_create_counter;
         self.batch_create_counter = counter.wrapping_add(1);
         compute_batch_create_salt(process_salt, chain_id, nonce, counter)
+    }
+
+    /// Whether this frame duplicates the outer frame that entered an isolated transaction.
+    fn is_inner_context_root(&self, depth: usize) -> bool {
+        self.in_inner_context
+            && self.inner_context_data.as_ref().is_some_and(|inner| depth == inner.root_depth)
+    }
+
+    /// Gives a fresh transaction its own restore tracking, independent of the suspended parent.
+    fn with_snapshot_tracking<FEN: FoundryEvmNetwork, R>(
+        &mut self,
+        cheats: &mut Cheatcodes<FEN>,
+        f: impl FnOnce(&mut Self, &mut Cheatcodes<FEN>) -> R,
+    ) -> R {
+        let tracking = std::mem::replace(&mut cheats.track_isolated_snapshots, true);
+        let isolation = std::mem::replace(&mut cheats.in_isolation_context, false);
+        let capture = std::mem::replace(&mut cheats.capture_isolated_snapshot_restore, true);
+        let restores = std::mem::take(&mut cheats.isolated_snapshot_restores);
+        let pending = cheats.pending_isolated_snapshot_journal.take();
+        let frames = std::mem::take(&mut self.isolated_frame_checkpoints);
+        let result = f(self, cheats);
+        self.isolated_frame_checkpoints = frames;
+        cheats.pending_isolated_snapshot_journal = pending;
+        cheats.isolated_snapshot_restores = restores;
+        cheats.capture_isolated_snapshot_restore = capture;
+        cheats.in_isolation_context = isolation;
+        cheats.track_isolated_snapshots = tracking;
+        result
     }
 }
 
@@ -2289,17 +2545,38 @@ fn compute_batch_create_salt(process_salt: u64, chain_id: u64, nonce: u64, count
     buf[8..16].copy_from_slice(&chain_id.to_be_bytes());
     buf[16..24].copy_from_slice(&nonce.to_be_bytes());
     buf[24..32].copy_from_slice(&counter.to_be_bytes());
-    U256::from_be_bytes(keccak256(buf).0)
+    keccak256(buf).into()
+}
+
+/// Redirects `call` to the implementation set with `vm.mockFunction`, if one matches.
+fn apply_mocked_function<FEN: FoundryEvmNetwork>(
+    cheatcodes: &Cheatcodes<FEN>,
+    ecx: &mut FoundryContextFor<'_, FEN>,
+    call: &mut CallInputs,
+) {
+    if let Some(mocks) = cheatcodes.core.mocked_functions.get(&call.bytecode_address) {
+        let input_bytes = call.input.bytes(ecx);
+        // Check if any mock function set for call data or if catch-all mock function set
+        // for selector.
+        if let Some(target) = mocks
+            .get(&input_bytes)
+            .or_else(|| input_bytes.get(..4).and_then(|selector| mocks.get(selector)))
+        {
+            call.bytecode_address = *target;
+
+            let target =
+                ecx.journal_mut().load_account_with_code(*target).expect("failed to load account");
+            call.known_bytecode =
+                (target.info.code_hash(), target.info.code.clone().unwrap_or_default());
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        Address, Fuzzer, InspectorStack, InspectorStackInner, OpcodeStepDispatch, RevertDiagnostic,
-        TraceRequirements, compute_batch_create_salt,
-    };
+    use super::*;
     use crate::{backend::Backend, executors::ExecutorBuilder};
-    use alloy_primitives::{B256, Bytes, U256};
+    use alloy_primitives::B256;
     use foundry_evm_core::{EvmEnv, evm::EthEvmNetwork};
     use foundry_evm_coverage::FOUNDRY_COVERAGE_ADDRESS;
     use foundry_evm_networks::NetworkConfigs;

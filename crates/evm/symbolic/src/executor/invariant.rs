@@ -8,27 +8,36 @@ fn record_candidate_limitation(
         error,
         SymbolicError::Timeout(_) | SymbolicError::Solver(_) | SymbolicError::SolverQueryLimit(_)
     );
-    limitation.get_or_insert_with(|| error.into());
+    if search_exhausted {
+        *limitation = Some(error.into());
+    } else {
+        limitation.get_or_insert_with(|| error.into());
+    }
     search_exhausted
 }
 
 impl SymbolicExecutor {
     #[expect(clippy::too_many_arguments)]
-    pub(super) fn execute_invariant_check<FEN: FoundryEvmNetwork>(
+    pub(super) fn execute_invariant_check(
         &mut self,
-        executor: &Executor<FEN>,
-        state: PathState,
+        executor: &ExecutorView<'_>,
+        state: &PathState,
         invariant_address: Address,
         sender: Address,
         invariant: &Function,
         after_invariant: Option<&Function>,
         completed_paths: &mut usize,
     ) -> Result<Vec<InvariantCheckOutcome>, SymbolicError> {
-        let mut call =
-            self.prepare_invariant_call(executor, state, invariant_address, sender, invariant)?;
+        let mut call = self.prepare_invariant_call(
+            executor,
+            state.clone(),
+            invariant_address,
+            sender,
+            invariant,
+        )?;
 
         let mut checked = Vec::new();
-        while let Some(outcome) =
+        while let Some(mut outcome) =
             self.execute_sequence_call_next(executor, &mut call, completed_paths)?
         {
             if !matches!(outcome.status, CallStatus::Success) {
@@ -40,9 +49,14 @@ impl SymbolicExecutor {
                 continue;
             };
 
+            // Concrete invariant checks do not commit predicate state before invoking
+            // `afterInvariant`. Retain the predicate's path state while restoring the unchanged
+            // post-handler world.
+            let mut after_state = state.clone();
+            after_state.take_noncommitting_check_state(&mut outcome.state);
             let mut after_call = self.prepare_invariant_call(
                 executor,
-                outcome.state,
+                after_state,
                 invariant_address,
                 sender,
                 after_invariant,
@@ -61,14 +75,15 @@ impl SymbolicExecutor {
         Ok(checked)
     }
 
-    fn prepare_invariant_call<FEN: FoundryEvmNetwork>(
+    fn prepare_invariant_call(
         &mut self,
-        executor: &Executor<FEN>,
-        state: PathState,
+        executor: &ExecutorView<'_>,
+        mut state: PathState,
         invariant_address: Address,
         sender: Address,
         invariant: &Function,
     ) -> Result<SequenceCall, SymbolicError> {
+        state.invariant_predicate = true;
         let calldata = SymbolicCalldata::selector_only(&mut self.cx, invariant)?;
         let call_data = calldata.call_data(&mut self.cx);
         let constraints = calldata.into_constraints();
@@ -83,9 +98,9 @@ impl SymbolicExecutor {
         )
     }
 
-    pub(super) fn search_invariant_candidates_inner<FEN: FoundryEvmNetwork>(
+    pub(super) fn search_invariant_candidates_inner(
         &mut self,
-        input: &SymbolicInvariantCandidateInput<'_, FEN>,
+        input: &SymbolicInvariantCandidateInput<'_>,
         candidates: &mut Vec<SymbolicInvariantCandidate>,
         limitation: &mut Option<SymbolicInvariantSearchLimitation>,
     ) -> Result<(), SymbolicError> {
@@ -100,7 +115,7 @@ impl SymbolicExecutor {
             input.handler_sender,
             input.ffi_enabled,
         );
-        initial_state.apply_executor_env(&mut self.cx, input.executor);
+        initial_state.apply_executor_env(&mut self.cx, &input.executor);
         initial_state.world.set_storage_layout(self.config.storage_layout);
 
         let calldatas = SymbolicCalldata::variants_with_prefix(
@@ -121,7 +136,7 @@ impl SymbolicExecutor {
             let call_data = step.calldata.call_data(&mut self.cx);
             let constraints = step.calldata.constraints().to_vec();
             let mut handler = match self.prepare_sequence_call(
-                input.executor,
+                &input.executor,
                 initial_state.clone(),
                 input.target.address,
                 input.handler_sender,
@@ -140,7 +155,7 @@ impl SymbolicExecutor {
             let mut stop_after_handler = false;
             loop {
                 let outcome = match self.execute_sequence_call_next(
-                    input.executor,
+                    &input.executor,
                     &mut handler,
                     &mut completed_paths,
                 ) {
@@ -158,7 +173,7 @@ impl SymbolicExecutor {
                 for (invariant_idx, invariant) in input.invariants.iter().enumerate() {
                     self.check_timeout()?;
                     let mut predicate = match self.prepare_invariant_call(
-                        input.executor,
+                        &input.executor,
                         handler_state.clone(),
                         input.invariant_address,
                         CALLER,
@@ -175,8 +190,8 @@ impl SymbolicExecutor {
                     let mut stop_after_predicate = false;
                     let mut candidate_states = Vec::new();
                     loop {
-                        let predicate_outcome = match self.execute_sequence_call_next(
-                            input.executor,
+                        let mut predicate_outcome = match self.execute_sequence_call_next(
+                            &input.executor,
                             &mut predicate,
                             &mut completed_paths,
                         ) {
@@ -197,12 +212,12 @@ impl SymbolicExecutor {
                         };
 
                         // Concrete invariant checks do not commit predicate state before invoking
-                        // `afterInvariant`. Retain its path constraints while restoring the
+                        // `afterInvariant`. Retain the predicate's path state while restoring the
                         // unchanged post-handler world.
                         let mut after_state = handler_state.clone();
-                        after_state.constraints = predicate_outcome.state.constraints;
+                        after_state.take_noncommitting_check_state(&mut predicate_outcome.state);
                         let mut after = match self.prepare_invariant_call(
-                            input.executor,
+                            &input.executor,
                             after_state,
                             input.invariant_address,
                             CALLER,
@@ -219,7 +234,7 @@ impl SymbolicExecutor {
                         };
                         loop {
                             match self.execute_sequence_call_next(
-                                input.executor,
+                                &input.executor,
                                 &mut after,
                                 &mut completed_paths,
                             ) {
@@ -274,9 +289,9 @@ impl SymbolicExecutor {
     }
 
     #[expect(clippy::too_many_arguments)]
-    pub(super) fn prepare_sequence_call<FEN: FoundryEvmNetwork>(
+    pub(super) fn prepare_sequence_call(
         &mut self,
-        executor: &Executor<FEN>,
+        executor: &ExecutorView<'_>,
         mut state: PathState,
         target: Address,
         sender: Address,
@@ -301,9 +316,9 @@ impl SymbolicExecutor {
         })
     }
 
-    pub(super) fn execute_sequence_call_next<FEN: FoundryEvmNetwork>(
+    pub(super) fn execute_sequence_call_next(
         &mut self,
-        executor: &Executor<FEN>,
+        executor: &ExecutorView<'_>,
         call: &mut SequenceCall,
         completed_paths: &mut usize,
     ) -> Result<Option<CallOutcome>, SymbolicError> {

@@ -8,6 +8,7 @@ use foundry_config::{
     cache::StorageCachingConfig, fs_permissions::FsAccessKind,
 };
 use foundry_evm_core::opts::EvmOpts;
+use foundry_evm_traces::identifier::ExternalIdentifierConfig;
 use std::{
     path::{Path, PathBuf},
     time::Duration,
@@ -57,6 +58,12 @@ pub struct CheatsConfig {
     /// Artifacts used to resolve cheatcode artifact references.
     /// Unlike `available_artifacts`, this is retained when artifact safety checks are disabled.
     pub artifact_lookup: Option<ContractsByArtifact>,
+    /// Whether to decode the storage layouts of contracts outside the local project in state
+    /// diffs, by fetching their verified source code from a block explorer.
+    pub decode_external_storage: bool,
+    /// Settings for looking contracts up on block explorers, resolved lazily against the chain a
+    /// test is running on: a `vm.createSelectFork` can change it after this config was built.
+    pub external_sources: ExternalIdentifierConfig,
     /// Currently running artifact.
     pub running_artifact: Option<ArtifactId>,
     /// Whether to enable legacy (non-reverting) assertions.
@@ -105,6 +112,8 @@ impl CheatsConfig {
             labels,
             available_artifacts,
             artifact_lookup,
+            decode_external_storage: config.decode_external_storage,
+            external_sources: ExternalIdentifierConfig::new(config),
             running_artifact,
             assertions_revert: config.assertions_revert,
             seed: config.fuzz.seed,
@@ -198,7 +207,12 @@ impl CheatsConfig {
     ///  - Returns an error if `url_or_alias` is a known alias but references an unresolved env var.
     ///  - Returns an error if `url_or_alias` is not an alias but does not start with a `http` or
     ///    `ws` `scheme` and is not a path to an existing file
+    ///  - Returns an error if network access is disabled.
     pub fn rpc_endpoint(&self, url_or_alias: &str) -> Result<ResolvedRpcEndpoint> {
+        // Every cheatcode that opens a connection to a URL or alias resolves it here.
+        if self.evm_opts.no_network {
+            return Err(fmt_err!("network access is disabled"));
+        }
         if let Some(endpoint) = self.rpc_endpoints.get(url_or_alias) {
             Ok(endpoint.clone().try_resolve())
         } else if let Some(builtin_url) = foundry_config::builtin_rpc_url(url_or_alias) {
@@ -250,6 +264,8 @@ impl Default for CheatsConfig {
             labels: Default::default(),
             available_artifacts: Default::default(),
             artifact_lookup: Default::default(),
+            decode_external_storage: false,
+            external_sources: Default::default(),
             running_artifact: Default::default(),
             assertions_revert: true,
             seed: None,
@@ -278,8 +294,9 @@ fn canonicalize_existing_ancestor(path: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
-    use alloy_primitives::address;
+    use alloy_primitives::Address;
     use foundry_config::fs_permissions::PathPermission;
     use tempfile::TempDir;
 
@@ -352,7 +369,7 @@ mod tests {
 
     #[test]
     fn tracing_labels_override_legacy_labels() {
-        let address = address!("0x0000000000000000000000000000000000000001");
+        let address = Address::with_last_byte(1);
         let mut config = Config::default();
         config.labels.insert(address, "legacy".to_string());
         config.tracing.labels.insert(address, "canonical".to_string());

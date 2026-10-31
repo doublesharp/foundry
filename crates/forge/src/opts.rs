@@ -1,9 +1,10 @@
 use crate::cmd::{
     bind::BindArgs, bind_json, build::BuildArgs, cache::CacheArgs, clone::CloneArgs,
-    compiler::CompilerArgs, config, coverage, create::CreateArgs, doc::DocArgs, eip712, flatten,
-    fmt::FmtArgs, fuzz::FuzzArgs, geiger, init::InitArgs, inspect, install::InstallArgs,
-    lint::LintArgs, lsp::LspArgs, reinit::ReinitArgs, remappings::RemappingArgs,
-    remove::RemoveArgs, selectors::SelectorsSubcommands, snapshot, soldeer, test, tree, update,
+    compiler::CompilerArgs, config, coverage, create::CreateArgs, doc::DocArgs, eip712, exploit,
+    flatten, fmt::FmtArgs, fuzz::FuzzArgs, geiger, init::InitArgs, inspect, install::InstallArgs,
+    lint::LintArgs, lsp::LspArgs, properties::PropertiesArgs, reinit::ReinitArgs,
+    remappings::RemappingArgs, remove::RemoveArgs, selectors::SelectorsSubcommands, snapshot,
+    soldeer, test, tree, update,
 };
 use clap::{Parser, Subcommand, ValueHint};
 use forge_script::ScriptArgs;
@@ -43,6 +44,14 @@ pub enum ForgeSubcommand {
 
     /// Run and manage Forge fuzzing corpora.
     Fuzz(FuzzArgs),
+
+    /// Run agents that prove bugs with failing tests and report the bugs that they agree on
+    ///
+    /// Examples:
+    /// - forge properties --target src/A.sol --agent-command ./agent.sh --seed 1 --seed 2
+    /// - forge properties --context docs/spec.md --agent-command ./agent.sh --seed 1 --seed 2
+    #[command(verbatim_doc_comment)]
+    Properties(PropertiesArgs),
 
     /// Run a smart contract as a script, building transactions that can be sent onchain
     ///
@@ -195,7 +204,7 @@ pub enum ForgeSubcommand {
     #[command(visible_alias = "l")]
     Lint(LintArgs),
 
-    /// Start the Solar language server.
+    /// Open Solidity in VS Code or start the language server.
     Lsp(LspArgs),
 
     /// Get specialized information about a smart contract
@@ -218,6 +227,14 @@ pub enum ForgeSubcommand {
 
     /// Generate documentation for the project.
     Doc(DocArgs),
+
+    /// Ask a model on the Tempo Gateway to find a bug in a contract and prove it with a test.
+    ///
+    /// Examples:
+    /// - forge exploit --target src/Vault.sol
+    /// - forge exploit --target src/Vault.sol --context docs/spec.md --attempts 5
+    #[command(verbatim_doc_comment)]
+    Exploit(exploit::ExploitArgs),
 
     /// Function selector utilities.
     #[command(visible_alias = "se")]
@@ -256,5 +273,37 @@ mod tests {
             panic!("expected lsp subcommand");
         };
         assert!(args.stdio);
+    }
+
+    #[test]
+    fn parse_lsp_editor_args() {
+        let args = Forge::try_parse_from([
+            "forge",
+            "lsp",
+            "--vscode",
+            "--code-path",
+            "code-insiders",
+            "project",
+        ])
+        .unwrap();
+        let ForgeSubcommand::Lsp(args) = args.cmd else {
+            panic!("expected lsp subcommand");
+        };
+        assert!(!args.stdio);
+        assert!(args.vscode);
+        assert_eq!(args.path, Some(PathBuf::from("project")));
+        assert_eq!(args.code_path, Some(PathBuf::from("code-insiders")));
+    }
+
+    #[test]
+    fn lsp_stdio_conflicts_with_editor_args() {
+        for options in [&["--vscode"][..], &["--code-path", "code"], &["project"]] {
+            let error = Forge::try_parse_from(
+                ["forge", "lsp", "--stdio"].into_iter().chain(options.iter().copied()),
+            )
+            .err()
+            .expect("stdio must reject editor launch options");
+            assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+        }
     }
 }

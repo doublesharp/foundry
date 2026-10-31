@@ -1,6 +1,7 @@
 use serde_json::Value;
 
-forgetest!(json_and_lcov_reports_do_not_overwrite_each_other, |prj, cmd| {
+#[forgetest]
+fn json_and_lcov_reports_do_not_overwrite_each_other(prj: _, cmd: _) {
     prj.add_source(
         "Target.sol",
         "contract Target { function value() external pure returns (uint256) { return 42; } }",
@@ -24,9 +25,10 @@ contract TargetTest {
     let lcov = std::fs::read_to_string(prj.root().join("lcov.info")).unwrap();
     assert!(lcov.lines().any(|line| line == "SF:src/Target.sol"));
     assert!(!prj.root().join("combined.out").exists());
-});
+}
 
-forgetest!(instrumented_attribution_tracks_each_test, |prj, cmd| {
+#[forgetest]
+fn instrumented_attribution_tracks_each_test(prj: _, cmd: _) {
     prj.add_source(
         "Target.sol",
         r#"
@@ -69,9 +71,10 @@ contract TargetTest {
             name => panic!("unexpected test {name}"),
         }
     }
-});
+}
 
-forgetest!(instrumented_preserves_expected_revert_return_data, |prj, cmd| {
+#[forgetest]
+fn instrumented_preserves_expected_revert_return_data(prj: _, cmd: _) {
     prj.add_test(
         "Returndata.t.sol",
         r#"
@@ -94,4 +97,4 @@ contract ReturndataTest {
     );
     cmd.arg("test").assert_success();
     cmd.forge_fuse().args(["coverage", "--instrumented"]).assert_success();
-});
+}

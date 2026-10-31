@@ -54,13 +54,11 @@ impl<CTX> Inspector<CTX> for LineCoverageCollector {
         if let Some((call, with_value)) = call {
             map.call(call, with_value);
         }
-        // Reserve some space early to avoid reallocating too often.
-        map.reserve(8192.min(interpreter.bytecode.len()));
     }
 
     fn step(&mut self, interpreter: &mut Interpreter, _context: &mut CTX) {
-        let map = self.get_or_insert_map(interpreter);
-        map.hit(interpreter.bytecode.pc() as u32);
+        let pc = interpreter.bytecode.pc();
+        self.get_or_insert_map(interpreter).record(pc);
     }
 
     fn create_end(
@@ -79,7 +77,8 @@ impl<CTX> Inspector<CTX> for LineCoverageCollector {
 
 impl LineCoverageCollector {
     /// Finish collecting coverage information and return the [`HitMaps`].
-    pub fn finish(self) -> HitMaps {
+    pub fn finish(mut self) -> HitMaps {
+        self.maps.values_mut().for_each(HitMap::flush);
         self.maps
     }
 
