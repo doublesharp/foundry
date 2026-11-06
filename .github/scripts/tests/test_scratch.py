@@ -15,6 +15,10 @@ SCRIPT = Path(__file__).parents[1] / "scratch.py"
 
 class ScratchTests(unittest.TestCase):
     def setUp(self):
+        environment = patch.dict(os.environ)
+        environment.start()
+        self.addCleanup(environment.stop)
+        os.environ.pop("CARGO_INCREMENTAL", None)
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.base = Path(self.temp.name).resolve()

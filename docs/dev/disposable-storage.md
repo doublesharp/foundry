@@ -60,7 +60,7 @@ python3 .github/scripts/scratch.py run sccache --show-stats
 
 ## CI caches
 
-The `forge-ds` release workflow uses `Swatinem/rust-cache` to persist compiled Rust
+The `forgeds` release workflow uses `Swatinem/rust-cache` to persist compiled Rust
 dependencies per target. Tag builds dispatch onto the same branch so subsequent
 builds can restore its caches. GitHub Actions caches are scoped by branch; they do
 not share this machine's sccache. Other inherited CI jobs also use sccache.

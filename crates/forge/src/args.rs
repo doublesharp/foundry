@@ -1,6 +1,6 @@
 use crate::{
     cmd::{cache::CacheSubcommands, watch},
-    opts::{Forge, ForgeSubcommand},
+    opts::{Forge, ForgeSubcommand, command_name},
 };
 use clap::{CommandFactory, Parser};
 use clap_complete::generate;
@@ -106,7 +106,7 @@ pub fn run_command(args: Forge) -> Result<()> {
         ForgeSubcommand::Remappings(cmd) => cmd.run(),
         ForgeSubcommand::Init(cmd) => global.block_on(cmd.run()),
         ForgeSubcommand::Completions { shell } => {
-            generate(shell, &mut Forge::command(), "forge", &mut std::io::stdout());
+            generate(shell, &mut Forge::command(), command_name(), &mut std::io::stdout());
             Ok(())
         }
         ForgeSubcommand::Clean { root } => {

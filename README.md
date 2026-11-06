@@ -1,3 +1,10 @@
+# forgeds
+
+Doublesharp's Foundry fork, focused on faster local development and CI.
+[Download forgeds](https://github.com/doublesharp/foundry/releases/tag/forgeds).
+
+The upstream Foundry documentation follows.
+
 <div align="center">
   <img src=".github/assets/banner.png" alt="Foundry banner" />
 

@@ -317,9 +317,9 @@ exclude = []
 
 "#;
 
-#[cfg(feature = "forge-ds")]
+#[cfg(feature = "forgeds")]
 #[forgetest]
-fn forge_ds_binary_defaults_are_isolated_and_overridable(prj: _, cmd: _) {
+fn forgeds_binary_defaults_are_isolated_and_overridable(prj: _, cmd: _) {
     fn config_value(
         cmd: &mut TestCommand,
         root: &Path,
@@ -353,11 +353,11 @@ fn forge_ds_binary_defaults_are_isolated_and_overridable(prj: _, cmd: _) {
 
     let root = prj.root().to_path_buf();
     let forge = Path::new(env!("CARGO_BIN_EXE_forge"));
-    let forge_ds = Path::new(env!("CARGO_BIN_EXE_forge-ds"));
+    let forgeds = Path::new(env!("CARGO_BIN_EXE_forgeds"));
     assert_eq!(config_paths(&mut cmd, &root, forge, &[], &[]), ("out".into(), "cache".into()));
     assert_eq!(
-        config_paths(&mut cmd, &root, forge_ds, &[], &[]),
-        ("forge-ds-out".into(), "forge-ds-cache".into())
+        config_paths(&mut cmd, &root, forgeds, &[], &[]),
+        ("forgeds-out".into(), "forgeds-cache".into())
     );
 
     fs::remove_dir(prj.root().join("out")).unwrap();
@@ -366,9 +366,9 @@ fn forge_ds_binary_defaults_are_isolated_and_overridable(prj: _, cmd: _) {
         config_paths(&mut cmd, &root, forge, &[], &[]),
         ("artifacts".into(), "cache".into())
     );
-    let config = config_value(&mut cmd, &root, forge_ds, &[], &[]);
-    assert_eq!(paths_from_value(&config), ("forge-ds-out".into(), "forge-ds-cache".into()));
-    assert_eq!(config["fs_permissions"][0]["path"], "forge-ds-out");
+    let config = config_value(&mut cmd, &root, forgeds, &[], &[]);
+    assert_eq!(paths_from_value(&config), ("forgeds-out".into(), "forgeds-cache".into()));
+    assert_eq!(config["fs_permissions"][0]["path"], "forgeds-out");
     fs::remove_dir(prj.root().join("artifacts")).unwrap();
 
     prj.create_file(
@@ -387,12 +387,12 @@ cache_path = "profile-cache"
         ("toml-out".into(), "toml-cache".into())
     );
     assert_eq!(
-        config_paths(&mut cmd, &root, forge_ds, &[], &[]),
-        ("forge-ds-out".into(), "forge-ds-cache".into())
+        config_paths(&mut cmd, &root, forgeds, &[], &[]),
+        ("forgeds-out".into(), "forgeds-cache".into())
     );
     assert_eq!(
-        config_paths(&mut cmd, &root, forge_ds, &[], &[("FOUNDRY_PROFILE", "custom")],),
-        ("forge-ds-out".into(), "forge-ds-cache".into())
+        config_paths(&mut cmd, &root, forgeds, &[], &[("FOUNDRY_PROFILE", "custom")],),
+        ("forgeds-out".into(), "forgeds-cache".into())
     );
     fs::remove_file(prj.root().join(Config::FILE_NAME)).unwrap();
 
@@ -412,8 +412,8 @@ cache_path = "profile-cache"
             ("global-out".into(), "global-cache".into())
         );
         assert_eq!(
-            config_paths(&mut cmd, &root, forge_ds, &[], home_env),
-            ("forge-ds-out".into(), "forge-ds-cache".into())
+            config_paths(&mut cmd, &root, forgeds, &[], home_env),
+            ("forgeds-out".into(), "forgeds-cache".into())
         );
     }
 
@@ -421,7 +421,7 @@ cache_path = "profile-cache"
         config_paths(
             &mut cmd,
             &root,
-            forge_ds,
+            forgeds,
             &[],
             &[("DAPP_OUT", "dapp-out"), ("DAPP_CACHE_PATH", "dapp-cache")],
         ),
@@ -432,7 +432,7 @@ cache_path = "profile-cache"
         config_paths(
             &mut cmd,
             &root,
-            forge_ds,
+            forgeds,
             &[],
             &[("FOUNDRY_OUT", "env-out"), ("FOUNDRY_CACHE_PATH", "env-cache")],
         ),
@@ -443,7 +443,7 @@ cache_path = "profile-cache"
         config_paths(
             &mut cmd,
             &root,
-            forge_ds,
+            forgeds,
             &["--out", "cli-out", "--cache-path", "cli-cache"],
             &[],
         ),

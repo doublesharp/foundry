@@ -16,7 +16,7 @@ use std::path::PathBuf;
 /// Build, test, fuzz, debug and deploy Solidity contracts.
 #[derive(Parser)]
 #[command(
-    name = "forge",
+    name = command_name(),
     version = SHORT_VERSION,
     long_version = LONG_VERSION,
     after_help = "Find more information in the book: https://getfoundry.sh/forge/overview",
@@ -254,6 +254,19 @@ pub enum ForgeSubcommand {
 
     /// Generate bindings for serialization/deserialization of project structs via JSON cheatcodes.
     BindJson(bind_json::BindJsonArgs),
+}
+
+/// Name of the invoked Forge executable, including the Doublesharp fork.
+pub(crate) fn command_name() -> &'static str {
+    if std::env::args_os()
+        .next()
+        .and_then(|path| PathBuf::from(path).file_stem().map(|stem| stem == "forgeds"))
+        .unwrap_or(false)
+    {
+        "forgeds"
+    } else {
+        "forge"
+    }
 }
 
 #[cfg(test)]
