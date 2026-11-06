@@ -48,6 +48,8 @@ use forking must contain `fork` in their name. Forge and Cast CLI tests live und
   state lifecycles, tool dispatch, and CI coverage.
 - [Output channels](./output-channels.md) defines the stdout/stderr contract for Foundry commands.
 - [Scripting](./scripting.md) documents the internal script execution and broadcast pipeline.
+- [Solidity compiler caching](./solidity-compiler-cache.md) describes cross-worktree reuse and
+  the optional sccache storage integration.
 - [Showmap corpus replay](./showmap.md) documents the persisted-corpus coverage workflow and file
   format.
 

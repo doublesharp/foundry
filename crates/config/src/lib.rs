@@ -19,7 +19,8 @@ use figment::{
 use filter::GlobMatcher;
 use foundry_compilers::{
     ArtifactOutput, ConfigurableArtifacts, Graph, LocalCompilerOutputCache, Project,
-    ProjectBuilder, ProjectPathsConfig, RestrictionsWithVersion, VyperLanguage,
+    ProjectBuilder, ProjectPathsConfig, RestrictionsWithVersion, SccacheCompilerOutputCache,
+    VyperLanguage,
     artifacts::{
         BytecodeHash, Contract, DebuggingSettings, EvmVersion, Libraries, ModelCheckerSettings,
         ModelCheckerTarget, Optimizer, OptimizerDetails, RevertStrings, Settings, SettingsMetadata,
@@ -1539,9 +1540,14 @@ impl Config {
                     && !self.force
                     && let Some(cache_dir) = Self::foundry_compiler_cache_dir()
                 {
-                    compiler.set_compiler_output_cache(Arc::new(LocalCompilerOutputCache::new(
-                        cache_dir,
-                    )));
+                    let local = LocalCompilerOutputCache::new(cache_dir);
+                    if std::env::var("FORGEDS_SCCACHE").as_deref() == Ok("1") {
+                        compiler.set_compiler_output_cache(Arc::new(
+                            SccacheCompilerOutputCache::new(local),
+                        ));
+                    } else {
+                        compiler.set_compiler_output_cache(Arc::new(local));
+                    }
                 }
                 Ok(compiler)
             },
