@@ -274,7 +274,7 @@ impl BenchmarkProject {
     /// * `--shell=bash` - Use bash for shell command execution
     /// * `--show-output` - Show command output (when verbose)
     #[allow(clippy::too_many_arguments)]
-    fn hyperfine(
+    pub fn hyperfine(
         &self,
         benchmark_name: &str,
         version: &str,
