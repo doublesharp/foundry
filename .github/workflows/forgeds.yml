@@ -114,7 +114,7 @@ jobs:
             target: aarch64-unknown-linux-gnu
             platform: linux
             arch: arm64
-          - runner: macos-14
+          - runner: macos-15
             target: aarch64-apple-darwin
             platform: darwin
             arch: arm64
