@@ -36,6 +36,7 @@ use forking must contain `fork` in their name. Forge and Cast CLI tests live und
 
 ## Maintained guides
 
+- [Disposable build storage](./disposable-storage.md) configures a local directory for build outputs and temporary files.
 - [Cheatcodes](./cheatcodes.md) explains cheatcode generation, dispatch, and implementation.
 - [Debugging](./debugging.md) collects contributor debugging techniques.
 - [Editor integrations](../../editors/README.md) covers the VS Code Development Host,

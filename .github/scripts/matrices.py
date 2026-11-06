@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import hashlib
 import json
 import os
 
@@ -42,6 +43,7 @@ class Case:
 # GHA matrix entry
 class Expanded:
     name: str
+    cache_key: str
     runner_label: str
     target: str
     svm_target_platform: str
@@ -52,6 +54,7 @@ class Expanded:
     def __init__(
         self,
         name: str,
+        cache_key: str,
         runner_label: str,
         target: str,
         svm_target_platform: str,
@@ -60,6 +63,7 @@ class Expanded:
         partition: int,
     ):
         self.name = name
+        self.cache_key = cache_key
         self.runner_label = runner_label
         self.target = target
         self.svm_target_platform = svm_target_platform
@@ -100,11 +104,13 @@ config = [
 
 def main():
     expanded = []
+    profile = os.environ.get("PROFILE", "default")
     for target in targets:
         for case in config:
             if is_pr and (not case.pr_cross_platform and target != t_linux_x86):
                 continue
 
+            filter_hash = hashlib.sha256(case.filter.encode()).hexdigest()[:12]
             for partition in range(1, case.n_partitions + 1):
                 os_str = ""
                 if len(targets) > 1:
@@ -121,6 +127,11 @@ def main():
 
                 obj = Expanded(
                     name=name,
+                    # Display names differ between PRs and pushes; cache identities must not.
+                    cache_key=(
+                        f"{target.target}-{profile}-{case.name}-{filter_hash}-"
+                        f"{partition}-of-{case.n_partitions}"
+                    ),
                     runner_label=target.runner_label,
                     target=target.target,
                     svm_target_platform=target.svm_target_platform,

@@ -1,5 +1,6 @@
 .DS_STORE
 /target*
+/.cargo/scratch.local.toml
 /*.sol
 CLAUDE.md
 

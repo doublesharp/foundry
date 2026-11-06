@@ -1,3 +1,5 @@
+include = [{ path = "scratch.local.toml", optional = true }]
+
 [alias]
 cheats = "test -p foundry-cheatcodes-spec --features schema tests::"
 test-debugger = "test -p forge --test cli manual_debug_setup -- --include-ignored --nocapture"
