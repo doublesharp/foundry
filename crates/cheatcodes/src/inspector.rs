@@ -703,7 +703,7 @@ pub struct Cheatcodes<FEN: FoundryEvmNetwork = EthEvmNetwork> {
     /// payloads, so user-crafted `FOUNDRY::SKIP` revert data never skips a test on its own.
     pub skip_payloads: Vec<Bytes>,
 
-    /// All recorded ETH `deal`s.
+    /// ETH `deal`s recorded in the current root transaction, rolled back if it fails.
     pub eth_deals: Vec<DealRecord>,
 
     /// Gas metering state.
@@ -1214,6 +1214,13 @@ impl<FEN: FoundryEvmNetwork> Cheatcodes<FEN> {
                 ecx.tx_mut().set_tx_type(TransactionType::Eip2930 as u8);
             }
         }
+    }
+
+    /// Called at the start of a root frame to clear the records of the previous transaction.
+    pub fn on_root_frame_start(&mut self) {
+        self.clear_storage_hook_mapping_slots();
+        // Deals belong to earlier root transactions and must not be rolled back if this one fails.
+        self.eth_deals.clear();
     }
 
     /// Called when there was a revert.
@@ -1746,10 +1753,7 @@ impl<FEN: FoundryEvmNetwork> Cheatcodes<FEN> {
 
     /// Whether the given address has arbitrary storage.
     pub fn has_arbitrary_storage(&self, address: &Address) -> bool {
-        match &self.core.arbitrary_storage {
-            Some(storage) => storage.values.contains_key(address),
-            None => false,
-        }
+        self.core.arbitrary_storage.as_ref().is_some_and(|s| s.values.contains_key(address))
     }
 
     /// Whether the given slot of address with arbitrary storage should be overwritten.
@@ -1760,25 +1764,19 @@ impl<FEN: FoundryEvmNetwork> Cheatcodes<FEN> {
         address: &Address,
         storage_slot: U256,
     ) -> bool {
-        match &self.core.arbitrary_storage {
-            Some(storage) => {
-                storage.overwrites.contains(address)
-                    && storage
-                        .values
-                        .get(address)
-                        .and_then(|arbitrary_values| arbitrary_values.get(&storage_slot))
-                        .is_none()
-            }
-            None => false,
-        }
+        self.core.arbitrary_storage.as_ref().is_some_and(|storage| {
+            storage.overwrites.contains(address)
+                && storage
+                    .values
+                    .get(address)
+                    .and_then(|arbitrary_values| arbitrary_values.get(&storage_slot))
+                    .is_none()
+        })
     }
 
     /// Whether the given address is a copy of an address with arbitrary storage.
     pub fn is_arbitrary_storage_copy(&self, address: &Address) -> bool {
-        match &self.core.arbitrary_storage {
-            Some(storage) => storage.copies.contains_key(address),
-            None => false,
-        }
+        self.core.arbitrary_storage.as_ref().is_some_and(|s| s.copies.contains_key(address))
     }
 
     /// Registers an SLOAD callback, replacing the existing callback for `target`.
@@ -1913,7 +1911,7 @@ impl<FEN: FoundryEvmNetwork> Cheatcodes<FEN> {
     }
 
     #[inline(always)]
-    pub fn has_step_end_hooks(&self) -> bool {
+    pub const fn has_step_end_hooks(&self) -> bool {
         self.gas_metering.paused
             || self.gas_metering.touched
             || self.core.arbitrary_storage.is_some()
@@ -1942,7 +1940,7 @@ impl<FEN: FoundryEvmNetwork> Cheatcodes<FEN> {
     }
 
     #[inline(always)]
-    fn has_active_env_overrides(&self) -> bool {
+    const fn has_active_env_overrides(&self) -> bool {
         self.env_overrides.is_any_set()
     }
 }
@@ -2802,8 +2800,9 @@ impl<FEN: FoundryEvmNetwork> Inspector<FoundryContextFor<'_, FEN>> for Cheatcode
             merge_recorded_frame(recorded_account_diffs_stack, last_depth);
         }
 
-        // Match the create against expected_creates
+        // Match successful creates against expected_creates; a failed create deploys nothing.
         if !self.expected_creates.is_empty()
+            && outcome.result.is_ok()
             && let (Some(address), Some(call)) = (outcome.address, call)
             && let Ok(created_acc) = ecx.journal_mut().load_account(address)
         {

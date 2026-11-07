@@ -28,6 +28,7 @@ use foundry_config::{Config, DenyLevel, impl_figment_convert};
 use foundry_evm::fuzz::CounterExample;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use solar::parse::Cursor;
 use std::{
     cmp::Reverse,
     collections::{BTreeMap, BTreeSet, HashSet},
@@ -60,6 +61,20 @@ mod matcher;
 /// of independent agents rarely repeat.
 const DEFAULT_AGENTS: usize = 4;
 const DEFAULT_QUORUM: usize = 2;
+/// The focus of each agent without `--focus`, by agent number, wrapping: the four strategy lanes
+/// of ultrafuzz's smoke benchmark (MIT). On an audited vault, five runs of four agents with these
+/// focuses found 3.6 distinct real bugs per run against 2.2 without, at a lower cost and with
+/// the same hit rate on the audit's findings.
+const DEFAULT_FOCUSES: [&str; 4] = [
+    "block and time transitions, accrual, vesting, auctions, deadlines, stale snapshots, and \
+     sequences whose result depends on elapsed time.",
+    "stale, reverting, zero, extreme, or adversarial oracle, strategy, pool, token, gauge, hook, \
+     and callback values.",
+    "cached or stored balances, donations, fees, rewards, bad debt, utilization, exchange rates, \
+     and state that can diverge from live balances.",
+    "agreement of max, preview, and view functions before, during, and after lifecycle \
+     transitions, especially empty, paused, removed, nested, and terminal states.",
+];
 /// How often Forge checks whether an agent session with a timeout has exited. Sessions take
 /// minutes, so this adds no noticeable delay.
 const SESSION_POLL: Duration = Duration::from_millis(100);
@@ -148,6 +163,7 @@ pub struct PropertiesArgs {
     /// FORGE_PROPERTIES_CONTEXT  absolute paths of the --context files, one per line
     /// FORGE_PROPERTIES_OUT      absolute, empty directory for the agent's tests
     /// FORGE_PROPERTIES_SEED     the agent's own seed, in hex
+    /// FORGE_PROPERTIES_FOCUS    the agent's focus, as in the task; empty with --no-focus
     /// FORGE_PROPERTIES_USAGE    file where the agent can write its model usage as JSON:
     ///                           {"input_tokens": N, "output_tokens": N, "cost_usd": X}
     ///
@@ -204,6 +220,19 @@ pub struct PropertiesArgs {
     /// copy of the project, with its own seed.
     #[arg(long, default_value_t = DEFAULT_AGENTS, value_name = "N")]
     agents: usize,
+
+    /// An area for one agent to search first. Agent N gets the Nth focus, wrapping. Can be given
+    /// more than once.
+    ///
+    /// Without it, agents get built-in focuses: time and sequence effects, external dependency
+    /// boundaries, stored state against live balances, and limit and view functions across
+    /// lifecycle states.
+    #[arg(long, value_name = "TEXT")]
+    focus: Vec<String>,
+
+    /// Give every agent the same task, without a focus.
+    #[arg(long, conflicts_with = "focus")]
+    no_focus: bool,
 
     /// Number of agents that must report the same root cause before Forge reports it as a
     /// possible bug.
@@ -479,8 +508,10 @@ impl PropertiesArgs {
         ensure_inside(&config.root, &generated_dir, &generated_tests)?;
         fs::create_dir_all(&generated_dir)
             .wrap_err_with(|| format!("failed to create {}", generated_dir.display()))?;
+        let properties_cache = config.cache_path.join("properties");
+        fs::create_dir_all(&properties_cache)?;
         let mut run = 1;
-        let run_dirs = loop {
+        let (run_dirs, cache_root) = loop {
             let mut dirs = RunDirs(Vec::new());
             for id in 1..=self.agents {
                 let dir = generated_dir.join(format!("run-{run}-agent-{id}"));
@@ -494,11 +525,20 @@ impl PropertiesArgs {
                 }
             }
             if dirs.0.len() == self.agents {
-                break dirs;
+                // Empty generated directories are removed on drop, but campaign caches remain.
+                // Reserve the cache too, so a later run never reads an earlier run's outputs.
+                let cache = properties_cache.join(format!("run-{run}"));
+                match fs::create_dir(&cache) {
+                    Ok(()) => break (dirs, cache),
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                    Err(error) => {
+                        return Err(error)
+                            .wrap_err_with(|| format!("failed to create {}", cache.display()));
+                    }
+                }
             }
             run += 1;
         };
-        let cache_root = config.cache_path.join("properties");
         let verifier_command = self
             .verifier_command
             .as_ref()
@@ -607,10 +647,6 @@ impl Campaign<'_> {
             self.args.target.clone()
         };
         let inputs = AgentInputs { agent_command, targets, context };
-        // The prompts, logs, usage, verdicts, and test copies of an earlier run go.
-        if self.cache_root.exists() {
-            fs::remove_dir_all(&self.cache_root)?;
-        }
         // Agents work in copies of the project, but the copies link the entries of dependency
         // directories. A shared file that changes while they run taints the run.
         let fingerprint = project_fingerprint(self.config, &self.sandbox.dependencies());
@@ -721,12 +757,11 @@ impl Campaign<'_> {
         // unless a written file of its agent imports it or it imports one, so every written test
         // compiles against the files that it ran with. Nothing is kept when files that the
         // workspaces share with the project changed while the agents ran.
-        let normalize =
-            |content: &str| COMMENT.replace_all(content, "").split_whitespace().collect::<String>();
-        let mut seen = collect_tests(&self.config.root, &self.generated_tests, 0, &mut vec![])
-            .unwrap_or_default()
+        let existing = collect_tests(&self.config.root, &self.generated_tests, 0, &mut vec![])
+            .unwrap_or_default();
+        let mut seen = existing
             .iter()
-            .map(|file| normalize(&file.content))
+            .map(|file| normalize_test_content(&file.content))
             .collect::<HashSet<_>>();
         let mut held_back = Vec::new();
         let mut kept = Vec::new();
@@ -749,8 +784,10 @@ impl Campaign<'_> {
             let imports = |file: &TestFile, other: &TestFile| {
                 session.imports.get(&file.path).is_some_and(|i| i.contains(&other.path))
             };
-            let mut write =
-                files.iter().map(|file| seen.insert(normalize(&file.content))).collect::<Vec<_>>();
+            let mut write = files
+                .iter()
+                .map(|file| seen.insert(normalize_test_content(&file.content)))
+                .collect::<Vec<_>>();
             while let Some(index) = (0..files.len()).find(|&i| {
                 !write[i]
                     && files.iter().zip(&write).any(|(other, written)| {
@@ -839,7 +876,14 @@ impl Campaign<'_> {
             "duplicates": duplicates,
             "usage": usage,
         });
-        fs::write(&report_path, serde_json::to_vec_pretty(&report)?)?;
+        let report_bytes = serde_json::to_vec_pretty(&report)?;
+        fs::write(&report_path, &report_bytes)?;
+        // Publish the convenience copy atomically: concurrent campaigns must not interleave
+        // writes into one report. Each campaign also keeps its own copy under `run-<n>/`.
+        let properties_root = self.cache_root.parent().expect("campaign cache has a parent");
+        let mut latest = tempfile::NamedTempFile::new_in(properties_root)?;
+        latest.write_all(&report_bytes)?;
+        latest.persist(properties_root.join("report.json")).map_err(|error| error.error)?;
 
         // Agents can reach the project's dependencies through their copies, so a change can come
         // from an agent, and no result of the run can be trusted.
@@ -886,8 +930,18 @@ impl Campaign<'_> {
         let out_dir = workspace.path().join(&out);
         ensure_inside(workspace.path(), &out_dir, &out)?;
         fs::create_dir_all(&out_dir)?;
+        let focus = (!args.no_focus).then(|| {
+            if args.focus.is_empty() {
+                DEFAULT_FOCUSES[(id - 1) % DEFAULT_FOCUSES.len()].to_owned()
+            } else {
+                args.focus[(id - 1) % args.focus.len()].clone()
+            }
+        });
         let prompt = cache.join("prompt.md");
-        fs::write(&prompt, session_prompt(&inputs.targets, &inputs.context, &out_dir))?;
+        fs::write(
+            &prompt,
+            session_prompt(&inputs.targets, &inputs.context, &out_dir, focus.as_deref()),
+        )?;
         let usage_path = cache.join("usage.json");
         let log_path = cache.join("agent.log");
         let log = fs::File::create(&log_path)?;
@@ -908,6 +962,7 @@ impl Campaign<'_> {
             .env("FORGE_PROPERTIES_CONTEXT", lines(&inputs.context))
             .env("FORGE_PROPERTIES_OUT", &out_dir)
             .env("FORGE_PROPERTIES_SEED", format!("{seed:#x}"))
+            .env("FORGE_PROPERTIES_FOCUS", focus.unwrap_or_default())
             .env("FORGE_PROPERTIES_USAGE", &usage_path)
             .stdin(Stdio::null())
             .stdout(log.try_clone()?)
@@ -1440,7 +1495,12 @@ fn group_failures(failures: Vec<AgentFailure>) -> Vec<BugGroup> {
 /// Returns the task of an agent session. On 26 held-out cases, plain independent small-model
 /// audits with a task of this kind found 0.05 to 0.10 more planted bugs at every spend level than
 /// agents that returned candidate JSON in short rounds.
-fn session_prompt(targets: &[PathBuf], context: &[PathBuf], out: &Path) -> String {
+fn session_prompt(
+    targets: &[PathBuf],
+    context: &[PathBuf],
+    out: &Path,
+    focus: Option<&str>,
+) -> String {
     let list = |paths: &[PathBuf]| {
         paths.iter().map(|path| format!("- {}\n", path.display())).collect::<String>()
     };
@@ -1466,6 +1526,12 @@ fn session_prompt(targets: &[PathBuf], context: &[PathBuf], out: &Path) -> Strin
          freely.\n",
         out.display()
     ));
+    if let Some(focus) = focus {
+        prompt.push_str(&format!(
+            "\nYour focus (the other agents have other focuses): {focus} Trace a small number of \
+             concrete high-signal paths in this area first; then widen if budget is left.\n"
+        ));
+    }
     prompt
 }
 
@@ -1523,6 +1589,16 @@ fn collect_tests(
     }
     files.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(files)
+}
+
+/// Compares Solidity tokens without comments or whitespace, preserving literal bytes and token
+/// boundaries so different expressions cannot collapse into the same comparison key.
+fn normalize_test_content(source: &str) -> Vec<&str> {
+    Cursor::new(source)
+        .with_position()
+        .filter(|(_, token)| !token.kind.is_trivial())
+        .map(|(pos, token)| &source[pos..pos + token.len as usize])
+        .collect()
 }
 
 /// Returns the comment right above a test function, without comment markers, as one line. The
@@ -2169,6 +2245,8 @@ contract OtherTest {
         write("helpers/Helper.sol", "library Helper {}");
         write("notes.md", "notes");
         write("A{B,C}.t.sol", "contract GlobTest {}");
+        // Windows does not allow `*` in file names.
+        #[cfg(unix)]
         write("dir*/Star.t.sol", "contract StarTest {}");
         #[cfg(unix)]
         std::os::unix::fs::symlink(
@@ -2179,26 +2257,28 @@ contract OtherTest {
 
         let mut rejected = Vec::new();
         let files = collect_tests(workspace.path(), out, 1, &mut rejected).unwrap();
+        // Paths compare by component, so the expected paths hold on Windows too.
         assert_eq!(
             files
                 .iter()
-                .map(|file| (file.path.to_str().unwrap(), file.content.as_str()))
+                .map(|file| (file.path.as_path(), file.content.as_str()))
                 .collect::<Vec<_>>(),
             [
-                ("test/generated/agent-1/Fee.t.sol", "contract FeeTest {}"),
-                ("test/generated/agent-1/helpers/Helper.sol", "library Helper {}"),
+                (Path::new("test/generated/agent-1/Fee.t.sol"), "contract FeeTest {}"),
+                (Path::new("test/generated/agent-1/helpers/Helper.sol"), "library Helper {}"),
             ]
         );
         rejected.sort_by(|a, b| a.paths.cmp(&b.paths));
         assert_eq!(
             rejected
                 .iter()
-                .map(|rejected| format!("{} {}", rejected.paths[0].display(), rejected.reason))
+                .map(|rejected| (rejected.paths[0].as_path(), rejected.reason.as_str()))
                 .collect::<Vec<_>>(),
-            [
-                "test/generated/agent-1/A{B,C}.t.sol the path has a glob character",
-                "test/generated/agent-1/dir*/Star.t.sol the path has a glob character",
-            ]
+            ["test/generated/agent-1/A{B,C}.t.sol"]
+                .into_iter()
+                .chain(cfg!(unix).then_some("test/generated/agent-1/dir*/Star.t.sol"))
+                .map(|path| (Path::new(path), "the path has a glob character"))
+                .collect::<Vec<_>>()
         );
 
         // The output directory itself must not be a link.
@@ -2210,5 +2290,41 @@ contract OtherTest {
             let error = collect_tests(workspace.path(), linked, 2, &mut rejected).unwrap_err();
             assert!(error.to_string().contains("is not a directory"), "{error}");
         }
+    }
+
+    #[test]
+    fn normalize_test_content_keeps_string_literals_and_strips_comments() {
+        let with_space = r#"
+            // Fixture case.
+            contract EchoSpecTest {
+              function testEcho() public pure {
+                require(keccak256(bytes(Echo.echo("a b"))) == keccak256(bytes("a b")), "echo changed");
+              }
+            }
+        "#;
+        let without_space = r#"
+            // Other fixture.
+            contract EchoSpecTest {
+              function testEcho() public pure {
+                require(keccak256(bytes(Echo.echo("ab"))) == keccak256(bytes("ab")), "echo changed");
+              }
+            }
+        "#;
+        let url_one = r#"require(Echo.echo("https://one.example") == "https://one.example");"#;
+        let url_two = r#"require(Echo.echo("https://two.example") == "https://two.example");"#;
+        let comment_only_a =
+            "contract T { function testA() public pure { /* note */ require(true); } }";
+        let comment_only_b =
+            "contract T { function testA() public pure { require(true); // note\n } }";
+
+        assert_ne!(normalize_test_content(with_space), normalize_test_content(without_space));
+        assert_ne!(normalize_test_content(url_one), normalize_test_content(url_two));
+        assert_eq!(normalize_test_content(comment_only_a), normalize_test_content(comment_only_b));
+        for literal in
+            [r#""https://one.example""#, r#"'a\' /* b */'"#, r#"unicode"été //""#, r#"hex"abcd""#]
+        {
+            assert_eq!(normalize_test_content(literal), [literal]);
+        }
+        assert_ne!(normalize_test_content("a + ++b"), normalize_test_content("a++ + b"));
     }
 }

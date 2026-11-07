@@ -790,6 +790,18 @@ impl<FEN: FoundryEvmNetwork> InspectorStack<FEN> {
         self.refresh_static_step_dispatch();
     }
 
+    /// Drops the inspectors that only feed fuzz guidance: edge coverage, the fuzzer value
+    /// collector, and sancov collection. Calls whose coverage and collected values are never
+    /// merged back, such as invariant predicate checks, run faster without them.
+    #[inline]
+    pub fn disable_fuzz_instrumentation(&mut self) {
+        self.edge_coverage = None;
+        self.fuzzer = None;
+        self.sancov_edges = false;
+        self.sancov_trace_cmp = false;
+        self.refresh_static_step_dispatch();
+    }
+
     /// Set whether to collect EVM comparison operands.
     #[inline]
     pub fn collect_evm_cmp_log(&mut self, yes: bool) {
@@ -1383,7 +1395,7 @@ impl<FEN: FoundryEvmNetwork> InspectorStackRefMut<'_, FEN> {
         self.top_level_frame_failed_before_rewrite = false;
         warm_arbitrum_system_contract::<FEN>(ecx);
         if let Some(cheatcodes) = &mut self.cheatcodes {
-            cheatcodes.clear_storage_hook_mapping_slots();
+            cheatcodes.on_root_frame_start();
         }
 
         if self.enable_isolation {
@@ -2261,10 +2273,8 @@ fn handle_arbitrum_system_call<FEN: FoundryEvmNetwork>(
 
     // Forks report their L2 block, which the block env lacks on Arbitrum because `NUMBER` returns
     // the L1 block there. Without a fork the block env is read here to follow `vm.roll`.
-    let block_number = match ecx.db().active_fork_block_number() {
-        Some(block_number) => block_number,
-        None => ecx.block().number().saturating_to(),
-    };
+    let block_number =
+        ecx.db().active_fork_block_number().unwrap_or_else(|| ecx.block().number().saturating_to());
     let Some((gas_cost, output)) = arbitrum::arb_block_number_call(call.gas_limit, block_number)
     else {
         return Some(arbitrum_call_outcome(
@@ -2576,10 +2586,7 @@ fn apply_mocked_function<FEN: FoundryEvmNetwork>(
 mod tests {
     use super::*;
     use crate::{backend::Backend, executors::ExecutorBuilder};
-    use alloy_primitives::B256;
-    use foundry_evm_core::{EvmEnv, evm::EthEvmNetwork};
-    use foundry_evm_coverage::FOUNDRY_COVERAGE_ADDRESS;
-    use foundry_evm_networks::NetworkConfigs;
+    use foundry_evm_core::EvmEnv;
     use revm::{bytecode::Bytecode, context::TxEnv};
 
     #[test]

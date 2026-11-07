@@ -689,14 +689,7 @@ mod tests {
         let path = dir.path().join("solc");
         std::fs::write(&path, "#!/bin/sh\nexec sleep 10\n").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let solc = Solc {
-            solc: path,
-            version: NO_IMPORT_CALLBACK_SOLC,
-            base_path: None,
-            allow_paths: Default::default(),
-            include_paths: Default::default(),
-            extra_args: Vec::new(),
-        };
+        let solc = Solc::new_with_version(path, NO_IMPORT_CALLBACK_SOLC);
         let input = SolcInput::new(SolcLanguage::Solidity, Default::default(), Default::default());
         let started = Instant::now();
 
@@ -717,14 +710,7 @@ mod tests {
         )
         .unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let solc = Solc {
-            solc: path,
-            version: NO_IMPORT_CALLBACK_SOLC,
-            base_path: None,
-            allow_paths: Default::default(),
-            include_paths: Default::default(),
-            extra_args: Vec::new(),
-        };
+        let solc = Solc::new_with_version(path, NO_IMPORT_CALLBACK_SOLC);
         let input = SolcInput::new(SolcLanguage::Solidity, Default::default(), Default::default());
 
         assert!(run_solc(&solc, &NO_IMPORT_CALLBACK_SOLC, &input, Duration::from_secs(1)).is_ok());

@@ -238,7 +238,7 @@ mod tests {
     use super::*;
     use crate::executors::ExecutorBuilder;
     use alloy_json_abi::JsonAbi;
-    use alloy_primitives::{Address, B256};
+    use alloy_primitives::B256;
     use foundry_evm_core::{EvmEnv, backend::Backend, evm::EthEvmNetwork};
     use foundry_evm_coverage::FOUNDRY_COVERAGE_ADDRESS;
     use foundry_evm_fuzz::CallDetails;
