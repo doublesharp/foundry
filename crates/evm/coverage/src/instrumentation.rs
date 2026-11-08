@@ -6,6 +6,7 @@ use foundry_common::errors::convert_solar_errors;
 use foundry_compilers::{
     Compiler, ProjectPathsConfig, SourceParser,
     artifacts::{SolcLanguage, Source},
+    buildinfo::SourceEdit,
     error::{self, SolcError},
     multi::{MultiCompiler, MultiCompilerInput, MultiCompilerLanguage},
     project::Preprocessor,
@@ -27,6 +28,8 @@ use std::{
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
+
+mod diagnostics;
 
 /// Virtual Solidity source used by instrumented coverage builds.
 pub const COVERAGE_LIBRARY_PATH: &str = "__foundry_coverage/InstrumentedCoverage.sol";
@@ -115,6 +118,18 @@ pub enum InstrumentedCoverageProbeKind {
 #[derive(Clone, Debug, Default)]
 pub struct InstrumentedCoverageMetadata {
     pub probes: Vec<InstrumentedCoverageProbe>,
+    /// Original text and instrumentation edits of every compiled source, keyed by compiler
+    /// source name. Sources that were not instrumented have no edits.
+    pub sources: BTreeMap<PathBuf, InstrumentedSource>,
+}
+
+/// A compiler input source before instrumentation.
+#[derive(Clone, Debug)]
+pub struct InstrumentedSource {
+    /// Source text before instrumentation.
+    pub original: Arc<String>,
+    /// Insertions applied by instrumentation, sorted by original offset.
+    pub edits: Vec<SourceEdit>,
 }
 
 /// Shared metadata populated while solc inputs are preprocessed.
@@ -147,6 +162,17 @@ impl CoverageInstrumentationPreprocessor {
         _mocks: &mut HashSet<PathBuf>,
     ) -> error::Result<()> {
         let mut instrumented_sources = BTreeMap::new();
+        let mut sources = input
+            .input
+            .sources
+            .iter()
+            .filter(|(path, _)| path.as_path() != Path::new(COVERAGE_LIBRARY_PATH))
+            .map(|(path, source)| {
+                let source =
+                    InstrumentedSource { original: source.content.clone(), edits: Vec::new() };
+                (path.clone(), source)
+            })
+            .collect::<BTreeMap<_, _>>();
 
         let mut compiler =
             foundry_compilers::resolver::parse::SolParser::new(paths.with_language_ref())
@@ -173,7 +199,7 @@ impl CoverageInstrumentationPreprocessor {
                 let Some(source) = input.input.sources.get(&path) else { continue };
                 let Some((_, ast_source)) = gcx.get_ast_source(&path) else { continue };
                 let Some(ast) = ast_source.ast.as_ref() else { continue };
-                let Some((content, source_probes)) = instrument_source(
+                let Some((content, source_probes, edits)) = instrument_source(
                     &path,
                     source.content.as_str(),
                     &input.version,
@@ -182,7 +208,7 @@ impl CoverageInstrumentationPreprocessor {
                 ) else {
                     continue;
                 };
-                instrumented_sources.insert(path, (content, source_probes));
+                instrumented_sources.insert(path, (content, source_probes, edits));
             }
 
             Ok(())
@@ -198,11 +224,14 @@ impl CoverageInstrumentationPreprocessor {
         let mut probes = Vec::new();
         let mut changed = false;
 
-        for (path, (content, mut source_probes)) in instrumented_sources {
+        for (path, (content, mut source_probes, edits)) in instrumented_sources {
             let Some(source) = input.input.sources.get_mut(&path) else { continue };
             source.content = Arc::new(content);
             changed = true;
             probes.append(&mut source_probes);
+            if let Some(source) = sources.get_mut(&path) {
+                source.edits = edits;
+            }
         }
 
         if changed {
@@ -212,7 +241,12 @@ impl CoverageInstrumentationPreprocessor {
                 .insert(PathBuf::from(COVERAGE_LIBRARY_PATH), Source::new(COVERAGE_LIBRARY_SOURCE));
         }
 
-        self.metadata.lock().unwrap_or_else(|e| e.into_inner()).probes.extend(probes);
+        let mut metadata = self.metadata.lock().unwrap_or_else(|e| e.into_inner());
+        metadata.probes.extend(probes);
+        // Every compiler job instruments a shared source identically.
+        for (path, source) in sources {
+            metadata.sources.entry(path).or_insert(source);
+        }
         Ok(())
     }
 
@@ -273,7 +307,7 @@ fn instrument_source<'ast>(
     version: &Version,
     source_map: &SourceMap,
     ast: &'ast ast::SourceUnit<'ast>,
-) -> Option<(String, Vec<InstrumentedCoverageProbe>)> {
+) -> Option<(String, Vec<InstrumentedCoverageProbe>, Vec<SourceEdit>)> {
     if has_ignore_file_directive(source) {
         return None;
     }
@@ -302,16 +336,28 @@ fn instrument_source<'ast>(
                 Edge::Open | Edge::Point => a_idx.cmp(b_idx),
             })
     });
+    let mut edits = Vec::with_capacity(updates.len() + 1);
     for (_, update) in updates {
         content.push_str(&source[cursor..update.range.start]);
         content.push_str(&update.text);
         cursor = update.range.end;
+        edits.push(SourceEdit {
+            start: update.range.start,
+            end: update.range.end,
+            len: update.text.len(),
+        });
     }
     content.push_str(&source[cursor..]);
+    let import_start = content.len();
     content.push('\n');
     content.push_str(COVERAGE_IMPORT);
     content.push('\n');
-    Some((content, collector.probes))
+    edits.push(SourceEdit {
+        start: source.len(),
+        end: source.len(),
+        len: content.len() - import_start,
+    });
+    Some((content, collector.probes, edits))
 }
 
 fn comment_ranges(source: &str) -> impl Iterator<Item = Range<usize>> {
@@ -1171,6 +1217,14 @@ mod tests {
     /// preprocessor, so unit tests can assert on rewrites and probe metadata without spinning
     /// up a full solc compilation.
     fn instrument(source: &str) -> (String, Vec<InstrumentedCoverageProbe>) {
+        let (content, probes, _) = instrument_with_edits(source);
+        (content, probes)
+    }
+
+    /// Like [`instrument`], but also returns the edits that map the rewrite to `source`.
+    fn instrument_with_edits(
+        source: &str,
+    ) -> (String, Vec<InstrumentedCoverageProbe>, Vec<SourceEdit>) {
         let version = Version::new(0, 8, 25);
         let path = PathBuf::from("Test.sol");
         let sess = Session::builder().with_buffer_emitter(Default::default()).build();
@@ -1323,6 +1377,45 @@ contract C {
         assert!(
             count_kind(&probes, |k| matches!(k, InstrumentedCoverageProbeKind::Statement)) >= 1
         );
+    }
+
+    #[test]
+    fn edits_map_instrumented_offsets_to_original() {
+        let source = r#"
+contract C {
+    function f(uint256 x) external pure returns (uint256) {
+        if (x > 1) return x;
+        require(x != 0, "zero");
+        return x + 1;
+    }
+}
+"#;
+        let (out, _, edits) = instrument_with_edits(source);
+        assert!(edits.len() > 1);
+        assert!(edits.windows(2).all(|pair| pair[0].start <= pair[1].start));
+
+        // Removing every insertion restores the original source.
+        let mut restored = String::new();
+        let mut cursor = 0;
+        let mut shift = 0;
+        for edit in &edits {
+            assert_eq!(edit.start, edit.end, "instrumentation only inserts");
+            let start = edit.start + shift;
+            restored.push_str(&out[cursor..start]);
+            cursor = start + edit.len;
+            shift += edit.len;
+        }
+        restored.push_str(&out[cursor..]);
+        assert_eq!(restored, source);
+
+        // Original code maps back to its own offset; inserted probes map to their insertion point.
+        for snippet in ["return x + 1", "require(x != 0", "uint256 x"] {
+            let offset = out.find(snippet).unwrap();
+            assert_eq!(SourceEdit::original_offset(&edits, offset), source.find(snippet).unwrap());
+        }
+        let probe = out.find("__FoundryCoverage.sendHit").unwrap();
+        let original = SourceEdit::original_offset(&edits, probe);
+        assert!(edits.iter().any(|edit| edit.start == original));
     }
 
     #[test]
