@@ -1,7 +1,9 @@
 # forgeds
 
 Doublesharp's Foundry fork, focused on faster local development and CI.
-[Download forgeds](https://github.com/doublesharp/foundry/releases/tag/forgeds).
+[Download forgeds](https://github.com/doublesharp/foundry/releases/tag/forgeds) and read
+[what's different](FORGEDS.md): shared compiler caching across worktrees, instrumented coverage,
+and quieter compiler output for AI agents.
 
 The upstream Foundry documentation follows.
 
