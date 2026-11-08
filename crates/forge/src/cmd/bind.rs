@@ -157,7 +157,9 @@ impl BindArgs {
             let contexts = resolved_artifact_contexts(&project, artifact_graph(&project, None)?)?;
             let output = compile_abi_project(
                 &mut project,
-                ProjectCompiler::new().external_compilers(&config),
+                ProjectCompiler::new()
+                    .external_compilers(&config)
+                    .compiler_warnings(config.compiler_warnings),
             )?;
             let files =
                 self.filter_artifact_paths(output.artifact_ids().filter_map(|(id, _)| {

@@ -78,6 +78,7 @@ ignored_error_codes = [
 ignored_error_codes_from = []
 ignored_warnings_from = []
 deny = "never"
+compiler_warnings = "all"
 test_failures_file = "cache/test-failures"
 mutation_dir = "cache/mutation"
 show_progress = false
@@ -609,6 +610,7 @@ fn can_extract_config_values(prj: _, cmd: _) {
         ignored_file_paths: vec![],
         deny: foundry_config::DenyLevel::Never,
         deny_warnings: false,
+        compiler_warnings: foundry_config::CompilerWarnings::All,
         via_ir: true,
         ast: false,
         rpc_storage_caching: StorageCachingConfig {
@@ -2404,6 +2406,7 @@ fn test_default_config(prj: _, cmd: _) {
   "ignored_error_codes_from": [],
   "ignored_warnings_from": [],
   "deny": "never",
+  "compiler_warnings": "all",
   "match_test": null,
   "no_match_test": null,
   "match_contract": null,

@@ -389,6 +389,12 @@ pub struct Config {
     /// DEPRECATED: use `deny` instead.
     #[serde(default, skip_serializing)]
     pub deny_warnings: bool,
+    /// Which compiler warnings to print.
+    ///
+    /// `changed` prints warnings only for sources whose content changed since the last cached
+    /// build and summarizes the rest in a single line. Errors and denied warnings are always
+    /// printed.
+    pub compiler_warnings: CompilerWarnings,
     /// Only run test functions matching the specified regex pattern.
     #[serde(rename = "match_test")]
     pub test_pattern: Option<RegexWrapper>,
@@ -810,6 +816,24 @@ impl DenyLevel {
             Self::Never => true,
             Self::Warnings | Self::Notes => false,
         }
+    }
+}
+
+/// Which compiler warnings to print after a build.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CompilerWarnings {
+    /// Print warnings from every source in the compiler output.
+    #[default]
+    All,
+    /// Print warnings only from sources whose content changed since the last cached build.
+    Changed,
+}
+
+impl CompilerWarnings {
+    /// Returns `true` if warnings from unchanged sources are hidden.
+    pub const fn changed_only(&self) -> bool {
+        matches!(self, Self::Changed)
     }
 }
 
@@ -3425,6 +3449,7 @@ impl Default for Config {
             ignored_file_paths: vec![],
             deny: DenyLevel::Never,
             deny_warnings: false,
+            compiler_warnings: CompilerWarnings::All,
             via_ir: false,
             via_ssa_cfg: false,
             experimental: false,
@@ -10241,6 +10266,46 @@ mod tests {
             let config = Config::load_with_root(jail.directory()).unwrap();
             assert!(config.allow_linked_libraries);
             assert!(!config.solc_settings().unwrap().settings.libraries.libs.is_empty());
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn compiler_warnings_parses_profiles_env_and_serializes() {
+        figment::Jail::expect_with(|jail| {
+            jail.create_file(
+                "foundry.toml",
+                r#"
+                [profile.default]
+                [profile.agent]
+                compiler_warnings = "changed"
+            "#,
+            )?;
+            let config = Config::load_with_root(jail.directory()).unwrap();
+            assert_eq!(config.compiler_warnings, CompilerWarnings::All);
+            assert!(!config.compiler_warnings.changed_only());
+
+            jail.set_env("FOUNDRY_PROFILE", "agent");
+            let config = Config::load_with_root(jail.directory()).unwrap();
+            assert_eq!(config.compiler_warnings, CompilerWarnings::Changed);
+            assert!(config.compiler_warnings.changed_only());
+            let roundtrip = Config::from_provider(&config).unwrap();
+            assert_eq!(roundtrip.compiler_warnings, CompilerWarnings::Changed);
+            assert_eq!(serde_json::to_string(&config.compiler_warnings).unwrap(), r#""changed""#);
+
+            jail.set_env("FOUNDRY_COMPILER_WARNINGS", "all");
+            let config = Config::load_with_root(jail.directory()).unwrap();
+            assert_eq!(config.compiler_warnings, CompilerWarnings::All);
+
+            jail.set_env("FOUNDRY_COMPILER_WARNINGS", "some");
+            let err = Config::load_with_root(jail.directory()).unwrap_err().to_string();
+            assert!(
+                err.contains(
+                    "unknown variant: found `some`, expected ``all` or `changed`` for setting \
+                     `compiler_warnings`"
+                ),
+                "{err}"
+            );
             Ok(())
         });
     }

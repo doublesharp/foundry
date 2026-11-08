@@ -133,6 +133,7 @@ impl BuildArgs {
             .ignore_eip_3860(self.ignore_eip_3860)
             .size_limits(contract_size_limits(&config))
             .bail(!format_json)
+            .compiler_warnings(config.compiler_warnings)
             .compile(&project)?;
 
         // Cache project selectors.
