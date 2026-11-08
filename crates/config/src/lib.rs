@@ -1446,6 +1446,17 @@ impl Config {
         self.create_project(false, true)
     }
 
+    /// Same as [`Self::ephemeral_project()`], but reuses raw compiler output from the shared
+    /// compiler-output cache unless caching is disabled or `force` is set.
+    ///
+    /// The project cache stays disabled. Compiler output is keyed by the complete compiler input,
+    /// so this suits builds that rewrite sources before compilation, such as instrumented coverage.
+    pub fn ephemeral_project_with_compiler_cache(
+        &self,
+    ) -> Result<Project<MultiCompiler>, SolcError> {
+        self.create_project_with_compiler_output_cache(false, true, true)
+    }
+
     /// A cached, in-memory project that does not request any artifacts.
     ///
     /// Use this when you just want the source graph or the Solar compiler context.
@@ -1532,10 +1543,21 @@ impl Config {
     ///
     /// Prefer using [`Self::project`] or [`Self::ephemeral_project`] instead.
     pub fn create_project(&self, cached: bool, no_artifacts: bool) -> Result<Project, SolcError> {
+        self.create_project_with_compiler_output_cache(cached, no_artifacts, cached)
+    }
+
+    /// Creates a [`Project`], attaching the shared compiler-output cache if `output_cache` is set
+    /// and caching is enabled without `force`.
+    fn create_project_with_compiler_output_cache(
+        &self,
+        cached: bool,
+        no_artifacts: bool,
+        output_cache: bool,
+    ) -> Result<Project, SolcError> {
         let project = self.create_project_with_compiler(
             || {
                 let mut compiler = self.compiler()?;
-                if cached
+                if output_cache
                     && self.cache
                     && !self.force
                     && let Some(cache_dir) = Self::foundry_compiler_cache_dir()

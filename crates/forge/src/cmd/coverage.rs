@@ -39,7 +39,7 @@ use foundry_compilers::{
     cache::SOLIDITY_FILES_CACHE_FILENAME,
     compilers::{
         Language,
-        multi::{MultiCompilerLanguage, MultiCompilerParser},
+        multi::{MultiCompilerError, MultiCompilerLanguage, MultiCompilerParser},
     },
     error::SolcError,
     project::ProjectCompiler as FoundryProjectCompiler,
@@ -285,7 +285,14 @@ impl CoverageArgs {
 
     /// Builds the project.
     fn build(&self, config: &Config, filter: &ProjectPathsAwareFilter) -> Result<CoverageBuild> {
-        let mut project = config.ephemeral_project()?;
+        // Instrumentation rewrites sources deterministically, so the instrumented compiler input
+        // identifies its output. Reusing raw compiler output skips the compiler for unchanged
+        // inputs while instrumentation metadata is still rebuilt on every run.
+        let mut project = if self.instrumented {
+            config.ephemeral_project_with_compiler_cache()?
+        } else {
+            config.ephemeral_project()?
+        };
         // A contended or unavailable cache retains ephemeral compilation. Keep the lock until
         // artifacts and build contexts have been loaded or published together.
         let cache = (!self.instrumented && config.cache && !config.deny.warnings())
@@ -503,20 +510,28 @@ impl CoverageArgs {
         filtered_sources: Option<&BTreeSet<PathBuf>>,
     ) -> Result<ProjectCompileOutput> {
         let root = project.root().to_path_buf();
-        let output = with_compilation_reporter(false, Some(root), || {
+        let mut output = with_compilation_reporter(false, Some(root), || {
             let mut sources = project.paths.read_input_files()?;
             if let Some(filtered_sources) = filtered_sources {
                 sources.retain(|path, _| filtered_sources.contains(path));
             }
             let compiler = FoundryProjectCompiler::with_sources(project, sources)?
                 .with_preprocessor(CoverageInstrumentationPreprocessor::new(
-                    metadata,
+                    metadata.clone(),
                     self.include_libs,
                     self.exclude_tests,
                     excluded_sources,
                 ));
             compiler.compile().map_err(eyre::Report::from)
         })?;
+
+        // Diagnostics refer to the instrumented sources; report them against the user's sources.
+        let metadata = metadata.lock().unwrap_or_else(|e| e.into_inner());
+        output.output_mut().errors.retain_mut(|error| match error {
+            MultiCompilerError::Solc(error) => metadata.remap_diagnostic(error),
+            MultiCompilerError::Vyper(_) => true,
+        });
+        drop(metadata);
 
         if output.has_compiler_errors() {
             eyre::bail!("{output}");

@@ -431,6 +431,7 @@ mod tests {
                 probe(22, "src/Counter.sol", 5, 5),
                 probe(21, "src/Unknown.sol", 6, 6),
             ],
+            ..Default::default()
         };
         let paths = ProjectPathsConfig::builder().build_with_root(Path::new("."));
         let (report, index) = prepare(&paths, &output, &metadata, true, false).unwrap();
