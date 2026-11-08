@@ -1601,7 +1601,7 @@ contract C is B {}
 Unable to resolve imports:
       "/badpath/B.sol" in "[..]"
 with remappings:
-      forge-std/=[..]
+      no remapping matches these imports ([..] configured); run `forge remappings` to list them
 [COMPILING_FILES] with [SOLC_VERSION]
 [SOLC_VERSION] [ELAPSED]
 
@@ -1610,7 +1610,7 @@ with remappings:
 Unable to resolve imports:
       "badpath/B.sol" in "[..]"
 with remappings:
-      forge-std/=[..]
+      no remapping matches these imports ([..] configured); run `forge remappings` to list them
 [COMPILING_FILES] with [SOLC_VERSION]
 [SOLC_VERSION] [ELAPSED]
 
@@ -2713,6 +2713,64 @@ warning[2018]: function state mutability can be restricted to pure
  9 │ ┃         return 2;
 10 │ ┃     }
    ╰╴┗━━━━━┛
+
+"#]]);
+}
+
+// Unresolved imports are listed once with their importers, along with only the remappings that
+// match them, followed by solc's shortened missing-source errors.
+#[forgetest]
+fn unresolved_imports_are_condensed(prj: _, cmd: _) {
+    let mut remappings = (1..=30)
+        .map(|i| {
+            let target = prj.root().join(format!("node_modules/@pkg{i}"));
+            fs::create_dir_all(&target).unwrap();
+            Remapping::from_str(&format!("@pkg{i}/={}/", target.display())).unwrap().into()
+        })
+        .collect::<Vec<_>>();
+    remappings.push(Remapping::from_str("@missing/=node_modules/@missing/").unwrap().into());
+    prj.update_config(|config| config.remappings = remappings);
+    prj.add_raw_source(
+        "A.sol",
+        r#"
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+import {Token} from "@missing/pkg/Token.sol";
+contract A {}
+"#,
+    );
+    prj.add_raw_source(
+        "B.sol",
+        r#"
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+import {Token} from "@missing/pkg/Token.sol";
+import {Other} from "@missing/pkg/Other.sol";
+contract B {}
+"#,
+    );
+
+    cmd.arg("build")
+        .assert_failure()
+        .stdout_eq(str![[r#"
+Unable to resolve imports:
+      "@missing/pkg/Other.sol" in "src/B.sol"
+      "@missing/pkg/Token.sol" in "src/A.sol", "src/B.sol"
+with remappings:
+      @missing/=node_modules/@missing/ (target not found)
+      30 other remappings not shown; run `forge remappings` to list them
+[COMPILING_FILES] with [SOLC_VERSION]
+[SOLC_VERSION] [ELAPSED]
+
+"#]])
+        .stderr_eq(str![[r#"
+Error: Compiler run failed:
+Error (6275): Source "node_modules/@missing/pkg/Token.sol" not found: File not found. Searched the following locations: "[..]".
+ [FILE]:4:1:
+Error (6275): Source "node_modules/@missing/pkg/Token.sol" not found: File not found. Searched the following locations: "[..]".
+ [FILE]:4:1:
+Error (6275): Source "node_modules/@missing/pkg/Other.sol" not found: File not found. Searched the following locations: "[..]".
+ [FILE]:5:1:
 
 "#]]);
 }

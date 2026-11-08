@@ -6213,6 +6213,7 @@ dependencies = [
  "serde_json",
  "sha2 0.11.0",
  "smolgen",
+ "snapbox",
  "solar-compiler",
  "syn 3.0.6",
  "tempfile",

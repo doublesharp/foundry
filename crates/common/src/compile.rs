@@ -6,7 +6,7 @@ use crate::{
     fs::canonicalize_path,
     preprocessor::DynamicTestLinkingPreprocessor,
     shell,
-    term::SpinnerReporter,
+    term::{BasicReporter, SpinnerReporter},
 };
 use alloy_json_abi::JsonAbi;
 use comfy_table::{
@@ -29,7 +29,7 @@ use foundry_compilers::{
     info::ContractInfo as CompilerContractInfo,
     multi::{MultiCompiler, MultiCompilerError, MultiCompilerSettings},
     project::Preprocessor,
-    report::{BasicStdoutReporter, NoReporter, Report},
+    report::{NoReporter, Report},
     solc::SolcSettings,
 };
 use foundry_config::{CompilerWarnings, Config};
@@ -1017,7 +1017,7 @@ pub fn add_storage_layout_output<C: Compiler<CompilerContract = Contract>>(
 /// Configures the reporter and runs the given closure.
 ///
 /// In TTY mode, [`SpinnerReporter`] paints the progress to stderr. The non-TTY fallback
-/// still writes to stdout via `BasicStdoutReporter`; migrating that path to stderr is
+/// still writes to stdout via [`BasicReporter`]; migrating that path to stderr is
 /// part of the per-command stdout migration tracked in `docs/dev/output-channels.md`
 /// (it would shift many existing snapshot tests at once).
 pub fn with_compilation_reporter<O>(
@@ -1044,9 +1044,7 @@ fn with_compilation_reporter_and_settings<O>(
                     .with_compiler_settings(print_compiler_settings),
             )
         } else {
-            Report::new(
-                BasicStdoutReporter::default().with_compiler_settings(print_compiler_settings),
-            )
+            Report::new(BasicReporter::new(project_root, print_compiler_settings))
         }
     };
 
@@ -1113,9 +1111,10 @@ impl std::fmt::Debug for PathOrContractInfo {
 
 /// Formats the compiler diagnostics in `output` like its `Display` implementation.
 ///
-/// With [`CompilerWarnings::Changed`], warnings from sources whose artifacts were reused from the
-/// cache in this run are replaced by a summary line. Errors and warnings denied by the project's
-/// severity filter are always included.
+/// Missing-source errors are shortened to their message and location; the compilation reporter
+/// already lists the unresolved imports. With [`CompilerWarnings::Changed`], warnings from sources
+/// whose artifacts were reused from the cache in this run are replaced by a summary line. Errors
+/// and warnings denied by the project's severity filter are always included.
 pub fn format_diagnostics<C: Compiler<CompilerContract = Contract>>(
     output: &ProjectCompileOutput<C>,
     project: &Project<C>,
@@ -1127,7 +1126,7 @@ pub fn format_diagnostics<C: Compiler<CompilerContract = Contract>>(
     } else {
         HashSet::new()
     };
-    if hidden.is_empty() {
+    if hidden.is_empty() && !compiler_output.errors.iter().any(|e| missing_source(e).is_some()) {
         return output.to_string();
     }
 
@@ -1143,7 +1142,10 @@ pub fn format_diagnostics<C: Compiler<CompilerContract = Contract>>(
         if hidden.contains(&index) || is_ignored_diagnostic(project, compiler_output, error) {
             continue;
         }
-        let _ = write!(formatted, "\n{error}");
+        let _ = match missing_source(error) {
+            Some(short) => write!(formatted, "\n{short}"),
+            None => write!(formatted, "\n{error}"),
+        };
     }
     let count = hidden.len();
     if count > 0 {
@@ -1203,6 +1205,39 @@ fn is_ignored_diagnostic<C: Compiler<CompilerContract = Contract>>(
         &project.ignored_file_paths,
         error,
     )
+}
+
+/// Shortens a solc "Source not found" error (6275) to its message and source location.
+///
+/// Solc repeats the message and quotes the import statement for every unresolved import, while
+/// the compilation reporter already lists each import once.
+fn missing_source<E: CompilationError>(error: &E) -> Option<String> {
+    let error = error as &dyn Any;
+    let error = if let Some(error) = error.downcast_ref::<SolcError>() {
+        error
+    } else if let Some(MultiCompilerError::Solc(error)) = error.downcast_ref::<MultiCompilerError>()
+    {
+        error
+    } else {
+        return None;
+    };
+    if error.error_code != Some(6275) {
+        return None;
+    }
+    // Pre-styled diagnostics keep their own layout.
+    let formatted = error.formatted_message.as_deref().unwrap_or_default();
+    if formatted.contains('\x1b') || formatted.contains('\u{25b8}') {
+        return None;
+    }
+    let mut short = format!(
+        "{}{}",
+        format!("{} (6275)", error.severity.as_str()).paint(error.error_style()),
+        format!(": {}", error.message.trim()).paint(SolcError::message_style()),
+    );
+    if let Some(location) = formatted.lines().find(|line| line.trim_start().starts_with("-->")) {
+        let _ = write!(short, "\n{location}");
+    }
+    Some(short)
 }
 
 /// Describes the Solidity library dependencies in creation or runtime bytecode, if any.
