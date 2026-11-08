@@ -610,9 +610,9 @@ solar-lint = { git = "https://github.com/paradigmxyz/solar", tag = "v0.3.0" }
 ## foundry-core
 # forgeds keeps its compiler cache changes in the doublesharp fork.
 foundry-wallets = { git = "https://github.com/foundry-rs/foundry-core", rev = "39cc9fbe82bab09345ff0265032deb9fb4ca7782" }
-foundry-compilers = { git = "https://github.com/doublesharp/foundry-core", rev = "e1e13fa98928447926e150906aa54a58a2b0771b" }
-foundry-block-explorers = { git = "https://github.com/doublesharp/foundry-core", rev = "e1e13fa98928447926e150906aa54a58a2b0771b" }
-foundry-fork-db = { git = "https://github.com/doublesharp/foundry-core", rev = "e1e13fa98928447926e150906aa54a58a2b0771b" }
+foundry-compilers = { git = "https://github.com/doublesharp/foundry-core", rev = "576a206ecd027a02d4f3c0f2857d5b102b536d6a" }
+foundry-block-explorers = { git = "https://github.com/doublesharp/foundry-core", rev = "576a206ecd027a02d4f3c0f2857d5b102b536d6a" }
+foundry-fork-db = { git = "https://github.com/doublesharp/foundry-core", rev = "576a206ecd027a02d4f3c0f2857d5b102b536d6a" }
 
 ## alloy-core
 alloy-dyn-abi = { git = "https://github.com/alloy-rs/core", rev = "1e17055e111d087cd303186f9c4eeaee9af11684" }
