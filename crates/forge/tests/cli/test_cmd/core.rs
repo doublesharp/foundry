@@ -1,6 +1,7 @@
 //! Core test functionality tests
 
 use foundry_compilers::artifacts::output_selection::ContractOutputSelection;
+use foundry_config::CompilerWarnings;
 use foundry_test_utils::{str, util::OutputExt};
 use serde_json::Value;
 
@@ -780,4 +781,63 @@ contract RerunNetworksTest {
     assert_eq!(failed_tests.len(), 2);
     assert!(failed_tests.contains(&"testDefaultFailure"));
     assert!(failed_tests.contains(&"testTempoFailure"));
+}
+
+// After only a test file changes, a filtered `forge test` run in changed-only mode prints that
+// file's warnings and summarizes the warnings from the unchanged source it imports.
+#[forgetest]
+fn compiler_warnings_changed_after_test_edit(prj: _, cmd: _) {
+    prj.update_config(|config| config.compiler_warnings = CompilerWarnings::Changed);
+    prj.add_raw_source(
+        "OrderBook.sol",
+        r#"
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+contract OrderBook {
+    function fill(uint256 amount) public pure returns (uint256) {
+        return 1;
+    }
+}
+"#,
+    );
+    let test = |body: &str| {
+        format!(
+            r#"
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+import {{OrderBook}} from "../src/OrderBook.sol";
+
+contract OrderBookTest {{
+    function testX() public {{
+        new OrderBook();{body}
+    }}
+}}
+"#
+        )
+    };
+    prj.add_raw_test("OrderBook.t.sol", &test(""));
+    cmd.args(["test", "--mt", "testX"]).assert_success();
+
+    prj.add_raw_test("OrderBook.t.sol", &test("\n        uint256 unusedInTest;"));
+    cmd.forge_fuse().args(["test", "--mt", "testX"]).assert_success().stdout_eq(str![[r#"
+[COMPILING_FILES] with [SOLC_VERSION]
+[SOLC_VERSION] [ELAPSED]
+Compiler run successful with warnings:
+Warning (2072): Unused local variable.
+  [FILE]:10:9:
+   |
+10 |         uint256 unusedInTest;
+   |         ^^^^^^^^^^^^^^^^^^^^
+
+1 compiler warning in unchanged files hidden; set `compiler_warnings = "all"` to show it
+
+Ran 1 test for test/OrderBook.t.sol:OrderBookTest
+[PASS] testX() ([GAS])
+Suite result: ok. 1 passed; 0 failed; 0 skipped; [ELAPSED]
+
+Ran 1 test suite [ELAPSED]: 1 tests passed, 0 failed, 0 skipped (1 total tests)
+
+"#]]);
 }

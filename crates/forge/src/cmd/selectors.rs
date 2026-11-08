@@ -492,7 +492,8 @@ fn project_from_paths(
     let compiler = ProjectCompiler::new()
         .external_compilers(&config)
         .external_artifacts(false)
-        .dynamic_test_linking(config.dynamic_test_linking);
+        .dynamic_test_linking(config.dynamic_test_linking)
+        .compiler_warnings(config.compiler_warnings);
     let mut project = config.project()?;
     if !project.build_info {
         project.no_artifacts = true;

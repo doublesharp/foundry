@@ -28,7 +28,7 @@ use eyre::Result;
 use foundry_cli::utils::{FoundryPathExt, LoadConfig, STATIC_FUZZ_SEED};
 use foundry_common::{
     ContractsByArtifactBuilder, TestFilter,
-    compile::{ProjectCompiler, with_compilation_reporter},
+    compile::{ProjectCompiler, format_diagnostics, with_compilation_reporter},
     errors::convert_solar_errors,
     version::SHORT_VERSION,
 };
@@ -46,7 +46,7 @@ use foundry_compilers::{
     utils::source_files_iter,
 };
 use foundry_config::{
-    Config, CoverageConfig, CoverageReportKind, InlineConfig, parse_lcov_version,
+    CompilerWarnings, Config, CoverageConfig, CoverageReportKind, InlineConfig, parse_lcov_version,
 };
 use foundry_evm::{core::ic::IcPcMap, opts::EvmOpts};
 use globset::{Glob, GlobSetBuilder};
@@ -376,6 +376,7 @@ impl CoverageArgs {
                     metadata.clone(),
                     filter.args().coverage_pattern_inverse.clone(),
                     filtered_sources.as_ref(),
+                    config.compiler_warnings,
                 )?
                 .with_stripped_file_prefixes(project.root());
             return Ok(CoverageBuild {
@@ -390,7 +391,8 @@ impl CoverageArgs {
                 .allow_linked_libraries(config.allow_linked_libraries)
                 .external_compilers(config)
                 .external_artifacts(false)
-                .dynamic_test_linking(config.dynamic_test_linking);
+                .dynamic_test_linking(config.dynamic_test_linking)
+                .compiler_warnings(config.compiler_warnings);
             if let Some(files) = &filtered_sources {
                 compiler = compiler.files(files.iter().cloned());
             }
@@ -508,6 +510,7 @@ impl CoverageArgs {
         metadata: InstrumentedCoverageMetadataRef,
         excluded_sources: Option<regex::Regex>,
         filtered_sources: Option<&BTreeSet<PathBuf>>,
+        warnings: CompilerWarnings,
     ) -> Result<ProjectCompileOutput> {
         let root = project.root().to_path_buf();
         let mut output = with_compilation_reporter(false, Some(root), || {
@@ -534,12 +537,12 @@ impl CoverageArgs {
         drop(metadata);
 
         if output.has_compiler_errors() {
-            eyre::bail!("{output}");
+            eyre::bail!("{}", format_diagnostics(&output, project, warnings));
         }
         if output.is_unchanged() {
             sh_println!("No files changed, compilation skipped")?;
         } else {
-            sh_println!("{output}")?;
+            sh_println!("{}", format_diagnostics(&output, project, warnings))?;
         }
 
         Ok(output)

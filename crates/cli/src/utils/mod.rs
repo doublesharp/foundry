@@ -124,6 +124,12 @@ fn env_filter() -> EnvFilter {
     for &directive in DEFAULT_DIRECTIVES {
         filter = filter.add_directive(directive.parse().unwrap());
     }
+    // The compilation reporter lists unresolved imports. Without an explicit filter, drop the
+    // duplicate error event logged for each import that cannot be read.
+    if std::env::var_os(EnvFilter::DEFAULT_ENV).is_none() {
+        filter =
+            filter.add_directive("foundry_compilers_artifacts_solc::sources=off".parse().unwrap());
+    }
     filter
 }
 

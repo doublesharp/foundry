@@ -1,16 +1,18 @@
 //! terminal utils
 use foundry_compilers::{
     artifacts::remappings::Remapping,
-    report::{self, Reporter},
+    report::{BasicStdoutReporter, Reporter},
 };
 use itertools::Itertools;
 use semver::Version;
 use std::{
+    collections::{BTreeMap, BTreeSet, HashSet},
+    fmt::Write as _,
     io,
     io::{IsTerminal, prelude::*},
     path::{Path, PathBuf},
     sync::{
-        LazyLock,
+        LazyLock, Mutex, PoisonError,
         mpsc::{self, TryRecvError},
     },
     thread,
@@ -100,6 +102,8 @@ pub struct SpinnerReporter {
     sender: mpsc::Sender<SpinnerMsg>,
     /// The project root path for trimming file paths in verbose output.
     project_root: Option<PathBuf>,
+    /// Unresolved imports already reported.
+    unresolved_imports: UnresolvedImports,
     /// Whether to print the resolved settings for each compiler invocation.
     print_compiler_settings: bool,
 }
@@ -148,7 +152,12 @@ impl SpinnerReporter {
             })
             .expect("failed to spawn thread");
 
-        Self { sender, project_root, print_compiler_settings: false }
+        Self {
+            sender,
+            project_root,
+            unresolved_imports: Default::default(),
+            print_compiler_settings: false,
+        }
     }
 
     /// Sets whether resolved compiler settings are included in progress output.
@@ -255,8 +264,179 @@ impl Reporter for SpinnerReporter {
     }
 
     fn on_unresolved_imports(&self, imports: &[(&Path, &Path)], remappings: &[Remapping]) {
-        self.send_msg(report::format_unresolved_imports(imports, remappings));
+        if let Some(message) =
+            self.unresolved_imports.report(imports, remappings, self.project_root.as_deref())
+        {
+            self.send_msg(message);
+        }
     }
+}
+
+/// A non-interactive [`Reporter`] that prints progress like [`BasicStdoutReporter`] and condenses
+/// unresolved import reports like [`SpinnerReporter`].
+#[derive(Debug)]
+pub struct BasicReporter {
+    inner: BasicStdoutReporter,
+    project_root: Option<PathBuf>,
+    unresolved_imports: UnresolvedImports,
+}
+
+impl BasicReporter {
+    /// Creates a reporter that shortens paths relative to `project_root`.
+    pub fn new(project_root: Option<PathBuf>, print_compiler_settings: bool) -> Self {
+        Self {
+            inner: BasicStdoutReporter::default().with_compiler_settings(print_compiler_settings),
+            project_root,
+            unresolved_imports: Default::default(),
+        }
+    }
+}
+
+impl Reporter for BasicReporter {
+    fn on_compiler_spawn(&self, compiler_name: &str, version: &Version, dirty_files: &[PathBuf]) {
+        self.inner.on_compiler_spawn(compiler_name, version, dirty_files);
+    }
+
+    fn on_compiler_settings(
+        &self,
+        compiler_name: &str,
+        version: &Version,
+        profile: &str,
+        settings: &str,
+    ) {
+        self.inner.on_compiler_settings(compiler_name, version, profile, settings);
+    }
+
+    fn on_compiler_success(&self, compiler_name: &str, version: &Version, duration: &Duration) {
+        self.inner.on_compiler_success(compiler_name, version, duration);
+    }
+
+    fn on_solc_installation_start(&self, version: &Version) {
+        self.inner.on_solc_installation_start(version);
+    }
+
+    fn on_solc_installation_success(&self, version: &Version) {
+        self.inner.on_solc_installation_success(version);
+    }
+
+    fn on_solc_installation_error(&self, version: &Version, error: &str) {
+        self.inner.on_solc_installation_error(version, error);
+    }
+
+    fn on_solar_installation_start(&self, version: &Version) {
+        self.inner.on_solar_installation_start(version);
+    }
+
+    fn on_solar_installation_success(&self, version: &Version) {
+        self.inner.on_solar_installation_success(version);
+    }
+
+    fn on_solar_installation_error(&self, version: &Version, error: &str) {
+        self.inner.on_solar_installation_error(version, error);
+    }
+
+    fn on_unresolved_imports(&self, imports: &[(&Path, &Path)], remappings: &[Remapping]) {
+        if let Some(message) =
+            self.unresolved_imports.report(imports, remappings, self.project_root.as_deref())
+        {
+            let _ = sh_println!("{message}");
+        }
+    }
+}
+
+/// Unresolved `(import, importing file)` pairs already reported by a reporter.
+///
+/// A build can resolve the source graph several times, and each resolution reports the same
+/// imports again.
+#[derive(Debug, Default)]
+struct UnresolvedImports(Mutex<HashSet<(PathBuf, PathBuf)>>);
+
+impl UnresolvedImports {
+    /// Formats the unresolved imports that were not reported yet.
+    fn report(
+        &self,
+        imports: &[(&Path, &Path)],
+        remappings: &[Remapping],
+        project_root: Option<&Path>,
+    ) -> Option<String> {
+        let mut reported = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        let imports = imports
+            .iter()
+            .copied()
+            .filter(|(import, file)| reported.insert((import.to_path_buf(), file.to_path_buf())))
+            .collect::<Vec<_>>();
+        (!imports.is_empty()).then(|| format_unresolved_imports(&imports, remappings, project_root))
+    }
+}
+
+/// Formats unresolved imports for an agent or user to fix.
+///
+/// Each import is listed once with the files that import it. Only remappings whose prefix
+/// matches an unresolved import are listed, with a count of the remaining remappings, and
+/// remapping targets that do not exist are marked.
+pub fn format_unresolved_imports(
+    imports: &[(&Path, &Path)],
+    remappings: &[Remapping],
+    project_root: Option<&Path>,
+) -> String {
+    let relative = |path: &Path| {
+        project_root
+            .and_then(|root| path.strip_prefix(root).ok())
+            .unwrap_or(path)
+            .display()
+            .to_string()
+    };
+    let mut importers = BTreeMap::<String, BTreeSet<String>>::new();
+    for (import, file) in imports {
+        importers.entry(import.display().to_string()).or_default().insert(relative(file));
+    }
+
+    let mut message = String::from("Unable to resolve imports:");
+    for (import, files) in &importers {
+        let files = files.iter().map(|file| format!("\"{file}\"")).join(", ");
+        let _ = write!(message, "\n      \"{import}\" in {files}");
+    }
+
+    let matching = remappings
+        .iter()
+        .filter(|remapping| {
+            imports.iter().any(|(import, file)| {
+                import.to_string_lossy().starts_with(&remapping.name)
+                    && remapping.context.as_deref().is_none_or(|context| {
+                        relative(file).starts_with(&relative(Path::new(context)))
+                    })
+            })
+        })
+        .collect::<Vec<_>>();
+    message.push_str("\nwith remappings:");
+    for remapping in &matching {
+        let target = Path::new(&remapping.path);
+        let target = match project_root {
+            Some(root) if target.is_relative() => root.join(target),
+            _ => target.to_path_buf(),
+        };
+        let mut remapping = (*remapping).clone();
+        if let Some(root) = project_root {
+            remapping.strip_prefix(root);
+        }
+        let missing = if target.exists() { "" } else { " (target not found)" };
+        let _ = write!(message, "\n      {remapping}{missing}");
+    }
+    let omitted = remappings.len() - matching.len();
+    if matching.is_empty() {
+        let _ = write!(
+            message,
+            "\n      no remapping matches these imports ({omitted} configured); \
+             run `forge remappings` to list them"
+        );
+    } else if omitted > 0 {
+        let noun = if omitted == 1 { "remapping" } else { "remappings" };
+        let _ = write!(
+            message,
+            "\n      {omitted} other {noun} not shown; run `forge remappings` to list them"
+        );
+    }
+    message
 }
 
 #[cfg(test)]
@@ -275,23 +455,65 @@ mod tests {
     }
 
     #[test]
-    fn can_format_properly() {
-        let r = SpinnerReporter::spawn(None);
+    fn formats_unresolved_imports_with_matching_remappings() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
         let remappings: Vec<Remapping> = vec![
-            "library/=library/src/".parse().unwrap(),
-            "weird-erc20/=lib/weird-erc20/src/".parse().unwrap(),
-            "ds-test/=lib/ds-test/src/".parse().unwrap(),
-            "openzeppelin-contracts/=lib/openzeppelin-contracts/contracts/".parse().unwrap(),
+            format!("@missing/={}/node_modules/@missing/", root.display()).parse().unwrap(),
+            "lib/nested/:@oz/=lib/nested/lib/oz/".parse().unwrap(),
+            "lib/other/:@oz/=lib/other/lib/oz/".parse().unwrap(),
+            "src/=src/".parse().unwrap(),
+            "forge-std/=lib/forge-std/src/".parse().unwrap(),
         ];
-        let unresolved = vec![(Path::new("./src/Import.sol"), Path::new("src/File.col"))];
-        r.on_unresolved_imports(&unresolved, &remappings);
-        // formats:
-        // [⠒] Unable to resolve imports:
-        //       "./src/Import.sol" in "src/File.col"
-        // with remappings:
-        //       library/=library/src/
-        //       weird-erc20/=lib/weird-erc20/src/
-        //       ds-test/=lib/ds-test/src/
-        //       openzeppelin-contracts/=lib/openzeppelin-contracts/contracts/
+        let a = root.join("src/A.sol");
+        let b = root.join("src/B.sol");
+        let nested = root.join("lib/nested/src/N.sol");
+        let unresolved = [
+            (Path::new("@missing/pkg/Token.sol"), b.as_path()),
+            (Path::new("@missing/pkg/Token.sol"), a.as_path()),
+            (Path::new("@oz/Ownable.sol"), nested.as_path()),
+            (Path::new("./Local.sol"), a.as_path()),
+        ];
+        snapbox::assert_data_eq!(
+            format_unresolved_imports(&unresolved, &remappings, Some(root)),
+            snapbox::str![[r#"
+Unable to resolve imports:
+      "./Local.sol" in "src/A.sol"
+      "@missing/pkg/Token.sol" in "src/A.sol", "src/B.sol"
+      "@oz/Ownable.sol" in "lib/nested/src/N.sol"
+with remappings:
+      @missing/=node_modules/@missing/ (target not found)
+      lib/nested/:@oz/=lib/nested/lib/oz/ (target not found)
+      3 other remappings not shown; run `forge remappings` to list them
+"#]]
+        );
+
+        snapbox::assert_data_eq!(
+            format_unresolved_imports(&unresolved[3..], &remappings, Some(root)),
+            snapbox::str![[r#"
+Unable to resolve imports:
+      "./Local.sol" in "src/A.sol"
+with remappings:
+      no remapping matches these imports (5 configured); run `forge remappings` to list them
+"#]]
+        );
+    }
+
+    #[test]
+    fn reports_each_unresolved_import_once() {
+        let file = Path::new("src/ReportedOnce.sol");
+        let first = [(Path::new("reported/First.sol"), file)];
+        let both = [first[0], (Path::new("reported/Second.sol"), file)];
+        let reported = UnresolvedImports::default();
+        assert!(reported.report(&first, &[], None).is_some());
+        assert!(reported.report(&first, &[], None).is_none());
+        snapbox::assert_data_eq!(
+            reported.report(&both, &[], None).unwrap(),
+            snapbox::str![[r#"
+Unable to resolve imports:
+      "reported/Second.sol" in "src/ReportedOnce.sol"
+with remappings:
+      no remapping matches these imports (0 configured); run `forge remappings` to list them
+"#]]
+        );
     }
 }

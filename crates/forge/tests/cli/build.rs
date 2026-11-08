@@ -3,7 +3,7 @@ use foundry_compilers::{
     artifacts::{BytecodeHash, EvmVersion, remappings::Remapping},
     compilers::solc::Solc,
 };
-use foundry_config::{CompilationRestrictions, SettingsOverrides};
+use foundry_config::{CompilationRestrictions, CompilerWarnings, DenyLevel, SettingsOverrides};
 use foundry_test_utils::{
     TestProject, forgetest, forgetest_init, snapbox::IntoData, str, util::OutputExt,
 };
@@ -1601,7 +1601,7 @@ contract C is B {}
 Unable to resolve imports:
       "/badpath/B.sol" in "[..]"
 with remappings:
-      forge-std/=[..]
+      no remapping matches these imports ([..] configured); run `forge remappings` to list them
 [COMPILING_FILES] with [SOLC_VERSION]
 [SOLC_VERSION] [ELAPSED]
 
@@ -1610,7 +1610,7 @@ with remappings:
 Unable to resolve imports:
       "badpath/B.sol" in "[..]"
 with remappings:
-      forge-std/=[..]
+      no remapping matches these imports ([..] configured); run `forge remappings` to list them
 [COMPILING_FILES] with [SOLC_VERSION]
 [SOLC_VERSION] [ELAPSED]
 
@@ -2048,7 +2048,7 @@ contract Warn {
     cmd.forge_fuse().arg("build").assert_success();
     cmd.forge_fuse().args(["build", "--deny", "warnings"]).assert_failure();
     cmd.forge_fuse().args(["test", "--deny", "warnings"]).assert_failure();
-    prj.update_config(|config| config.deny = foundry_config::DenyLevel::Warnings);
+    prj.update_config(|config| config.deny = DenyLevel::Warnings);
     cmd.forge_fuse().arg("build").assert_failure();
 }
 
@@ -2439,4 +2439,338 @@ contract Broken {
 "#]]
             .is_json(),
         );
+}
+
+/// Solar release used to check that changed-only warnings behave the same with Solar.
+const SOLAR: &str = "solar:0.3.0";
+
+const WARNING_DEP: &str = r#"
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+contract Dep {
+    function dep() public view returns (uint256) {
+        return 1;
+    }
+}
+"#;
+
+const WARNING_MAIN: &str = r#"
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+import {Dep} from "./Dep.sol";
+
+contract Main is Dep {}
+"#;
+
+const WARNING_MAIN_EDITED: &str = r#"
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+import {Dep} from "./Dep.sol";
+
+contract Main is Dep {
+    function main() public view returns (uint256) {
+        return 2;
+    }
+}
+"#;
+
+const ERROR_MAIN_EDITED: &str = r#"
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+import {Dep} from "./Dep.sol";
+
+contract Main is Dep {
+    function main() public pure {
+        missing();
+    }
+}
+"#;
+
+/// Adds `Main.sol`, which imports `Dep.sol`, where only `Dep.sol` has a warning.
+fn add_compiler_warnings_sources(prj: &TestProject, warnings: CompilerWarnings) {
+    prj.add_raw_source("Dep.sol", WARNING_DEP);
+    prj.add_raw_source("Main.sol", WARNING_MAIN);
+    prj.update_config(|config| config.compiler_warnings = warnings);
+}
+
+// The first build compiles every source, so changed-only mode shows every warning. After editing
+// `Main.sol`, the warning from the unchanged `Dep.sol` is summarized.
+#[forgetest]
+fn compiler_warnings_changed_hides_unchanged_sources(prj: _, cmd: _) {
+    add_compiler_warnings_sources(&prj, CompilerWarnings::Changed);
+    cmd.arg("build").assert_success().stdout_eq(str![[r#"
+[COMPILING_FILES] with [SOLC_VERSION]
+[SOLC_VERSION] [ELAPSED]
+Compiler run successful with warnings:
+Warning (2018): Function state mutability can be restricted to pure
+ [FILE]:6:5:
+  |
+6 |     function dep() public view returns (uint256) {
+  |     ^ (Relevant source part starts here and spans across multiple lines).
+
+
+"#]]);
+
+    prj.add_raw_source("Main.sol", WARNING_MAIN_EDITED);
+    cmd.forge_fuse().arg("build").assert_success().stdout_eq(str![[r#"
+[COMPILING_FILES] with [SOLC_VERSION]
+[SOLC_VERSION] [ELAPSED]
+Compiler run successful with warnings:
+Warning (2018): Function state mutability can be restricted to pure
+ [FILE]:8:5:
+  |
+8 |     function main() public view returns (uint256) {
+  |     ^ (Relevant source part starts here and spans across multiple lines).
+
+1 compiler warning in unchanged files hidden; set `compiler_warnings = "all"` to show it
+
+"#]]);
+}
+
+#[forgetest]
+fn compiler_warnings_changed_hides_unchanged_sources_solar(prj: _, cmd: _) {
+    add_compiler_warnings_sources(&prj, CompilerWarnings::Changed);
+    cmd.args(["build", "--use", SOLAR]).assert_success().stdout_eq(str![[r#"
+[COMPILING_FILES] with Solar 0.8.38
+Solar 0.8.38 [ELAPSED]
+Compiler run successful with warnings:
+warning[2018]: function state mutability can be restricted to pure
+  [FILE]:6:5
+  │
+6 │ ┏     function dep() public view returns (uint256) {
+7 │ ┃         return 1;
+8 │ ┃     }
+  ╰╴┗━━━━━┛
+
+
+
+"#]]);
+
+    prj.add_raw_source("Main.sol", WARNING_MAIN_EDITED);
+    cmd.forge_fuse().args(["build", "--use", SOLAR]).assert_success().stdout_eq(str![[r#"
+[COMPILING_FILES] with Solar 0.8.38
+Solar 0.8.38 [ELAPSED]
+Compiler run successful with warnings:
+warning[2018]: function state mutability can be restricted to pure
+   [FILE]:8:5
+   │
+ 8 │ ┏     function main() public view returns (uint256) {
+ 9 │ ┃         return 2;
+10 │ ┃     }
+   ╰╴┗━━━━━┛
+
+
+1 compiler warning in unchanged files hidden; set `compiler_warnings = "all"` to show it
+
+"#]]);
+}
+
+// By default, warnings from unchanged imports are printed after every edit.
+#[forgetest]
+fn compiler_warnings_all_shows_unchanged_sources(prj: _, cmd: _) {
+    add_compiler_warnings_sources(&prj, CompilerWarnings::All);
+    cmd.arg("build").assert_success();
+
+    prj.add_raw_source("Main.sol", WARNING_MAIN_EDITED);
+    cmd.forge_fuse().arg("build").assert_success().stdout_eq(str![[r#"
+[COMPILING_FILES] with [SOLC_VERSION]
+[SOLC_VERSION] [ELAPSED]
+Compiler run successful with warnings:
+Warning (2018): Function state mutability can be restricted to pure
+ [FILE]:6:5:
+  |
+6 |     function dep() public view returns (uint256) {
+  |     ^ (Relevant source part starts here and spans across multiple lines).
+
+Warning (2018): Function state mutability can be restricted to pure
+ [FILE]:8:5:
+  |
+8 |     function main() public view returns (uint256) {
+  |     ^ (Relevant source part starts here and spans across multiple lines).
+
+
+"#]]);
+}
+
+#[forgetest]
+fn compiler_warnings_all_shows_unchanged_sources_solar(prj: _, cmd: _) {
+    add_compiler_warnings_sources(&prj, CompilerWarnings::All);
+    cmd.args(["build", "--use", SOLAR]).assert_success();
+
+    prj.add_raw_source("Main.sol", WARNING_MAIN_EDITED);
+    cmd.forge_fuse().args(["build", "--use", SOLAR]).assert_success().stdout_eq(str![[r#"
+[COMPILING_FILES] with Solar 0.8.38
+Solar 0.8.38 [ELAPSED]
+Compiler run successful with warnings:
+warning[2018]: function state mutability can be restricted to pure
+  [FILE]:6:5
+  │
+6 │ ┏     function dep() public view returns (uint256) {
+7 │ ┃         return 1;
+8 │ ┃     }
+  ╰╴┗━━━━━┛
+
+
+warning[2018]: function state mutability can be restricted to pure
+   [FILE]:8:5
+   │
+ 8 │ ┏     function main() public view returns (uint256) {
+ 9 │ ┃         return 2;
+10 │ ┃     }
+   ╰╴┗━━━━━┛
+
+
+
+"#]]);
+}
+
+// Errors are always printed in changed-only mode.
+#[forgetest]
+fn compiler_warnings_changed_shows_errors(prj: _, cmd: _) {
+    add_compiler_warnings_sources(&prj, CompilerWarnings::Changed);
+    cmd.arg("build").assert_success();
+
+    prj.add_raw_source("Main.sol", ERROR_MAIN_EDITED);
+    cmd.forge_fuse().arg("build").assert_failure().stderr_eq(str![[r#"
+Error: Compiler run failed:
+Error (7576): Undeclared identifier.
+ [FILE]:9:9:
+  |
+9 |         missing();
+  |         ^^^^^^^
+
+"#]]);
+}
+
+#[forgetest]
+fn compiler_warnings_changed_shows_errors_solar(prj: _, cmd: _) {
+    add_compiler_warnings_sources(&prj, CompilerWarnings::Changed);
+    cmd.args(["build", "--use", SOLAR]).assert_success();
+
+    prj.add_raw_source("Main.sol", ERROR_MAIN_EDITED);
+    cmd.forge_fuse().args(["build", "--use", SOLAR]).assert_failure().stderr_eq(str![[r#"
+Error: Compiler run failed:
+error: unresolved symbol `missing`
+  [FILE]:9:9
+  │
+9 │         missing();
+  ╰╴        ━━━━━━━
+
+"#]]);
+}
+
+// Denied warnings fail the build, so changed-only mode prints them from unchanged sources too.
+#[forgetest]
+fn compiler_warnings_changed_shows_denied_warnings(prj: _, cmd: _) {
+    add_compiler_warnings_sources(&prj, CompilerWarnings::Changed);
+    cmd.arg("build").assert_success();
+
+    prj.add_raw_source("Main.sol", WARNING_MAIN_EDITED);
+    prj.update_config(|config| config.deny = DenyLevel::Warnings);
+    cmd.forge_fuse().arg("build").assert_failure().stderr_eq(str![[r#"
+Error: Compiler run failed:
+Warning (2018): Function state mutability can be restricted to pure
+ [FILE]:6:5:
+  |
+6 |     function dep() public view returns (uint256) {
+  |     ^ (Relevant source part starts here and spans across multiple lines).
+
+Warning (2018): Function state mutability can be restricted to pure
+ [FILE]:8:5:
+  |
+8 |     function main() public view returns (uint256) {
+  |     ^ (Relevant source part starts here and spans across multiple lines).
+
+"#]]);
+}
+
+#[forgetest]
+fn compiler_warnings_changed_shows_denied_warnings_solar(prj: _, cmd: _) {
+    add_compiler_warnings_sources(&prj, CompilerWarnings::Changed);
+    cmd.args(["build", "--use", SOLAR]).assert_success();
+
+    prj.add_raw_source("Main.sol", WARNING_MAIN_EDITED);
+    prj.update_config(|config| config.deny = DenyLevel::Warnings);
+    cmd.forge_fuse().args(["build", "--use", SOLAR]).assert_failure().stderr_eq(str![[r#"
+Error: Compiler run failed:
+warning[2018]: function state mutability can be restricted to pure
+  [FILE]:6:5
+  │
+6 │ ┏     function dep() public view returns (uint256) {
+7 │ ┃         return 1;
+8 │ ┃     }
+  ╰╴┗━━━━━┛
+
+
+warning[2018]: function state mutability can be restricted to pure
+   [FILE]:8:5
+   │
+ 8 │ ┏     function main() public view returns (uint256) {
+ 9 │ ┃         return 2;
+10 │ ┃     }
+   ╰╴┗━━━━━┛
+
+"#]]);
+}
+
+// Unresolved imports are listed once with their importers, along with only the remappings that
+// match them, followed by solc's shortened missing-source errors.
+#[forgetest]
+fn unresolved_imports_are_condensed(prj: _, cmd: _) {
+    let mut remappings = (1..=30)
+        .map(|i| {
+            let target = prj.root().join(format!("node_modules/@pkg{i}"));
+            fs::create_dir_all(&target).unwrap();
+            Remapping::from_str(&format!("@pkg{i}/={}/", target.display())).unwrap().into()
+        })
+        .collect::<Vec<_>>();
+    remappings.push(Remapping::from_str("@missing/=node_modules/@missing/").unwrap().into());
+    prj.update_config(|config| config.remappings = remappings);
+    prj.add_raw_source(
+        "A.sol",
+        r#"
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+import {Token} from "@missing/pkg/Token.sol";
+contract A {}
+"#,
+    );
+    prj.add_raw_source(
+        "B.sol",
+        r#"
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+import {Token} from "@missing/pkg/Token.sol";
+import {Other} from "@missing/pkg/Other.sol";
+contract B {}
+"#,
+    );
+
+    cmd.arg("build")
+        .assert_failure()
+        .stdout_eq(str![[r#"
+Unable to resolve imports:
+      "@missing/pkg/Other.sol" in "src/B.sol"
+      "@missing/pkg/Token.sol" in "src/A.sol", "src/B.sol"
+with remappings:
+      @missing/=node_modules/@missing/ (target not found)
+      30 other remappings not shown; run `forge remappings` to list them
+[COMPILING_FILES] with [SOLC_VERSION]
+[SOLC_VERSION] [ELAPSED]
+
+"#]])
+        .stderr_eq(str![[r#"
+Error: Compiler run failed:
+Error (6275): Source "node_modules/@missing/pkg/Token.sol" not found: File not found. Searched the following locations: "[..]".
+ [FILE]:4:1:
+Error (6275): Source "node_modules/@missing/pkg/Token.sol" not found: File not found. Searched the following locations: "[..]".
+ [FILE]:4:1:
+Error (6275): Source "node_modules/@missing/pkg/Other.sol" not found: File not found. Searched the following locations: "[..]".
+ [FILE]:5:1:
+
+"#]]);
 }

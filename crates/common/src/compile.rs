@@ -6,7 +6,7 @@ use crate::{
     fs::canonicalize_path,
     preprocessor::DynamicTestLinkingPreprocessor,
     shell,
-    term::SpinnerReporter,
+    term::{BasicReporter, SpinnerReporter},
 };
 use alloy_json_abi::JsonAbi;
 use comfy_table::{
@@ -16,7 +16,8 @@ use comfy_table::{
 use eyre::{OptionExt, Result};
 use foundry_block_explorers::contract::Metadata;
 use foundry_compilers::{
-    Artifact, Project, ProjectBuilder, ProjectCompileOutput, ProjectPathsConfig, SolcConfig,
+    AggregatedCompilerOutput, Artifact, Project, ProjectBuilder, ProjectCompileOutput,
+    ProjectPathsConfig, SolcConfig,
     artifacts::{
         BytecodeObject, Contract, Error as SolcError, Severity, Source,
         output_selection::OutputSelection, remappings::Remapping,
@@ -28,10 +29,10 @@ use foundry_compilers::{
     info::ContractInfo as CompilerContractInfo,
     multi::{MultiCompiler, MultiCompilerError, MultiCompilerSettings},
     project::Preprocessor,
-    report::{BasicStdoutReporter, NoReporter, Report},
+    report::{NoReporter, Report},
     solc::SolcSettings,
 };
-use foundry_config::Config;
+use foundry_config::{CompilerWarnings, Config};
 use num_format::{Locale, ToFormattedString};
 use revm::primitives::{eip170, eip3860, hardfork::SpecId};
 use solar::{
@@ -42,13 +43,14 @@ use solar::{
 use std::{
     any::Any,
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
-    fmt::Display,
+    fmt::{Display, Write},
     io::IsTerminal,
     path::{Component, Path, PathBuf},
     str::FromStr,
     sync::Arc,
     time::Instant,
 };
+use yansi::Paint;
 
 /// A Solar compiler instance, to grant syntactic and semantic analysis capabilities.
 pub type Analysis = Arc<solar::sema::Compiler>;
@@ -107,6 +109,9 @@ pub struct ProjectCompiler {
     /// Preserves the caller's artifact policy when ABI caching enables artifacts on a cloned
     /// project.
     external_writes: bool,
+
+    /// Which compiler warnings to print.
+    compiler_warnings: CompilerWarnings,
 }
 
 impl Default for ProjectCompiler {
@@ -137,6 +142,7 @@ impl ProjectCompiler {
             abi_cache: false,
             external_compilers: None,
             external_writes: true,
+            compiler_warnings: CompilerWarnings::All,
         }
     }
 
@@ -258,6 +264,16 @@ impl ProjectCompiler {
         self
     }
 
+    /// Sets which compiler warnings to print.
+    ///
+    /// [`CompilerWarnings::Changed`] hides warnings from sources that were not recompiled in this
+    /// run. Errors and warnings denied by the project's severity filter are always printed.
+    #[inline]
+    pub const fn compiler_warnings(mut self, warnings: CompilerWarnings) -> Self {
+        self.compiler_warnings = warnings;
+        self
+    }
+
     /// Compiles the project.
     #[instrument(target = "forge::compile", skip_all)]
     pub fn compile<C: Compiler<CompilerContract = Contract>>(
@@ -296,7 +312,7 @@ impl ProjectCompiler {
         let abi_cache = self.abi_cache;
         let external_compilers = self.external_compilers.take();
         let external_writes = self.external_writes && !project.no_artifacts;
-        self.compile_with(|| {
+        self.compile_with(project, || {
             let external = external_compilers
                 .as_ref()
                 .map(|config| {
@@ -362,6 +378,7 @@ impl ProjectCompiler {
     /// Compiles the project with the given closure
     fn compile_with<C: Compiler<CompilerContract = Contract>, F>(
         self,
+        project: &Project<C>,
         f: F,
     ) -> Result<ProjectCompileOutput<C>>
     where
@@ -387,7 +404,7 @@ impl ProjectCompiler {
         )?;
 
         if bail && output.has_compiler_errors() {
-            eyre::bail!("{output}");
+            eyre::bail!("{}", format_diagnostics(&output, project, self.compiler_warnings));
         }
 
         let mut linking_error = (!self.allow_linked_libraries && !output.has_compiler_errors())
@@ -402,7 +419,7 @@ impl ProjectCompiler {
                 sh_println!("No files changed, compilation skipped")?;
             } else {
                 // print the compiler output / warnings
-                sh_println!("{output}")?;
+                sh_println!("{}", format_diagnostics(&output, project, self.compiler_warnings))?;
             }
         }
 
@@ -1000,7 +1017,7 @@ pub fn add_storage_layout_output<C: Compiler<CompilerContract = Contract>>(
 /// Configures the reporter and runs the given closure.
 ///
 /// In TTY mode, [`SpinnerReporter`] paints the progress to stderr. The non-TTY fallback
-/// still writes to stdout via `BasicStdoutReporter`; migrating that path to stderr is
+/// still writes to stdout via [`BasicReporter`]; migrating that path to stderr is
 /// part of the per-command stdout migration tracked in `docs/dev/output-channels.md`
 /// (it would shift many existing snapshot tests at once).
 pub fn with_compilation_reporter<O>(
@@ -1027,9 +1044,7 @@ fn with_compilation_reporter_and_settings<O>(
                     .with_compiler_settings(print_compiler_settings),
             )
         } else {
-            Report::new(
-                BasicStdoutReporter::default().with_compiler_settings(print_compiler_settings),
-            )
+            Report::new(BasicReporter::new(project_root, print_compiler_settings))
         }
     };
 
@@ -1092,6 +1107,137 @@ impl std::fmt::Debug for PathOrContractInfo {
             }
         }
     }
+}
+
+/// Formats the compiler diagnostics in `output` like its `Display` implementation.
+///
+/// Missing-source errors are shortened to their message and location; the compilation reporter
+/// already lists the unresolved imports. With [`CompilerWarnings::Changed`], warnings from sources
+/// whose artifacts were reused from the cache in this run are replaced by a summary line. Errors
+/// and warnings denied by the project's severity filter are always included.
+pub fn format_diagnostics<C: Compiler<CompilerContract = Contract>>(
+    output: &ProjectCompileOutput<C>,
+    project: &Project<C>,
+    warnings: CompilerWarnings,
+) -> String {
+    let compiler_output = output.output();
+    let hidden = if warnings.changed_only() {
+        unchanged_source_warnings(output, project)
+    } else {
+        HashSet::new()
+    };
+    if hidden.is_empty() && !compiler_output.errors.iter().any(|e| missing_source(e).is_some()) {
+        return output.to_string();
+    }
+
+    let mut formatted = String::from("Compiler run ");
+    let _ = if output.has_compiler_errors() {
+        write!(formatted, "{}:", "failed".red())
+    } else if output.has_compiler_warnings() {
+        write!(formatted, "{}:", "successful with warnings".yellow())
+    } else {
+        write!(formatted, "{}!", "successful".green())
+    };
+    for (index, error) in compiler_output.errors.iter().enumerate() {
+        if hidden.contains(&index) || is_ignored_diagnostic(project, compiler_output, error) {
+            continue;
+        }
+        let _ = match missing_source(error) {
+            Some(short) => write!(formatted, "\n{short}"),
+            None => write!(formatted, "\n{error}"),
+        };
+    }
+    let count = hidden.len();
+    if count > 0 {
+        let (noun, pronoun) = if count == 1 { ("warning", "it") } else { ("warnings", "them") };
+        let _ = write!(
+            formatted,
+            "\n{count} compiler {noun} in unchanged files hidden; \
+             set `compiler_warnings = \"all\"` to show {pronoun}"
+        );
+    }
+    formatted
+}
+
+/// Returns the indices of reported warnings from sources whose artifacts were all reused from the
+/// cache, i.e. sources that were only read as clean imports of recompiled files.
+fn unchanged_source_warnings<C: Compiler<CompilerContract = Contract>>(
+    output: &ProjectCompileOutput<C>,
+    project: &Project<C>,
+) -> HashSet<usize> {
+    let root = project.root();
+    let compiler_output = output.output();
+    let has_output = |file: &Path, contains: &dyn Fn(&Path) -> bool| {
+        contains(file) || contains(&root.join(file))
+    };
+    compiler_output
+        .errors
+        .iter()
+        .enumerate()
+        .filter(|(_, error)| {
+            // Denied warnings fail the build, so they stay visible like errors.
+            !error.is_error()
+                && !project.compiler_severity_filter.ge(&error.severity())
+                && !is_ignored_diagnostic(project, compiler_output, error)
+        })
+        .filter_map(|(index, error)| {
+            let file = PathBuf::from(error.source_location()?.file);
+            // Sources without artifacts, such as files with only free functions, stay visible.
+            let cached = has_output(&file, &|path| output.cached_artifacts().0.contains_key(path));
+            let compiled = has_output(&file, &|path| {
+                output.compiled_artifacts().0.contains_key(path)
+                    || compiler_output.contracts.0.contains_key(path)
+            });
+            (cached && !compiled).then_some(index)
+        })
+        .collect()
+}
+
+/// Returns whether the project's ignore settings silence `error`.
+fn is_ignored_diagnostic<C: Compiler<CompilerContract = Contract>>(
+    project: &Project<C>,
+    output: &AggregatedCompilerOutput<C>,
+    error: &C::CompilationError,
+) -> bool {
+    output.should_ignore(
+        &project.ignored_error_codes,
+        &project.ignored_error_codes_from,
+        &project.ignored_file_paths,
+        error,
+    )
+}
+
+/// Shortens a solc "Source not found" error (6275) to its message and source location.
+///
+/// Solc repeats the message and quotes the import statement for every unresolved import, while
+/// the compilation reporter already lists each import once.
+fn missing_source<E: CompilationError>(error: &E) -> Option<String> {
+    let error = error as &dyn Any;
+    let error = if let Some(error) = error.downcast_ref::<SolcError>() {
+        error
+    } else if let Some(MultiCompilerError::Solc(error)) = error.downcast_ref::<MultiCompilerError>()
+    {
+        error
+    } else {
+        return None;
+    };
+    if error.error_code != Some(6275) {
+        return None;
+    }
+    // Pre-styled diagnostics keep their own layout.
+    let formatted = error.formatted_message.as_deref().unwrap_or_default();
+    if formatted.contains('\x1b') || formatted.contains('\u{25b8}') {
+        return None;
+    }
+    let mut short = format!(
+        "{}{}",
+        format!("{} (6275)", error.severity.as_str()).paint(error.error_style()),
+        format!(": {}", error.message.trim()).paint(SolcError::message_style()),
+    );
+    if let Some(location) = formatted.lines().find(|line| line.trim_start().starts_with("-->")) {
+        let _ = write!(short, "\n{location}");
+    }
+    Some(short)
 }
 
 /// Describes the Solidity library dependencies in creation or runtime bytecode, if any.

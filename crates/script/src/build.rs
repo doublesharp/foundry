@@ -239,7 +239,8 @@ impl<FEN: FoundryEvmNetwork> PreprocessedState<FEN> {
             .allow_linked_libraries(script_config.config.allow_linked_libraries)
             .external_compilers(&script_config.config)
             .files(sources_to_compile)
-            .dynamic_test_linking(script_config.config.dynamic_test_linking);
+            .dynamic_test_linking(script_config.config.dynamic_test_linking)
+            .compiler_warnings(script_config.config.compiler_warnings);
         let compiler = if is_builtin_compiler_source(&target_path) {
             compiler.files([target_path.clone()])
         } else {

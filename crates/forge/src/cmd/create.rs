@@ -216,6 +216,7 @@ impl CreateArgs {
             .allow_linked_libraries(config.allow_linked_libraries)
             .external_compilers(&config)
             .quiet(shell::is_json())
+            .compiler_warnings(config.compiler_warnings)
             .target_files([target_path.clone()]);
         let output = compiler.compile(&project)?;
 

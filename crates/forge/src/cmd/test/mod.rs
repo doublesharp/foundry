@@ -40,7 +40,7 @@ use foundry_cli::{
 };
 use foundry_common::{
     ContractsByArtifact, EmptyTestFilter, TestFilter, TestFunctionExt, TestFunctionKind,
-    compile::{ProjectCompiler, compile_abi_project_cached},
+    compile::{ProjectCompiler, compile_abi_project_cached, format_diagnostics},
     external_compiler::is_external_artifact,
     fs,
     fs::canonicalize_path,
@@ -1533,7 +1533,7 @@ impl TestArgs {
                 .quiet(true),
         )?;
         if output.has_compiler_errors() {
-            sh_println!("{output}")?;
+            sh_println!("{}", format_diagnostics(&output, &project, config.compiler_warnings))?;
             bail!("Compilation failed");
         }
 
@@ -1713,6 +1713,7 @@ impl TestArgs {
             .allow_linked_libraries(config.allow_linked_libraries || self.list)
             .external_compilers(&config)
             .dynamic_test_linking(config.dynamic_test_linking)
+            .compiler_warnings(config.compiler_warnings)
             .quiet(shell::is_json() || self.junit);
         let (output, selected_sources, inline_config) = if self.list {
             let compiler = compiler.external_artifacts(false);
