@@ -11,6 +11,17 @@ use foundry_test_utils::{
 use serde_json::Value;
 use std::path::Path;
 
+#[cfg(unix)]
+use crate::build::{compiler_invocations, write_counting_solc};
+#[cfg(unix)]
+use foundry_compilers::solc::Solc;
+#[cfg(unix)]
+use foundry_config::SolcReq;
+#[cfg(unix)]
+use foundry_test_utils::util::SOLC_VERSION;
+#[cfg(unix)]
+use std::path::PathBuf;
+
 #[track_caller]
 fn assert_lcov(cmd: &mut TestCommand, data: impl IntoData) {
     cmd.args(["--report=lcov", "--report-file"]).assert_file_with(
@@ -6933,4 +6944,223 @@ contract TargetTest {
 "#,
     );
     cmd.arg("coverage").args(["--instrumented", "--exclude-tests"]).assert_success();
+}
+
+/// A compiler wrapper that counts standard JSON compilations, with an isolated home directory
+/// holding the shared compiler-output cache.
+#[cfg(unix)]
+struct CountedCompiler {
+    home: tempfile::TempDir,
+    invocations: PathBuf,
+    _dir: tempfile::TempDir,
+}
+
+#[cfg(unix)]
+impl CountedCompiler {
+    fn new(prj: &TestProject, compiler: &Path) -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let invocations = dir.path().join("invocations");
+        let wrapper = dir.path().join("compiler");
+        write_counting_solc(&wrapper, compiler, &invocations, "instrumented-coverage");
+        prj.update_config(|config| config.solc = Some(SolcReq::Local(wrapper)));
+        Self { home: tempfile::tempdir().unwrap(), invocations, _dir: dir }
+    }
+
+    fn solc(prj: &TestProject) -> Self {
+        let solc = Solc::find_svm_installed_version(&SOLC_VERSION.parse().unwrap()).unwrap();
+        Self::new(prj, &solc.unwrap().solc)
+    }
+
+    fn solar(prj: &TestProject) -> Self {
+        let version = "0.3.0".parse().unwrap();
+        let solar = Solc::find_installed_solar(&version)
+            .unwrap_or_else(|| Solc::blocking_install_solar(&version).unwrap());
+        Self::new(prj, &solar.solc)
+    }
+
+    /// Prepares `forge coverage --instrumented` with `args`.
+    fn coverage<'a>(&self, cmd: &'a mut TestCommand, args: &[&str]) -> &'a mut TestCommand {
+        cmd.forge_fuse().env("HOME", self.home.path());
+        cmd.args(["coverage", "--instrumented", "--exclude-tests"]).args(args)
+    }
+
+    fn invocations(&self) -> usize {
+        compiler_invocations(&self.invocations)
+    }
+}
+
+#[cfg(unix)]
+fn add_instrumented_cache_fixture(prj: &TestProject, with_decrement: bool) {
+    let decrement = if with_decrement {
+        "
+    function decrement() external {
+        number--;
+    }
+"
+    } else {
+        ""
+    };
+    prj.add_source(
+        "Counter.sol",
+        &format!(
+            "
+contract Counter {{
+    uint256 public number;
+
+    function increment() external {{
+        number++;
+    }}
+{decrement}}}
+"
+        ),
+    );
+    prj.add_test(
+        "Counter.t.sol",
+        r#"
+import {Counter} from "../src/Counter.sol";
+
+contract CounterTest {
+    function testIncrement() external {
+        Counter counter = new Counter();
+        counter.increment();
+        require(counter.number() == 1);
+    }
+}
+"#,
+    );
+}
+
+// An unchanged instrumented coverage rerun reuses compiler output instead of running solc, while
+// edits, `--force`, and `--no-cache` compile again.
+#[cfg(unix)]
+#[forgetest]
+fn instrumented_coverage_reuses_solc_output(prj: _, cmd: _) {
+    add_instrumented_cache_fixture(&prj, true);
+    let compiler = CountedCompiler::solc(&prj);
+    let report = str![[r#"
+[COMPILING_FILES] with [SOLC_VERSION]
+[SOLC_VERSION] [ELAPSED]
+Compiler run successful!
+Analysing contracts...
+Running tests...
+
+Ran 1 test for test/Counter.t.sol:CounterTest
+[PASS] testIncrement() ([GAS])
+Suite result: ok. 1 passed; 0 failed; 0 skipped; [ELAPSED]
+
+Ran 1 test suite [ELAPSED]: 1 tests passed, 0 failed, 0 skipped (1 total tests)
+
+╭-----------------+--------------+--------------+------------+--------------╮
+| File            | % Lines      | % Statements | % Branches | % Funcs      |
++===========================================================================+
+| src/Counter.sol | 50.00% (2/4) | 50.00% (1/2) | N/A (0/0)  | 50.00% (1/2) |
+|-----------------+--------------+--------------+------------+--------------|
+| Total           | 50.00% (2/4) | 50.00% (1/2) | N/A (0/0)  | 50.00% (1/2) |
+╰-----------------+--------------+--------------+------------+--------------╯
+
+"#]];
+
+    compiler.coverage(&mut cmd, &[]).assert_success().stdout_eq(report.clone());
+    assert_eq!(compiler.invocations(), 1);
+    compiler.coverage(&mut cmd, &[]).assert_success().stdout_eq(report.clone());
+    assert_eq!(compiler.invocations(), 1, "unchanged rerun must not invoke solc");
+
+    compiler.coverage(&mut cmd, &["--force"]).assert_success().stdout_eq(report);
+    assert_eq!(compiler.invocations(), 2, "--force must bypass the compiler-output cache");
+    compiler.coverage(&mut cmd, &["--no-cache"]).assert_success();
+    assert_eq!(compiler.invocations(), 3, "--no-cache must bypass the compiler-output cache");
+
+    add_instrumented_cache_fixture(&prj, false);
+    let report = str![[r#"
+[COMPILING_FILES] with [SOLC_VERSION]
+[SOLC_VERSION] [ELAPSED]
+Compiler run successful!
+Analysing contracts...
+Running tests...
+
+Ran 1 test for test/Counter.t.sol:CounterTest
+[PASS] testIncrement() ([GAS])
+Suite result: ok. 1 passed; 0 failed; 0 skipped; [ELAPSED]
+
+Ran 1 test suite [ELAPSED]: 1 tests passed, 0 failed, 0 skipped (1 total tests)
+
+╭-----------------+---------------+---------------+------------+---------------╮
+| File            | % Lines       | % Statements  | % Branches | % Funcs       |
++==============================================================================+
+| src/Counter.sol | 100.00% (2/2) | 100.00% (1/1) | N/A (0/0)  | 100.00% (1/1) |
+|-----------------+---------------+---------------+------------+---------------|
+| Total           | 100.00% (2/2) | 100.00% (1/1) | N/A (0/0)  | 100.00% (1/1) |
+╰-----------------+---------------+---------------+------------+---------------╯
+
+"#]];
+    compiler.coverage(&mut cmd, &[]).assert_success().stdout_eq(report.clone());
+    assert_eq!(compiler.invocations(), 4, "an edited source must compile");
+    compiler.coverage(&mut cmd, &[]).assert_success().stdout_eq(report);
+    assert_eq!(compiler.invocations(), 4);
+}
+
+// Solar builds reuse compiler output in the same way.
+#[cfg(unix)]
+#[forgetest]
+fn instrumented_coverage_reuses_solar_output(prj: _, cmd: _) {
+    add_instrumented_cache_fixture(&prj, true);
+    let compiler = CountedCompiler::solar(&prj);
+    let report = str![[r#"
+[COMPILING_FILES] with Solar 0.8.38
+Solar 0.8.38 [ELAPSED]
+Compiler run successful!
+Analysing contracts...
+Running tests...
+
+Ran 1 test for test/Counter.t.sol:CounterTest
+[PASS] testIncrement() ([GAS])
+Suite result: ok. 1 passed; 0 failed; 0 skipped; [ELAPSED]
+
+Ran 1 test suite [ELAPSED]: 1 tests passed, 0 failed, 0 skipped (1 total tests)
+
+╭-----------------+--------------+--------------+------------+--------------╮
+| File            | % Lines      | % Statements | % Branches | % Funcs      |
++===========================================================================+
+| src/Counter.sol | 50.00% (2/4) | 50.00% (1/2) | N/A (0/0)  | 50.00% (1/2) |
+|-----------------+--------------+--------------+------------+--------------|
+| Total           | 50.00% (2/4) | 50.00% (1/2) | N/A (0/0)  | 50.00% (1/2) |
+╰-----------------+--------------+--------------+------------+--------------╯
+
+"#]];
+
+    compiler.coverage(&mut cmd, &[]).assert_success().stdout_eq(report.clone());
+    assert_eq!(compiler.invocations(), 1);
+    compiler.coverage(&mut cmd, &[]).assert_success().stdout_eq(report.clone());
+    assert_eq!(compiler.invocations(), 1, "unchanged rerun must not invoke Solar");
+
+    compiler.coverage(&mut cmd, &["--force"]).assert_success().stdout_eq(report);
+    assert_eq!(compiler.invocations(), 2, "--force must bypass the compiler-output cache");
+
+    add_instrumented_cache_fixture(&prj, false);
+    let report = str![[r#"
+[COMPILING_FILES] with Solar 0.8.38
+Solar 0.8.38 [ELAPSED]
+Compiler run successful!
+Analysing contracts...
+Running tests...
+
+Ran 1 test for test/Counter.t.sol:CounterTest
+[PASS] testIncrement() ([GAS])
+Suite result: ok. 1 passed; 0 failed; 0 skipped; [ELAPSED]
+
+Ran 1 test suite [ELAPSED]: 1 tests passed, 0 failed, 0 skipped (1 total tests)
+
+╭-----------------+---------------+---------------+------------+---------------╮
+| File            | % Lines       | % Statements  | % Branches | % Funcs       |
++==============================================================================+
+| src/Counter.sol | 100.00% (2/2) | 100.00% (1/1) | N/A (0/0)  | 100.00% (1/1) |
+|-----------------+---------------+---------------+------------+---------------|
+| Total           | 100.00% (2/2) | 100.00% (1/1) | N/A (0/0)  | 100.00% (1/1) |
+╰-----------------+---------------+---------------+------------+---------------╯
+
+"#]];
+    compiler.coverage(&mut cmd, &[]).assert_success().stdout_eq(report.clone());
+    assert_eq!(compiler.invocations(), 3, "an edited source must compile");
+    compiler.coverage(&mut cmd, &[]).assert_success().stdout_eq(report);
+    assert_eq!(compiler.invocations(), 3);
 }

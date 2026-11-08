@@ -25,7 +25,7 @@ use foundry_config::ExternalCompiler;
 use std::os::unix::fs::{PermissionsExt, symlink};
 
 #[cfg(unix)]
-fn write_counting_solc(path: &Path, solc: &Path, invocations: &Path, identity: &str) {
+pub(crate) fn write_counting_solc(path: &Path, solc: &Path, invocations: &Path, identity: &str) {
     fs::write(
         path,
         format!(
@@ -49,7 +49,7 @@ exec '{}' "$@"
 }
 
 #[cfg(unix)]
-fn compiler_invocations(path: &Path) -> usize {
+pub(crate) fn compiler_invocations(path: &Path) -> usize {
     fs::read_to_string(path).map_or(0, |contents| contents.lines().count())
 }
 

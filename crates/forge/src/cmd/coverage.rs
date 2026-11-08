@@ -285,7 +285,14 @@ impl CoverageArgs {
 
     /// Builds the project.
     fn build(&self, config: &Config, filter: &ProjectPathsAwareFilter) -> Result<CoverageBuild> {
-        let mut project = config.ephemeral_project()?;
+        // Instrumentation rewrites sources deterministically, so the instrumented compiler input
+        // identifies its output. Reusing raw compiler output skips the compiler for unchanged
+        // inputs while instrumentation metadata is still rebuilt on every run.
+        let mut project = if self.instrumented {
+            config.ephemeral_project_with_compiler_cache()?
+        } else {
+            config.ephemeral_project()?
+        };
         // A contended or unavailable cache retains ephemeral compilation. Keep the lock until
         // artifacts and build contexts have been loaded or published together.
         let cache = (!self.instrumented && config.cache && !config.deny.warnings())
