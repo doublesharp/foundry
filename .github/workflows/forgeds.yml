@@ -143,6 +143,19 @@ jobs:
           key: forgeds-v2-${{ matrix.target }}
           cache-on-failure: true
 
+      - name: Configure Cargo Steward wrapper
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          if [[ -n "${RUSTC_WRAPPER:-}" && "$RUSTC_WRAPPER" != cargo-steward ]]; then
+            printf 'CARGO_STEWARD_INNER=%s\n' "$RUSTC_WRAPPER" >> "$GITHUB_ENV"
+          fi
+          echo "RUSTC_WRAPPER=cargo-steward" >> "$GITHUB_ENV"
+      - name: Track Cargo build cache
+        if: runner.os != 'Windows'
+        uses: 0xdoublesharp/cargo-steward@v0.2.2
+        with:
+          mode: start
       - name: Apple Silicon setup
         if: matrix.target == 'aarch64-apple-darwin'
         run: |
@@ -207,6 +220,12 @@ jobs:
           path: ${{ needs.resolve.outputs.prefix }}_${{ matrix.platform }}_${{ matrix.arch }}.tar.gz*
           retention-days: 7
           if-no-files-found: error
+      - name: Trim Cargo build cache
+        if: runner.os != 'Windows'
+        uses: 0xdoublesharp/cargo-steward@v0.2.2
+        with:
+          mode: trim
+          budget: 4GiB
 
   publish:
     name: publish release
