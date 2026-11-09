@@ -66,6 +66,23 @@ jobs:
           cache-bin: false
           prefix-key: v2-editor-forge
           save-if: ${{ github.ref == 'refs/heads/master' }}
+      - name: Install Cargo Steward v0.2.0
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          installer="$RUNNER_TEMP/install-cargo-steward.sh"
+          curl --fail --silent --show-error --location --retry 3 https://raw.githubusercontent.com/0xdoublesharp/cargo-steward/v0.2.0/scripts/install.sh -o "$installer"
+          sh "$installer" --release 0.2.0 --repo 0xdoublesharp/cargo-steward --no-setup
+          echo "${CARGO_HOME:-$HOME/.cargo}/bin" >> "$GITHUB_PATH"
+          if [[ -n "${RUSTC_WRAPPER:-}" && "$RUSTC_WRAPPER" != cargo-steward ]]; then
+            printf 'CARGO_STEWARD_INNER=%s\n' "$RUSTC_WRAPPER" >> "$GITHUB_ENV"
+          fi
+          echo "RUSTC_WRAPPER=cargo-steward" >> "$GITHUB_ENV"
+      - name: Track Cargo build cache
+        if: runner.os != 'Windows'
+        uses: 0xdoublesharp/cargo-steward@v0.2.0
+        with:
+          mode: start
       - run: npm ci
         working-directory: editors/vscode
       - run: npm run check && npm test && npm run bundle:check
@@ -87,6 +104,12 @@ jobs:
         working-directory: editors/vscode
         env:
           FORGE_PATH: ${{ github.workspace }}/target/debug/forge
+      - name: Trim Cargo build cache
+        if: runner.os != 'Windows'
+        uses: 0xdoublesharp/cargo-steward@v0.2.0
+        with:
+          mode: trim
+          budget: 4GiB
 
   zed:
     runs-on: depot-ubuntu-latest
@@ -113,7 +136,32 @@ jobs:
         with:
           workspaces: editors/zed
           cache-bin: false
+      - name: Install Cargo Steward v0.2.0
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          installer="$RUNNER_TEMP/install-cargo-steward.sh"
+          curl --fail --silent --show-error --location --retry 3 https://raw.githubusercontent.com/0xdoublesharp/cargo-steward/v0.2.0/scripts/install.sh -o "$installer"
+          sh "$installer" --release 0.2.0 --repo 0xdoublesharp/cargo-steward --no-setup
+          echo "${CARGO_HOME:-$HOME/.cargo}/bin" >> "$GITHUB_PATH"
+          if [[ -n "${RUSTC_WRAPPER:-}" && "$RUSTC_WRAPPER" != cargo-steward ]]; then
+            printf 'CARGO_STEWARD_INNER=%s\n' "$RUSTC_WRAPPER" >> "$GITHUB_ENV"
+          fi
+          echo "RUSTC_WRAPPER=cargo-steward" >> "$GITHUB_ENV"
+      - name: Track Cargo build cache (editors/zed)
+        if: runner.os != 'Windows'
+        uses: 0xdoublesharp/cargo-steward@v0.2.0
+        with:
+          mode: start
+          working-directory: editors/zed
       - run: cargo +nightly fmt --manifest-path editors/zed/Cargo.toml -- --check
       - run: cargo clippy --locked --manifest-path editors/zed/Cargo.toml --all-targets -- -D warnings
       - run: cargo test --locked --manifest-path editors/zed/Cargo.toml
       - run: cargo build --locked --manifest-path editors/zed/Cargo.toml --target wasm32-wasip2 --release
+      - name: Trim Cargo build cache (editors/zed)
+        if: runner.os != 'Windows'
+        uses: 0xdoublesharp/cargo-steward@v0.2.0
+        with:
+          mode: trim
+          working-directory: editors/zed
+          budget: 4GiB

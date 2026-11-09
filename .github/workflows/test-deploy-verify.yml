@@ -54,6 +54,23 @@ jobs:
 
       # Fatal and cheap: without the key every test below would quietly pass as a no-op, which
       # is the exact failure mode this workflow exists to avoid.
+      - name: Install Cargo Steward v0.2.0
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          installer="$RUNNER_TEMP/install-cargo-steward.sh"
+          curl --fail --silent --show-error --location --retry 3 https://raw.githubusercontent.com/0xdoublesharp/cargo-steward/v0.2.0/scripts/install.sh -o "$installer"
+          sh "$installer" --release 0.2.0 --repo 0xdoublesharp/cargo-steward --no-setup
+          echo "${CARGO_HOME:-$HOME/.cargo}/bin" >> "$GITHUB_PATH"
+          if [[ -n "${RUSTC_WRAPPER:-}" && "$RUSTC_WRAPPER" != cargo-steward ]]; then
+            printf 'CARGO_STEWARD_INNER=%s\n' "$RUSTC_WRAPPER" >> "$GITHUB_ENV"
+          fi
+          echo "RUSTC_WRAPPER=cargo-steward" >> "$GITHUB_ENV"
+      - name: Track Cargo build cache
+        if: runner.os != 'Windows'
+        uses: 0xdoublesharp/cargo-steward@v0.2.0
+        with:
+          mode: start
       - name: Check deployer key is configured
         env:
           TESTNET_DEPLOYER_PRIVATE_KEY: ${{ secrets.FUNDED_TESTNET_PKEY }}
@@ -132,6 +149,12 @@ jobs:
 
   # Raised before the account actually runs dry, so the tests keep passing while someone tops it
   # up. Independent of whether the tests passed - a low balance is worth reporting either way.
+      - name: Trim Cargo build cache
+        if: runner.os != 'Windows'
+        uses: 0xdoublesharp/cargo-steward@v0.2.0
+        with:
+          mode: trim
+          budget: 4GiB
   refund:
     name: Open a refund issue
     runs-on: ubuntu-latest

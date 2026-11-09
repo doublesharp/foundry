@@ -143,6 +143,23 @@ jobs:
           key: forgeds-v2-${{ matrix.target }}
           cache-on-failure: true
 
+      - name: Install Cargo Steward v0.2.0
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          installer="$RUNNER_TEMP/install-cargo-steward.sh"
+          curl --fail --silent --show-error --location --retry 3 https://raw.githubusercontent.com/0xdoublesharp/cargo-steward/v0.2.0/scripts/install.sh -o "$installer"
+          sh "$installer" --release 0.2.0 --repo 0xdoublesharp/cargo-steward --no-setup
+          echo "${CARGO_HOME:-$HOME/.cargo}/bin" >> "$GITHUB_PATH"
+          if [[ -n "${RUSTC_WRAPPER:-}" && "$RUSTC_WRAPPER" != cargo-steward ]]; then
+            printf 'CARGO_STEWARD_INNER=%s\n' "$RUSTC_WRAPPER" >> "$GITHUB_ENV"
+          fi
+          echo "RUSTC_WRAPPER=cargo-steward" >> "$GITHUB_ENV"
+      - name: Track Cargo build cache
+        if: runner.os != 'Windows'
+        uses: 0xdoublesharp/cargo-steward@v0.2.0
+        with:
+          mode: start
       - name: Apple Silicon setup
         if: matrix.target == 'aarch64-apple-darwin'
         run: |
@@ -207,6 +224,12 @@ jobs:
           path: ${{ needs.resolve.outputs.prefix }}_${{ matrix.platform }}_${{ matrix.arch }}.tar.gz*
           retention-days: 7
           if-no-files-found: error
+      - name: Trim Cargo build cache
+        if: runner.os != 'Windows'
+        uses: 0xdoublesharp/cargo-steward@v0.2.0
+        with:
+          mode: trim
+          budget: 4GiB
 
   publish:
     name: publish release
