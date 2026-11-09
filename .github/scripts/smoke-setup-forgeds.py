@@ -4,9 +4,15 @@
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import tempfile
+
+
+def shared_cache_hit(stderr):
+    plain = re.sub(r"\x1b\[[0-9;]*m", "", stderr)
+    return 'outcome="hit"' in plain or 'outcome=hit' in plain
 
 
 def verify(env):
@@ -44,7 +50,7 @@ def verify(env):
             tests = [test for suite in result.values() for test in suite["test_results"].values()]
             assert len(tests) == 1 and tests[0]["status"] == "Success", result
             if phase == "shared-cache":
-                assert 'outcome="hit"' in run.stderr or 'outcome=hit' in run.stderr, run.stderr
+                assert shared_cache_hit(run.stderr), run.stderr
     print("Verified action PATH, native alias, zero warm downloads, Solar test and shared compiler cache.")
 
 

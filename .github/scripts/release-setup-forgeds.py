@@ -16,10 +16,6 @@ FILES = {
     "LICENSE-APACHE": "LICENSE-APACHE",
     ".github/forgeds-toolchain.json": ".github/forgeds-toolchain.json",
     ".github/scripts/setup-forgeds.py": ".github/scripts/setup-forgeds.py",
-    ".github/scripts/smoke-setup-forgeds.py": ".github/scripts/smoke-setup-forgeds.py",
-    ".github/scripts/release-setup-forgeds.py": ".github/scripts/release-setup-forgeds.py",
-    ".github/scripts/tests/test_setup_forgeds.py": ".github/scripts/tests/test_setup_forgeds.py",
-    ".github/workflows/setup-forgeds.yml": ".github/workflows/setup-forgeds.yml",
 }
 
 
@@ -69,7 +65,7 @@ def publish(env):
         notes = (
             f"Install verified prebuilt forgeds and optional Solar with `doublesharp/foundry@{tag}`. "
             "Exact executable caching avoids downloads on warm runners; shared Solidity compiler caching is optional. "
-            "The release contains only the action, installer, documentation and checks.\n\n"
+            "The release contains only the action, installer, pinned checksums, documentation and licenses.\n\n"
             f"Source: https://github.com/{repository}/commit/{source}\n"
         )
         notes_path = Path(env["RUNNER_TEMP"]) / "setup-forgeds-release-notes.md"

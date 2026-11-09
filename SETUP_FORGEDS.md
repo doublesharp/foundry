@@ -11,9 +11,9 @@ It needs no Rust toolchain, source compilation, application launcher, or package
 - run: forgeds test
 ```
 
-Use `@setup-forgeds-v1.0.0` or the release commit SHA to pin the action itself. The moving
+Use `@setup-forgeds-v1.0.1` or the release commit SHA to pin the action itself. The moving
 `@setup-forgeds-v1` tag follows compatible releases. Action release refs contain only the installer,
-metadata, documentation and checks, so the runner avoids downloading the full Foundry source tree.
+metadata, pinned checksums, documentation and licenses, so the runner avoids downloading the full Foundry source tree.
 
 ## Solar and existing Forge commands
 
@@ -78,14 +78,14 @@ downloaded by this invocation and is `0` on a warm install.
 Commit changes to the action, bundled pins and tests, then push an action source-release tag:
 
 ```sh
-git tag setup-forgeds-release-v1.0.1
-git push origin setup-forgeds-release-v1.0.1
+git tag setup-forgeds-release-v1.0.2
+git push origin setup-forgeds-release-v1.0.2
 ```
 
 The `Setup forgeds action` workflow runs unit checks and real cold/warm installs on Linux x86_64,
 Linux ARM64, Apple Silicon macOS and Windows. It exercises the native alias, Solar compilation
 and shared compiler reuse. After all jobs pass, it packages only the action files, publishes
-`setup-forgeds-v1.0.1`, creates its GitHub release, and updates `setup-forgeds-v1`. Published
+`setup-forgeds-v1.0.2`, creates its GitHub release, and updates `setup-forgeds-v1`. Published
 version tags stay fixed. The source commit is linked in the release notes.
 
 The workflow also supports manual dispatch with a `version` input; empty validates without

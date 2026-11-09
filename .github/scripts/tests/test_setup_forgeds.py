@@ -222,6 +222,14 @@ class SetupForgedsTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Invalid multiline output"):
             MODULE.outputs({"path": "bad\ninjection=value"}, env)
 
+    def test_smoke_recognizes_shared_cache_hits_in_colored_ci_logs(self):
+        spec = importlib.util.spec_from_file_location("smoke_setup_forgeds", SCRIPT.with_name("smoke-setup-forgeds.py"))
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        self.assertTrue(module.shared_cache_hit('\x1b[3moutcome\x1b[0m\x1b[2m=\x1b[0m"hit"'))
+        self.assertTrue(module.shared_cache_hit('outcome=hit'))
+        self.assertFalse(module.shared_cache_hit('outcome="miss"'))
+
     def test_release_tree_is_small_self_contained_and_preserves_source_index(self):
         release = SCRIPT.with_name("release-setup-forgeds.py")
         spec = importlib.util.spec_from_file_location("release_setup_forgeds", release)
