@@ -1,0 +1,96 @@
+name: Setup forgeds and Solar
+description: Install verified prebuilt forgeds and optional Solar, with reusable binary and Solidity compiler caches
+author: doublesharp
+branding:
+  icon: zap
+  color: orange
+
+inputs:
+  forgeds-version:
+    description: Full forgeds commit SHA. Empty uses this action's pinned build; latest explicitly follows rolling builds.
+    required: false
+    default: ''
+  solar-version:
+    description: Exact Solar release, such as v0.3.0. Empty skips Solar. Installing Solar does not select it as the compiler.
+    required: false
+    default: ''
+  forge-alias:
+    description: Add a forge executable that runs forgeds, taking precedence over an existing forge on PATH.
+    required: false
+    default: 'false'
+  cache:
+    description: Restore and save the verified executables using an exact toolchain cache key.
+    required: false
+    default: 'true'
+  cache-compilers:
+    description: Restore and save the shared Solidity compiler result cache. Enable for jobs that compile Solidity.
+    required: false
+    default: 'false'
+  cache-prefix:
+    description: Namespace for the optional compiler result cache, for example contracts or development.
+    required: false
+    default: default
+
+outputs:
+  bin-dir:
+    description: Directory added to PATH.
+    value: ${{ steps.install.outputs.bin-dir }}
+  forgeds-path:
+    description: Absolute path to forgeds.
+    value: ${{ steps.install.outputs.forgeds-path }}
+  forge-path:
+    description: Absolute path to the forge alias, or empty when disabled.
+    value: ${{ steps.install.outputs.forge-path }}
+  solar-path:
+    description: Absolute path to Solar, or empty when disabled.
+    value: ${{ steps.install.outputs.solar-path }}
+  forgeds-commit:
+    description: Verified full forgeds commit SHA.
+    value: ${{ steps.install.outputs.forgeds-commit }}
+  solar-commit:
+    description: Verified full Solar commit SHA, or empty when disabled.
+    value: ${{ steps.install.outputs.solar-commit }}
+  cache-hit:
+    description: Whether the exact executable cache was restored.
+    value: ${{ steps.binaries.outputs.cache-hit }}
+  downloads:
+    description: Number of binary archives downloaded, zero on a warm install.
+    value: ${{ steps.install.outputs.downloads }}
+
+runs:
+  using: composite
+  steps:
+    - name: Resolve prebuilt toolchain
+      id: plan
+      shell: bash
+      env:
+        FORGEDS_VERSION: ${{ inputs.forgeds-version }}
+        SOLAR_VERSION: ${{ inputs.solar-version }}
+        FORGE_ALIAS: ${{ inputs.forge-alias }}
+        CACHE_BINARIES: ${{ inputs.cache }}
+        CACHE_COMPILERS: ${{ inputs.cache-compilers }}
+        CACHE_PREFIX: ${{ inputs.cache-prefix }}
+      run: python3 "$GITHUB_ACTION_PATH/.github/scripts/setup-forgeds.py" plan
+
+    - name: Cache verified executables
+      id: binaries
+      if: steps.plan.outputs.binary-cache == 'true'
+      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+      with:
+        path: ${{ steps.plan.outputs.bin-dir }}
+        key: ${{ steps.plan.outputs.tool-key }}
+
+    - name: Install and verify prebuilt executables
+      id: install
+      shell: bash
+      env:
+        PLAN_PATH: ${{ steps.plan.outputs.plan-path }}
+      run: python3 "$GITHUB_ACTION_PATH/.github/scripts/setup-forgeds.py" install
+
+    - name: Cache shared Solidity compiler results
+      if: steps.plan.outputs.compiler-cache == 'true'
+      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+      with:
+        path: ${{ steps.plan.outputs.compiler-path }}
+        key: ${{ steps.plan.outputs.compiler-key }}
+        restore-keys: ${{ steps.plan.outputs.compiler-prefix }}
