@@ -91,3 +91,7 @@ version tags stay fixed. The source commit is linked in the release notes.
 The workflow also supports manual dispatch with a `version` input; empty validates without
 publishing. Ordinary pushes touching action files run validation only. Binary releases keep
 their existing independent `forgeds-*` workflow.
+
+The workflow publishes GitHub releases and moving major tags automatically. To list a new
+version in Marketplace, select **Publish this Action to the GitHub Marketplace** in that
+release's editor. GitHub's release API does not expose this checkbox.

@@ -79,6 +79,11 @@ def publish(env):
                     "origin", f"{commit}:refs/tags/{major}"], check=True)
     print(json.dumps({"tag": tag, "major": major, "commit": commit, "source": source,
                       "url": f"https://github.com/{repository}/releases/tag/{tag}"}))
+    if env.get("GITHUB_STEP_SUMMARY"):
+        with Path(env["GITHUB_STEP_SUMMARY"]).open("a") as summary:
+            summary.write(f"Published `{repository}@{tag}` and updated `{major}`.\n\n"
+                          f"[List this version in Marketplace](https://github.com/{repository}/releases/edit/{tag}) "
+                          "by selecting **Publish this Action to the GitHub Marketplace**.\n")
 
 
 if __name__ == "__main__":
