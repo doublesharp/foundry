@@ -71,7 +71,8 @@ def publish(env):
         notes_path = Path(env["RUNNER_TEMP"]) / "setup-forgeds-release-notes.md"
         notes_path.write_text(notes)
         subprocess.run(["gh", "release", "create", tag, "--repo", repository, "--verify-tag",
-                        "--title", "Setup forgeds and Solar v" + version, "--notes-file", str(notes_path), "--latest=false"], check=True)
+                        "--target", commit, "--title", "Setup forgeds and Solar v" + version,
+                        "--notes-file", str(notes_path), "--latest=false"], check=True)
     # Update only this action's moving major tag, with a lease against concurrent releases.
     old_major = remote_tag(major)
     subprocess.run(["git", "push", "--force-with-lease=refs/tags/" + major + ":" + (old_major or ""),
