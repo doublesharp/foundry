@@ -5,6 +5,9 @@ Doublesharp's Foundry fork, focused on faster local development and CI.
 [what's different](FORGEDS.md): shared compiler caching across worktrees, instrumented coverage,
 and quieter compiler output for AI agents.
 
+Use [`doublesharp/foundry@setup-forgeds-v1`](SETUP_FORGEDS.md) to install verified prebuilt
+forgeds and optional Solar in GitHub Actions, with reusable executable and compiler caches.
+
 The upstream Foundry documentation follows.
 
 <div align="center">

@@ -6,6 +6,9 @@ This page covers what is different.
 
 ## Install
 
+For GitHub Actions, use [Setup forgeds and Solar](SETUP_FORGEDS.md). It installs prebuilt
+binaries, supports pinned versions, and can reuse shared Solidity compiler results between jobs.
+
 Prebuilt binaries are on the [`forgeds` release][release]. These links always serve the newest
 build:
 

@@ -1,0 +1,107 @@
+name: Setup forgeds action
+
+permissions:
+  contents: read
+
+on:
+  push:
+    branches: ['**']
+    tags: ['setup-forgeds-release-v*']
+    paths:
+      - action.yml
+      - SETUP_FORGEDS.md
+      - .github/forgeds-toolchain.json
+      - .github/scripts/*setup-forgeds.py
+      - .github/scripts/tests/test_setup_forgeds.py
+      - .github/workflows/setup-forgeds.yml
+  pull_request:
+    paths:
+      - action.yml
+      - SETUP_FORGEDS.md
+      - .github/forgeds-toolchain.json
+      - .github/scripts/*setup-forgeds.py
+      - .github/scripts/tests/test_setup_forgeds.py
+      - .github/workflows/setup-forgeds.yml
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Action version to publish, such as 1.0.1. Empty runs validation only.
+        required: false
+        default: ''
+
+concurrency:
+  group: setup-forgeds-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Test installer and composite action
+        env:
+          PYTHONDONTWRITEBYTECODE: '1'
+          TMPDIR: ${{ runner.temp }}
+        run: python3 -m unittest discover -s .github/scripts/tests -p test_setup_forgeds.py -v
+
+  smoke:
+    name: Prebuilt install (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm, macos-15, windows-2022]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install pinned prebuilt tools
+        id: cold
+        uses: ./
+        with:
+          solar-version: v0.3.0
+          forge-alias: 'true'
+          cache-compilers: 'true'
+          cache-prefix: setup-action-smoke
+      - name: Reuse installed tools without downloading
+        id: warm
+        uses: ./
+        with:
+          solar-version: v0.3.0
+          forge-alias: 'true'
+          cache-compilers: 'true'
+          cache-prefix: setup-action-smoke
+      - name: Exercise installed tools and shared compiler results
+        env:
+          FORGEDS_PATH: ${{ steps.warm.outputs.forgeds-path }}
+          FORGE_PATH: ${{ steps.warm.outputs.forge-path }}
+          SOLAR_PATH: ${{ steps.warm.outputs.solar-path }}
+          WARM_DOWNLOADS: ${{ steps.warm.outputs.downloads }}
+        run: python3 .github/scripts/smoke-setup-forgeds.py
+
+  publish:
+    if: startsWith(github.ref, 'refs/tags/setup-forgeds-release-v') || (github.event_name == 'workflow_dispatch' && inputs.version != '')
+    needs: [unit, smoke]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Publish minimal action release and major version tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_VERSION: ${{ inputs.version }}
+          GIT_AUTHOR_NAME: github-actions[bot]
+          GIT_AUTHOR_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
+          GIT_COMMITTER_NAME: github-actions[bot]
+          GIT_COMMITTER_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
+        run: python3 .github/scripts/release-setup-forgeds.py

@@ -1,0 +1,49 @@
+{
+  "forgeds": {
+    "commit": "4ca15fcba25aa61a1b436d28b428e30b459f3d56",
+    "assets": {
+      "macOS-ARM64": {
+        "name": "forgeds-4ca15fc_darwin_arm64.tar.gz",
+        "sha256": "39c4b0fd5ab8cd7ee2b411a1e0a5ac8519a5566bdd25d50f90ae9bd47ab01f63"
+      },
+      "Linux-X64": {
+        "name": "forgeds-4ca15fc_linux_amd64.tar.gz",
+        "sha256": "a1341d56a7fc743b4d87853596baaf0931a6e4348106def1a6994bc793c5b62f"
+      },
+      "Linux-ARM64": {
+        "name": "forgeds-4ca15fc_linux_arm64.tar.gz",
+        "sha256": "1555c23e95f42d4c0c907181a0ce157d42e40fa8028e9026caaf524ee007d522"
+      },
+      "Windows-X64": {
+        "name": "forgeds-4ca15fc_win32_amd64.tar.gz",
+        "sha256": "b43253bc6fb866df17c8a567ff41ce5ef8d615bc93739317c1f4884ed9566f64"
+      }
+    }
+  },
+  "solar": {
+    "version": "v0.3.0",
+    "commit": "e7a91fc70f29dc8d0c236d56a2aa7706dc2555cf",
+    "assets": {
+      "macOS-ARM64": {
+        "name": "solar-aarch64-apple-darwin.tar.gz",
+        "sha256": "6d213a61324b77d55868795b516661c84ec77b41c60befddb4f0cb7a0168d0b1"
+      },
+      "macOS-X64": {
+        "name": "solar-x86_64-apple-darwin.tar.gz",
+        "sha256": "df93b34f1568d4bd7bd2ddf46d5d5056be76166c99d008c4186166c2dbe8238a"
+      },
+      "Linux-X64": {
+        "name": "solar-x86_64-unknown-linux-gnu.tar.gz",
+        "sha256": "15a613746dd30ca772664824d97feddb5c5163ec2380aa556a2d270eacedc5fc"
+      },
+      "Linux-ARM64": {
+        "name": "solar-aarch64-unknown-linux-gnu.tar.gz",
+        "sha256": "8da0507426756ec175d281d421ea4fb44d02e3fb9f46ff8ff79802c5d547e95c"
+      },
+      "Windows-X64": {
+        "name": "solar-x86_64-pc-windows-msvc.zip",
+        "sha256": "d3c75bc2d28c330f3c83b6a122a5490c4ad01d2afe64f4598238e75434affc0d"
+      }
+    }
+  }
+}
