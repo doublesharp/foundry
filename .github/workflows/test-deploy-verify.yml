@@ -64,7 +64,7 @@ jobs:
           echo "RUSTC_WRAPPER=cargo-steward" >> "$GITHUB_ENV"
       - name: Track Cargo build cache
         if: runner.os != 'Windows'
-        uses: 0xdoublesharp/cargo-steward@v0.2.2
+        uses: 0xdoublesharp/cargo-steward@v0.2.6
         with:
           mode: start
       - name: Check deployer key is configured
@@ -147,7 +147,7 @@ jobs:
   # up. Independent of whether the tests passed - a low balance is worth reporting either way.
       - name: Trim Cargo build cache
         if: runner.os != 'Windows'
-        uses: 0xdoublesharp/cargo-steward@v0.2.2
+        uses: 0xdoublesharp/cargo-steward@v0.2.6
         with:
           mode: trim
           budget: 4GiB

@@ -78,7 +78,7 @@ jobs:
           echo "RUSTC_WRAPPER=cargo-steward" >> "$GITHUB_ENV"
       - name: Track Cargo build cache
         if: runner.os != 'Windows'
-        uses: 0xdoublesharp/cargo-steward@v0.2.2
+        uses: 0xdoublesharp/cargo-steward@v0.2.6
         with:
           mode: start
       - name: Build and install Foundry binaries
@@ -161,7 +161,7 @@ jobs:
         run: ./.github/scripts/tempo-wallet.sh
       - name: Trim Cargo build cache
         if: runner.os != 'Windows'
-        uses: 0xdoublesharp/cargo-steward@v0.2.2
+        uses: 0xdoublesharp/cargo-steward@v0.2.6
         with:
           mode: trim
           budget: 4GiB
@@ -201,7 +201,7 @@ jobs:
           echo "RUSTC_WRAPPER=cargo-steward" >> "$GITHUB_ENV"
       - name: Track Cargo build cache
         if: runner.os != 'Windows'
-        uses: 0xdoublesharp/cargo-steward@v0.2.2
+        uses: 0xdoublesharp/cargo-steward@v0.2.6
         with:
           mode: start
       - name: Verify native certificate and block compatibility
@@ -210,7 +210,7 @@ jobs:
   # If the nightly run fails, this will create an issue to signal so.
       - name: Trim Cargo build cache
         if: runner.os != 'Windows'
-        uses: 0xdoublesharp/cargo-steward@v0.2.2
+        uses: 0xdoublesharp/cargo-steward@v0.2.6
         with:
           mode: trim
           budget: 4GiB

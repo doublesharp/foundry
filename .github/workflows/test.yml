@@ -179,7 +179,7 @@ jobs:
           echo "RUSTC_WRAPPER=cargo-steward" >> "$GITHUB_ENV"
       - name: Track Cargo build cache
         if: runner.os != 'Windows'
-        uses: 0xdoublesharp/cargo-steward@v0.2.2
+        uses: 0xdoublesharp/cargo-steward@v0.2.6
         with:
           mode: start
       - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
@@ -211,7 +211,7 @@ jobs:
           cargo nextest run --locked --features base,monad --profile ci "${args[@]}"
       - name: Trim Cargo build cache
         if: runner.os != 'Windows'
-        uses: 0xdoublesharp/cargo-steward@v0.2.2
+        uses: 0xdoublesharp/cargo-steward@v0.2.6
         with:
           mode: trim
           budget: 4GiB

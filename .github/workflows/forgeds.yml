@@ -153,9 +153,10 @@ jobs:
           echo "RUSTC_WRAPPER=cargo-steward" >> "$GITHUB_ENV"
       - name: Track Cargo build cache
         if: runner.os != 'Windows'
-        uses: 0xdoublesharp/cargo-steward@v0.2.2
+        uses: 0xdoublesharp/cargo-steward@v0.2.6
         with:
           mode: start
+          install-from-source: ${{ startsWith(matrix.runner, 'ubuntu-22.04') }}
       - name: Apple Silicon setup
         if: matrix.target == 'aarch64-apple-darwin'
         run: |
@@ -222,7 +223,7 @@ jobs:
           if-no-files-found: error
       - name: Trim Cargo build cache
         if: runner.os != 'Windows'
-        uses: 0xdoublesharp/cargo-steward@v0.2.2
+        uses: 0xdoublesharp/cargo-steward@v0.2.6
         with:
           mode: trim
           budget: 4GiB

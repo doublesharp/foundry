@@ -43,7 +43,7 @@ jobs:
           echo "RUSTC_WRAPPER=cargo-steward" >> "$GITHUB_ENV"
       - name: Track Cargo build cache
         if: runner.os != 'Windows'
-        uses: 0xdoublesharp/cargo-steward@v0.2.2
+        uses: 0xdoublesharp/cargo-steward@v0.2.6
         with:
           mode: start
       - name: Build documentation
@@ -60,7 +60,7 @@ jobs:
           path: ./target/doc
       - name: Trim Cargo build cache
         if: runner.os != 'Windows'
-        uses: 0xdoublesharp/cargo-steward@v0.2.2
+        uses: 0xdoublesharp/cargo-steward@v0.2.6
         with:
           mode: trim
           budget: 4GiB
