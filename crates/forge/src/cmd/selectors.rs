@@ -181,6 +181,7 @@ impl SelectorsSubcommands {
                 let mut compiler = ProjectCompiler::new()
                     .external_compilers(&config)
                     .external_artifacts(false)
+                    .compiler_warnings(config.compiler_warnings)
                     .quiet(true);
                 if project.no_artifacts
                     && project.cached

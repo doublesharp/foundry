@@ -1,6 +1,6 @@
 //! Solidity source instrumentation and metadata for coverage probes.
 
-use alloy_primitives::{B256, keccak256};
+use alloy_primitives::{B256, Keccak256};
 use eyre::Result;
 use foundry_common::errors::convert_solar_errors;
 use foundry_compilers::{
@@ -12,6 +12,8 @@ use foundry_compilers::{
     project::Preprocessor,
     solc::{SolcCompiler, SolcVersionedInput},
 };
+use globset::GlobSet;
+use rayon::prelude::*;
 use semver::Version;
 use solar::{
     ast::{
@@ -19,11 +21,12 @@ use solar::{
         yul::{self, StmtKind as Yul},
     },
     data_structures::Never,
-    interface::{BytePos, Span},
-    parse::{Cursor, interface::SourceMap, lexer::token::RawTokenKind},
+    interface::{RelativeBytePos, Span, source_map::SourceFile},
+    parse::{Cursor, lexer::token::RawTokenKind},
 };
 use std::{
     collections::{BTreeMap, HashSet},
+    fmt::Write as _,
     ops::{ControlFlow, Range},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
@@ -44,9 +47,10 @@ library __FoundryCoverage {
         address coverageAddress = COVERAGE_ADDRESS;
         /// @solidity memory-safe-assembly
         assembly {
-            let ptr := mload(0x40)
-            mstore(ptr, tag)
-            pop(staticcall(gas(), coverageAddress, ptr, 0x20, 0, 0))
+            let scratch := mload(0x00)
+            mstore(0x00, tag)
+            pop(staticcall(gas(), coverageAddress, 0x00, 0x20, 0, 0))
+            mstore(0x00, scratch)
         }
     }
 
@@ -142,6 +146,7 @@ pub struct CoverageInstrumentationPreprocessor {
     include_libs: bool,
     exclude_tests: bool,
     excluded_sources: Option<regex::Regex>,
+    skip_files: Option<GlobSet>,
 }
 
 impl CoverageInstrumentationPreprocessor {
@@ -150,8 +155,9 @@ impl CoverageInstrumentationPreprocessor {
         include_libs: bool,
         exclude_tests: bool,
         excluded_sources: Option<regex::Regex>,
+        skip_files: Option<GlobSet>,
     ) -> Self {
-        Self { metadata, include_libs, exclude_tests, excluded_sources }
+        Self { metadata, include_libs, exclude_tests, excluded_sources, skip_files }
     }
 
     fn preprocess_solc(
@@ -174,51 +180,61 @@ impl CoverageInstrumentationPreprocessor {
             })
             .collect::<BTreeMap<_, _>>();
 
-        let mut compiler =
-            foundry_compilers::resolver::parse::SolParser::new(paths.with_language_ref())
-                .into_compiler();
-        let instrumentation_result = compiler.enter_mut(|compiler| -> solar::interface::Result {
-            let mut pcx = compiler.parse();
-            let mut candidate_paths = Vec::new();
+        let candidate_paths = input
+            .input
+            .sources
+            .keys()
+            .filter(|path| self.should_instrument(paths, path))
+            .cloned()
+            .collect::<Vec<_>>();
 
-            for (path, source) in &input.input.sources {
-                if let Ok(src_file) = compiler
-                    .sess()
-                    .source_map()
-                    .new_source_file(path.clone(), source.content.as_str().to_owned())
-                    && self.should_instrument(paths, path)
-                {
-                    pcx.add_file(src_file);
-                    candidate_paths.push(path.clone());
-                }
+        if !candidate_paths.is_empty() {
+            let mut compiler =
+                foundry_compilers::resolver::parse::SolParser::new(paths.with_language_ref())
+                    .into_compiler();
+            let instrumentation_result =
+                compiler.enter_mut(|compiler| -> solar::interface::Result {
+                    let mut pcx = compiler.parse();
+                    let source_map = compiler.sess().source_map();
+
+                    for path in &candidate_paths {
+                        let Some(source) = input.input.sources.get(path) else { continue };
+                        if let Ok(src_file) =
+                            source_map.new_source_file_shared(path.clone(), source.content.clone())
+                        {
+                            pcx.add_file(src_file);
+                        }
+                    }
+
+                    pcx.parse();
+                    let gcx = compiler.gcx();
+                    let results = candidate_paths
+                        .par_iter()
+                        .filter_map(|path| {
+                            let source = input.input.sources.get(path)?;
+                            let (_, ast_source) = gcx.get_ast_source(path)?;
+                            let ast = ast_source.ast.as_ref()?;
+                            let result = instrument_source(
+                                path,
+                                source.content.as_str(),
+                                &input.version,
+                                &ast_source.file,
+                                ast,
+                            )?;
+                            Some((path.clone(), result))
+                        })
+                        .collect::<Vec<_>>();
+                    instrumented_sources.extend(results);
+
+                    Ok(())
+                });
+
+            if let Err(err) = convert_solar_errors(compiler.dcx()) {
+                return Err(SolcError::msg(format!("failed coverage instrumentation: {err}")));
             }
-
-            pcx.parse();
-            let gcx = compiler.gcx();
-            for path in candidate_paths {
-                let Some(source) = input.input.sources.get(&path) else { continue };
-                let Some((_, ast_source)) = gcx.get_ast_source(&path) else { continue };
-                let Some(ast) = ast_source.ast.as_ref() else { continue };
-                let Some((content, source_probes, edits)) = instrument_source(
-                    &path,
-                    source.content.as_str(),
-                    &input.version,
-                    gcx.sess.source_map(),
-                    ast,
-                ) else {
-                    continue;
-                };
-                instrumented_sources.insert(path, (content, source_probes, edits));
+            if let Err(err) = instrumentation_result {
+                return Err(SolcError::msg(format!("failed coverage instrumentation: {err:?}")));
             }
-
-            Ok(())
-        });
-
-        if let Err(err) = convert_solar_errors(compiler.dcx()) {
-            return Err(SolcError::msg(format!("failed coverage instrumentation: {err}")));
-        }
-        if let Err(err) = instrumentation_result {
-            return Err(SolcError::msg(format!("failed coverage instrumentation: {err:?}")));
         }
 
         let mut probes = Vec::new();
@@ -263,11 +279,16 @@ impl CoverageInstrumentationPreprocessor {
         if self.exclude_tests && paths.is_test(path) {
             return false;
         }
-        if let Some(excluded_sources) = &self.excluded_sources {
-            let relative_path = path.strip_prefix(&paths.root).unwrap_or(path);
-            if excluded_sources.is_match(&relative_path.to_string_lossy()) {
-                return false;
-            }
+        let relative_path = path.strip_prefix(&paths.root).unwrap_or(path);
+        if let Some(excluded_sources) = &self.excluded_sources
+            && excluded_sources.is_match(&relative_path.to_string_lossy())
+        {
+            return false;
+        }
+        if let Some(skip_files) = &self.skip_files
+            && skip_files.is_match(relative_path)
+        {
+            return false;
         }
         true
     }
@@ -305,14 +326,13 @@ fn instrument_source<'ast>(
     path: &Path,
     source: &str,
     version: &Version,
-    source_map: &SourceMap,
+    source_file: &SourceFile,
     ast: &'ast ast::SourceUnit<'ast>,
 ) -> Option<(String, Vec<InstrumentedCoverageProbe>, Vec<SourceEdit>)> {
-    if has_ignore_file_directive(source) {
-        return None;
-    }
+    let ignore_next_comments = scan_ignore_directives(source)?;
 
-    let mut collector = StatementCollector::new(path, source, version, source_map);
+    let mut collector =
+        StatementCollector::new(path, source, version, source_file, ignore_next_comments);
     let _ = ast::Visit::visit_source_unit(&mut collector, ast);
     if collector.probes.is_empty() {
         return None;
@@ -367,14 +387,51 @@ fn comment_ranges(source: &str) -> impl Iterator<Item = Range<usize>> {
     })
 }
 
+/// ASCII case-insensitive substring check without heap allocations.
+fn contains_ascii_case_insensitive(haystack: &str, needle_lower: &str) -> bool {
+    let haystack = haystack.as_bytes();
+    let needle = needle_lower.as_bytes();
+    if needle.is_empty() {
+        return true;
+    }
+    if haystack.len() < needle.len() {
+        return false;
+    }
+    haystack.windows(needle.len()).any(|window| window.eq_ignore_ascii_case(needle))
+}
+
+/// Scans `source` once for coverage ignore directives.
+///
+/// Returns `None` if the file contains a file-level ignore directive, or `Some(ignore_next)` with
+/// the sorted byte ranges of all `ignore next` comment directives.
+fn scan_ignore_directives(source: &str) -> Option<Vec<Range<usize>>> {
+    // Fast path: skip lexing completely when the file does not mention "ignore" anywhere.
+    if !contains_ascii_case_insensitive(source, "ignore") {
+        return Some(Vec::new());
+    }
+    let mut ignore_next = Vec::new();
+    for range in comment_ranges(source) {
+        let text = &source[range.clone()];
+        if !contains_ascii_case_insensitive(text, "ignore") {
+            continue;
+        }
+        if contains_ignore_directive(text, IGNORE_FILE_DIRECTIVES) {
+            return None;
+        }
+        if contains_ignore_directive(text, IGNORE_NEXT_DIRECTIVES) {
+            ignore_next.push(range);
+        }
+    }
+    Some(ignore_next)
+}
+
+#[cfg(test)]
 fn has_ignore_file_directive(source: &str) -> bool {
-    comment_ranges(source)
-        .any(|range| contains_ignore_directive(&source[range], IGNORE_FILE_DIRECTIVES))
+    scan_ignore_directives(source).is_none()
 }
 
 fn contains_ignore_directive(text: &str, directives: &[&str]) -> bool {
-    let text = text.to_ascii_lowercase();
-    directives.iter().any(|directive| text.contains(directive))
+    directives.iter().any(|directive| contains_ascii_case_insensitive(text, directive))
 }
 
 /// Sort rank for an [`Edge`] at a shared byte offset: closes first, then points, then opens.
@@ -386,12 +443,13 @@ const fn edge_rank(edge: Edge) -> u8 {
     }
 }
 
-#[derive(Debug)]
 struct StatementCollector<'a> {
     path: &'a Path,
     source: &'a str,
     version: &'a Version,
-    source_map: &'a SourceMap,
+    source_file: &'a SourceFile,
+    /// Pre-seeded `Keccak256` hasher with `"foundry-coverage:{version}:{path}:"`.
+    tag_hasher: Keccak256,
     updates: Vec<SourceUpdate>,
     probes: Vec<InstrumentedCoverageProbe>,
     /// Monotonic counter mixed into every tag so each probe gets a unique tag regardless of its
@@ -410,18 +468,23 @@ impl<'a> StatementCollector<'a> {
         path: &'a Path,
         source: &'a str,
         version: &'a Version,
-        source_map: &'a SourceMap,
+        source_file: &'a SourceFile,
+        ignore_next_comments: Vec<Range<usize>>,
     ) -> Self {
         // Yul forbids shadowing even inside a nested block.
         let mut yul_scratch_name = "__foundry_coverage_scratch".to_string();
         while source.contains(&yul_scratch_name) {
             yul_scratch_name.push('_');
         }
+        let mut tag_hasher = Keccak256::new();
+        let prefix = format!("foundry-coverage:{}:{}:", version, path.display());
+        tag_hasher.update(prefix.as_bytes());
         Self {
             path,
             source,
             version,
-            source_map,
+            source_file,
+            tag_hasher,
             updates: Vec::new(),
             probes: Vec::new(),
             next_tag: 0,
@@ -429,11 +492,7 @@ impl<'a> StatementCollector<'a> {
             contract_name: "".into(),
             probe_mode: ProbeMode::Direct,
             yul_scratch_name,
-            ignore_next_comments: comment_ranges(source)
-                .filter(|range| {
-                    contains_ignore_directive(&source[range.clone()], IGNORE_NEXT_DIRECTIVES)
-                })
-                .collect(),
+            ignore_next_comments,
         }
     }
 
@@ -450,7 +509,7 @@ impl<'a> StatementCollector<'a> {
             return;
         }
 
-        let full_range = self.source_map.span_to_source(stmt.span).unwrap().data;
+        let full_range = self.source_range(stmt.span);
         let branch_id = self.next_branch_id();
 
         let pre_tag = self.make_tag(range.start);
@@ -497,7 +556,7 @@ impl<'a> StatementCollector<'a> {
         if range.is_empty() || self.has_ignore_next(stmt.span) {
             return;
         }
-        let full_range = self.source_map.span_to_source(stmt.span).unwrap().data;
+        let full_range = self.source_range(stmt.span);
         let tag = self.make_tag(range.start);
         self.updates
             .push(SourceUpdate::open(full_range.start, format!("{{ {}", self.probe_text(tag))));
@@ -524,7 +583,7 @@ impl<'a> StatementCollector<'a> {
         if range.is_empty() || self.has_ignore_next(stmt.span) {
             return;
         }
-        let full_range = self.source_map.span_to_source(stmt.span).unwrap().data;
+        let full_range = self.source_range(stmt.span);
         let branch_id = self.next_branch_id();
 
         // Emit a distinct body-entry probe only for a branch body (e.g. an `if` then/else path).
@@ -572,7 +631,7 @@ impl<'a> StatementCollector<'a> {
         if range.is_empty() || self.has_ignore_next(block.span) {
             return;
         }
-        let full_range = self.source_map.span_to_source(block.span).unwrap().data;
+        let full_range = self.source_range(block.span);
         let Some(brace_offset) = self.source[full_range.clone()].find('{') else {
             return;
         };
@@ -585,7 +644,7 @@ impl<'a> StatementCollector<'a> {
     /// Inserts a Yul coverage probe immediately before the Yul statement at `span` and records a
     /// probe of `kind` for it.
     fn push_yul_stmt_probe(&mut self, span: Span, kind: InstrumentedCoverageProbeKind) {
-        let range = self.source_map.span_to_source(span).unwrap().data;
+        let range = self.source_range(span);
         if range.is_empty() || self.has_ignore_next(span) {
             return;
         }
@@ -601,7 +660,7 @@ impl<'a> StatementCollector<'a> {
         block: &yul::Block<'_>,
         kind: InstrumentedCoverageProbeKind,
     ) {
-        let range = self.source_map.span_to_source(block.span).unwrap().data;
+        let range = self.source_range(block.span);
         if self.has_ignore_next(block.span) {
             return;
         }
@@ -650,46 +709,69 @@ impl<'a> StatementCollector<'a> {
         )
     }
 
-    fn trim_statement_span(&self, mut span: Span) -> Range<usize> {
-        if let Ok(snippet) = self.source_map.span_to_snippet(span)
+    fn trim_statement_span(&self, span: Span) -> Range<usize> {
+        let mut range = self.source_range(span);
+        if let Some(snippet) = self.source.get(range.clone())
             && let Some(stripped) = snippet.strip_suffix(';')
         {
-            let stripped = stripped.trim_end();
-            let skipped = snippet.len() - stripped.len();
-            span = span.with_hi(span.hi() - BytePos::from_usize(skipped));
+            range.end -= snippet.len() - stripped.trim_end().len();
         }
-        self.source_map.span_to_source(span).unwrap().data
+        range
     }
 
     fn line_range(&self, span: Span) -> Range<u32> {
-        let lines = self.source_map.span_to_lines(span).unwrap().data;
-        let first = lines.first().unwrap();
-        let last = lines.last().unwrap();
-        first.line_index as u32 + 1..last.line_index as u32 + 2
+        let bytes = self.source_range(span);
+        let last_pos = if bytes.end > bytes.start { bytes.end - 1 } else { bytes.start };
+        let first = self.source_file.lookup_line(RelativeBytePos::from_usize(bytes.start)).unwrap();
+        let last = self.source_file.lookup_line(RelativeBytePos::from_usize(last_pos)).unwrap();
+        first as u32 + 1..last as u32 + 2
     }
 
     fn has_ignore_next(&self, span: Span) -> bool {
-        let range = self.source_map.span_to_source(span).unwrap().data;
+        if self.ignore_next_comments.is_empty() {
+            return false;
+        }
+        let range = self.source_range(span);
         self.has_ignore_directive_before(range.start)
     }
 
     fn has_ignore_directive_before(&self, start: usize) -> bool {
+        if self.ignore_next_comments.is_empty() {
+            return false;
+        }
         let Some(before) = self.source.get(..start) else { return false };
         let line_start = before.rfind('\n').map_or(0, |idx| idx + 1);
         let previous = before[..line_start].trim_end_matches(['\r', '\n']);
         let previous_line_start = previous.rfind('\n').map_or(0, |idx| idx + 1);
 
-        self.ignore_next_comments
-            .iter()
-            .any(|range| range.end > previous_line_start && range.end <= start)
+        let first =
+            self.ignore_next_comments.partition_point(|range| range.end <= previous_line_start);
+        for range in &self.ignore_next_comments[first..] {
+            if range.end > start {
+                break;
+            }
+            if Cursor::new(&before[range.end..start]).all(|token| {
+                matches!(
+                    token.kind,
+                    RawTokenKind::Whitespace
+                        | RawTokenKind::LineComment { .. }
+                        | RawTokenKind::BlockComment { .. }
+                )
+            }) {
+                return true;
+            }
+        }
+        false
     }
 
     fn make_tag(&mut self, start: usize) -> B256 {
         let seq = self.next_tag;
         self.next_tag += 1;
-        let payload =
-            format!("foundry-coverage:{}:{}:{}:{}", self.version, self.path.display(), start, seq);
-        keccak256(payload)
+        let mut suffix = String::with_capacity(44);
+        let _ = write!(suffix, "{start}:{seq}");
+        let mut hasher = self.tag_hasher.clone();
+        hasher.update(suffix.as_bytes());
+        hasher.finalize()
     }
 
     const fn next_branch_id(&mut self) -> u32 {
@@ -723,7 +805,7 @@ impl<'a> StatementCollector<'a> {
             StmtKind::Block(block) | StmtKind::UncheckedBlock(block) => {
                 self.push_block_entry_probe(block, kind);
                 if let Some(trailing) = trailing {
-                    let end = self.source_map.span_to_source(block.span).unwrap().data.end;
+                    let end = self.source_range(block.span).end;
                     self.updates.push(SourceUpdate::close(end, trailing));
                 }
                 self.visit_stmt(stmt)
@@ -797,45 +879,51 @@ impl<'a> StatementCollector<'a> {
 
     /// Returns the source byte range covered by `span`.
     fn source_range(&self, span: Span) -> Range<usize> {
-        self.source_map.span_to_source(span).unwrap().data
+        let start = (span.lo() - self.source_file.start_pos).to_usize();
+        let end = (span.hi() - self.source_file.start_pos).to_usize();
+        start..end
     }
 
-    /// Wraps the boolean sub-expression at `span` in a `sendHitReturn(tag, (..))` call so the
-    /// probe fires exactly when the sub-expression is evaluated, while passing its value through
-    /// unchanged. Records a [`Branch`] probe for `(branch_id, path_id)`.
-    ///
-    /// [`Branch`]: InstrumentedCoverageProbeKind::Branch
-    fn wrap_bool_branch(&mut self, span: Span, branch_id: u32, path_id: u32) {
-        let range = self.source_range(span);
-        if range.is_empty() {
-            return;
-        }
-        let tag = self.make_tag(range.start);
-        self.updates.push(SourceUpdate::open(
-            range.start,
-            format!("__FoundryCoverage.sendHitReturn({tag}, ("),
-        ));
-        self.updates.push(SourceUpdate::close(range.end, "))"));
-        self.record_probe(
-            InstrumentedCoverageProbeKind::Branch { branch_id, path_id },
-            span,
-            range,
-            tag,
-        );
-    }
-
-    /// Instruments a logical `&&`/`||` expression so each operand becomes a branch outcome,
-    /// then recurses so nested logical/ternary operands are also instrumented.
+    /// Instruments a logical `&&`/`||` expression with a mutually-exclusive probe on `lhs` so
+    /// short-circuiting (`path_id: 0`) and evaluating `rhs` (`path_id: 1`) are measured
+    /// independently, then recurses so nested logical/ternary operands are also instrumented.
     fn instrument_logical_branch<'ast>(
         &mut self,
         lhs: &'ast ast::Expr<'ast>,
+        op: BinOpKind,
         rhs: &'ast ast::Expr<'ast>,
     ) -> ControlFlow<<Self as ast::Visit<'ast>>::BreakValue> {
-        let branch_id = self.next_branch_id();
-        // Path 0 is the always-evaluated left operand; path 1 is the right operand, which is
-        // only evaluated when the left operand does not short-circuit the expression.
-        self.wrap_bool_branch(lhs.span, branch_id, 0);
-        self.wrap_bool_branch(rhs.span, branch_id, 1);
+        let lhs_range = self.source_range(lhs.span);
+        let rhs_range = self.source_range(rhs.span);
+        if !lhs_range.is_empty() && !rhs_range.is_empty() {
+            let branch_id = self.next_branch_id();
+            let short_circuit_tag = self.make_tag(lhs_range.start);
+            let rhs_tag = self.make_tag(rhs_range.start);
+            let (true_tag, false_tag) = match op {
+                BinOpKind::Or => (short_circuit_tag, rhs_tag),
+                BinOpKind::And => (rhs_tag, short_circuit_tag),
+                _ => unreachable!("only logical && and || are instrumented"),
+            };
+            self.updates.push(SourceUpdate::open(lhs_range.start, "(("));
+            self.updates.push(SourceUpdate::close(
+                lhs_range.end,
+                format!(
+                    ") ? __FoundryCoverage.sendHitReturn({true_tag}, true) : __FoundryCoverage.sendHitReturn({false_tag}, false))"
+                ),
+            ));
+            self.record_probe(
+                InstrumentedCoverageProbeKind::Branch { branch_id, path_id: 0 },
+                lhs.span,
+                lhs_range,
+                short_circuit_tag,
+            );
+            self.record_probe(
+                InstrumentedCoverageProbeKind::Branch { branch_id, path_id: 1 },
+                rhs.span,
+                rhs_range,
+                rhs_tag,
+            );
+        }
         self.visit_expr(lhs)?;
         self.visit_expr(rhs)
     }
@@ -1055,8 +1143,7 @@ impl<'ast> ast::Visit<'ast> for StatementCollector<'_> {
                 // correctly relative to enclosing scopes even for nested brace-less `if`s.
                 let implicit_else = (else_stmt.is_none() && !self.has_ignore_next(then_stmt.span))
                     .then(|| {
-                        let then_range =
-                            self.source_map.span_to_source(then_stmt.span).unwrap().data;
+                        let then_range = self.source_range(then_stmt.span);
                         let tag = self.make_tag(then_range.end);
                         self.record_probe(
                             InstrumentedCoverageProbeKind::Branch { branch_id, path_id: 1 },
@@ -1083,6 +1170,10 @@ impl<'ast> ast::Visit<'ast> for StatementCollector<'_> {
                 self.visit_expr(try_.expr)?;
                 let branch_id = self.next_branch_id();
                 for (path_id, clause) in try_.clauses.iter().enumerate() {
+                    if self.has_ignore_next(clause.span) || self.has_ignore_next(clause.block.span)
+                    {
+                        continue;
+                    }
                     self.push_block_entry_probe(
                         &clause.block,
                         InstrumentedCoverageProbeKind::Branch {
@@ -1105,7 +1196,11 @@ impl<'ast> ast::Visit<'ast> for StatementCollector<'_> {
                 ControlFlow::Continue(())
             }
             StmtKind::For { init, cond, next, body } => {
-                let _ = init;
+                if let Some(init) = init {
+                    // Walk child expressions (such as ternaries or logical operators) without
+                    // injecting a statement probe inside the `for (...)` header.
+                    self.walk_stmt(init)?;
+                }
                 if let Some(cond) = cond {
                     self.visit_expr(cond)?;
                 }
@@ -1119,10 +1214,16 @@ impl<'ast> ast::Visit<'ast> for StatementCollector<'_> {
         }
     }
 
+    fn visit_ty(&mut self, _ty: &'ast ast::Type<'ast>) -> ControlFlow<Self::BreakValue> {
+        // Type expressions such as fixed-size array lengths (`uint256[FLAG ? 2 : 4]`) must stay
+        // compile-time constants and cannot contain coverage probes.
+        ControlFlow::Continue(())
+    }
+
     fn visit_expr(&mut self, expr: &'ast ast::Expr<'ast>) -> ControlFlow<Self::BreakValue> {
         match &expr.kind {
             ExprKind::Binary(lhs, op, rhs) if matches!(op.kind, BinOpKind::And | BinOpKind::Or) => {
-                self.instrument_logical_branch(lhs, rhs)
+                self.instrument_logical_branch(lhs, op.kind, rhs)
             }
             ExprKind::Ternary(cond, then_expr, else_expr) => {
                 self.instrument_ternary_branch(cond, then_expr, else_expr)
@@ -1162,6 +1263,9 @@ impl<'ast> ast::Visit<'ast> for StatementCollector<'_> {
             Yul::Switch(switch) => {
                 let branch_id = self.next_branch_id();
                 for (path_id, case) in switch.cases.iter().enumerate() {
+                    if self.has_ignore_next(case.span) || self.has_ignore_next(case.body.span) {
+                        continue;
+                    }
                     self.push_yul_block_entry_probe(
                         &case.body,
                         InstrumentedCoverageProbeKind::Branch {
@@ -1241,7 +1345,7 @@ mod tests {
             let gcx = compiler.gcx();
             let (_, ast_source) = gcx.get_ast_source(&path).expect("missing ast source");
             let ast = ast_source.ast.as_ref().expect("missing ast");
-            instrument_source(&path, source, &version, gcx.sess.source_map(), ast)
+            instrument_source(&path, source, &version, &ast_source.file, ast)
         });
         if let Some(Err(diags)) = compiler.sess().emitted_errors() {
             panic!("input source failed to parse:\n{diags}");
@@ -1882,6 +1986,104 @@ contract C {
         assert_eq!(
             count_kind(&probes, |k| matches!(k, InstrumentedCoverageProbeKind::Statement)),
             1
+        );
+    }
+
+    #[test]
+    fn type_expressions_with_ternaries_are_not_instrumented() {
+        let (out, probes) = instrument(
+            r#"
+contract C {
+    bool constant FLAG = true;
+    function f(bytes calldata data) external pure returns (uint256) {
+        uint256[FLAG ? 2 : 4] memory arr;
+        uint256[FLAG && true ? 1 : 2] memory decoded = abi.decode(data, (uint256[FLAG && true ? 1 : 2]));
+        return arr.length + decoded.length;
+    }
+}
+"#,
+        );
+        assert_reparses(&out);
+        assert_eq!(
+            count_kind(&probes, |k| matches!(k, InstrumentedCoverageProbeKind::Branch { .. })),
+            0,
+            "constant type expressions must not receive branch probes:\n{out}"
+        );
+    }
+
+    #[test]
+    fn for_loop_init_expressions_are_instrumented_without_statement_probe() {
+        let (out, probes) = instrument(
+            r#"
+contract C {
+    function f(bool flag) external pure returns (uint256 sum) {
+        for (uint256 i = flag ? 1 : 0; i < 2; i++) {
+            sum += i;
+        }
+    }
+}
+"#,
+        );
+        assert_reparses(&out);
+        assert_eq!(branch_paths(&probes), vec![(0, 0), (0, 1)]);
+    }
+
+    #[test]
+    fn ignore_next_does_not_bleed_to_sibling_or_miss_try_catch() {
+        let (out, probes) = instrument(
+            r#"
+interface ICallee {
+    function ping() external pure;
+}
+
+contract C {
+    function f(ICallee callee) external pure returns (uint256 x) {
+        /* forge coverage ignore next */ x = 1; x = 2;
+        try callee.ping() {
+            x = 3;
+        }
+        // forge coverage ignore next
+        catch {
+            x = 4;
+        }
+    }
+}
+"#,
+        );
+        assert_reparses(&out);
+        // `x = 1;` is ignored, `x = 2;` and `x = 3;` are instrumented, `catch { x = 4; }` is
+        // ignored.
+        assert_eq!(
+            count_kind(&probes, |k| matches!(k, InstrumentedCoverageProbeKind::Statement)),
+            2,
+            "unexpected statement probes:\n{out}\n{probes:?}"
+        );
+        assert_eq!(branch_paths(&probes), vec![(0, 0)]);
+    }
+
+    #[test]
+    fn ignore_next_applies_to_yul_switch_cases() {
+        let (out, probes) = instrument(
+            r#"
+contract C {
+    function f(uint256 x) external returns (uint256 r) {
+        assembly {
+            switch x
+            case 0 { r := 1 }
+            // forge coverage ignore next
+            default { r := 2 }
+        }
+    }
+}
+"#,
+        );
+        assert_reparses(&out);
+        assert_eq!(branch_paths(&probes), vec![(0, 0)]);
+        // Assembly block + `r := 1` (the ignored `default` case and `r := 2` are excluded).
+        assert_eq!(
+            count_kind(&probes, |k| matches!(k, InstrumentedCoverageProbeKind::Statement)),
+            2,
+            "unexpected statement probes:\n{out}\n{probes:?}"
         );
     }
 }

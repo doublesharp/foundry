@@ -73,7 +73,12 @@ impl InstrumentedCoverageMetadata {
             let rendered = if formatted.contains(SOLAR_LOCATION_MARKER) {
                 render_solar(error, &primary, &secondary)
             } else if formatted.contains(SOLC_LOCATION_MARKER) {
-                replace_solc_locations(formatted, &primary, &secondary)
+                replace_solc_locations(
+                    formatted,
+                    &primary,
+                    &error.secondary_source_locations,
+                    &secondary,
+                )
             } else {
                 None
             };
@@ -160,10 +165,18 @@ fn render_solar(
 fn replace_solc_locations(
     formatted: &str,
     primary: &OriginalLocation<'_>,
+    secondary_raw: &[foundry_compilers::artifacts::error::SecondarySourceLocation],
     secondary: &[Option<OriginalLocation<'_>>],
 ) -> Option<String> {
+    // Solc only prints a `--> file:line:col:` block for secondary locations that carry a file and
+    // non-negative byte span; spanless note entries have no location block in `formatted`.
     let locations = std::iter::once(Some(primary))
-        .chain(secondary.iter().map(Option::as_ref))
+        .chain(secondary_raw.iter().zip(secondary).filter_map(|(raw, original)| {
+            let has_span = raw.file.is_some()
+                && raw.start.is_some_and(|start| start >= 0)
+                && raw.end.is_some_and(|end| end >= 0);
+            has_span.then_some(original.as_ref())
+        }))
         .collect::<Vec<_>>();
     let mut rendered = String::with_capacity(formatted.len());
     let mut lines = formatted.split_inclusive('\n').peekable();
@@ -250,6 +263,8 @@ fn render_solc_location(location: &OriginalLocation<'_>) -> String {
         .collect::<String>();
     let marker = if multiline {
         "^ (Relevant source part starts here and spans across multiple lines).".to_string()
+    } else if snippet_start == snippet_end {
+        "^".to_string()
     } else {
         text[snippet_start..snippet_end]
             .iter()
@@ -517,5 +532,33 @@ contract A {
         );
         assert!(metadata(Vec::new()).remap_diagnostic(&mut error));
         assert_eq!(error.formatted_message.as_deref(), Some(SHADOW_WARNING));
+    }
+
+    #[test]
+    fn remaps_solc_diagnostic_with_spanless_secondary_note_and_zero_width_span() {
+        let (instrumented, edits) = instrument();
+        let instrumented_source = source(&instrumented, Vec::new());
+        let range = instrumented_range(&edits, (233, 233));
+        let message = "Syntax notice.";
+        let formatted = format!(
+            "Warning: {message}\n{}Note: Additional context without a source span.\n",
+            render_solc_location(&location(&instrumented_source, range))
+        );
+        let mut error = warning(range, message, formatted);
+        error.secondary_source_locations.push(SecondarySourceLocation {
+            file: None,
+            start: None,
+            end: None,
+            message: Some("Additional context without a source span.".to_string()),
+        });
+
+        assert!(metadata(edits).remap_diagnostic(&mut error));
+        let rendered = error.formatted_message.as_deref().unwrap();
+        assert!(rendered.contains("--> src/A.sol:9:50:"), "{rendered}");
+        assert!(
+            rendered.contains("\n  |                                                  ^\n"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("Note: Additional context without a source span."), "{rendered}");
     }
 }

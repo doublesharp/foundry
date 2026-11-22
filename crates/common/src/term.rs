@@ -386,9 +386,14 @@ pub fn format_unresolved_imports(
             .display()
             .to_string()
     };
+    let normalize_slashes = |path: &str| path.replace('\\', "/");
     let mut importers = BTreeMap::<String, BTreeSet<String>>::new();
+    let mut normalized_imports = Vec::with_capacity(imports.len());
     for (import, file) in imports {
-        importers.entry(import.display().to_string()).or_default().insert(relative(file));
+        let import_str = import.display().to_string();
+        let rel_file = relative(file);
+        normalized_imports.push((normalize_slashes(&import_str), normalize_slashes(&rel_file)));
+        importers.entry(import_str).or_default().insert(rel_file);
     }
 
     let mut message = String::from("Unable to resolve imports:");
@@ -400,11 +405,14 @@ pub fn format_unresolved_imports(
     let matching = remappings
         .iter()
         .filter(|remapping| {
-            imports.iter().any(|(import, file)| {
-                import.to_string_lossy().starts_with(&remapping.name)
-                    && remapping.context.as_deref().is_none_or(|context| {
-                        relative(file).starts_with(&relative(Path::new(context)))
-                    })
+            let remapping_name = normalize_slashes(&remapping.name);
+            let remapping_context = remapping
+                .context
+                .as_deref()
+                .map(|ctx| normalize_slashes(&relative(Path::new(ctx))));
+            normalized_imports.iter().any(|(import, file)| {
+                import.starts_with(&remapping_name)
+                    && remapping_context.as_deref().is_none_or(|context| file.starts_with(context))
             })
         })
         .collect::<Vec<_>>();

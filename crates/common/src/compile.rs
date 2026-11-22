@@ -404,7 +404,10 @@ impl ProjectCompiler {
         )?;
 
         if bail && output.has_compiler_errors() {
-            eyre::bail!("{}", format_diagnostics(&output, project, self.compiler_warnings));
+            eyre::bail!(
+                "{}",
+                format_diagnostics_inner(&output, project, self.compiler_warnings, !quiet)
+            );
         }
 
         let mut linking_error = (!self.allow_linked_libraries && !output.has_compiler_errors())
@@ -1120,13 +1123,24 @@ pub fn format_diagnostics<C: Compiler<CompilerContract = Contract>>(
     project: &Project<C>,
     warnings: CompilerWarnings,
 ) -> String {
+    format_diagnostics_inner(output, project, warnings, true)
+}
+
+fn format_diagnostics_inner<C: Compiler<CompilerContract = Contract>>(
+    output: &ProjectCompileOutput<C>,
+    project: &Project<C>,
+    warnings: CompilerWarnings,
+    shorten_missing_sources: bool,
+) -> String {
     let compiler_output = output.output();
     let hidden = if warnings.changed_only() {
         unchanged_source_warnings(output, project)
     } else {
         HashSet::new()
     };
-    if hidden.is_empty() && !compiler_output.errors.iter().any(|e| missing_source(e).is_some()) {
+    let has_shortened_missing =
+        shorten_missing_sources && compiler_output.errors.iter().any(is_missing_source);
+    if hidden.is_empty() && !has_shortened_missing {
         return output.to_string();
     }
 
@@ -1142,7 +1156,7 @@ pub fn format_diagnostics<C: Compiler<CompilerContract = Contract>>(
         if hidden.contains(&index) || is_ignored_diagnostic(project, compiler_output, error) {
             continue;
         }
-        let _ = match missing_source(error) {
+        let _ = match shorten_missing_sources.then(|| missing_source(error)).flatten() {
             Some(short) => write!(formatted, "\n{short}"),
             None => write!(formatted, "\n{error}"),
         };
@@ -1159,6 +1173,25 @@ pub fn format_diagnostics<C: Compiler<CompilerContract = Contract>>(
     formatted
 }
 
+/// Lexically resolves `.` and `..` components without touching the filesystem.
+fn normalize_lexical(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if matches!(normalized.components().next_back(), Some(Component::Normal(_))) {
+                    normalized.pop();
+                } else {
+                    normalized.push(component);
+                }
+            }
+            _ => normalized.push(component),
+        }
+    }
+    normalized
+}
+
 /// Returns the indices of reported warnings from sources whose artifacts were all reused from the
 /// cache, i.e. sources that were only read as clean imports of recompiled files.
 fn unchanged_source_warnings<C: Compiler<CompilerContract = Contract>>(
@@ -1168,7 +1201,11 @@ fn unchanged_source_warnings<C: Compiler<CompilerContract = Contract>>(
     let root = project.root();
     let compiler_output = output.output();
     let has_output = |file: &Path, contains: &dyn Fn(&Path) -> bool| {
-        contains(file) || contains(&root.join(file))
+        if contains(file) {
+            return true;
+        }
+        let joined = root.join(file);
+        contains(&joined) || contains(&normalize_lexical(&joined))
     };
     compiler_output
         .errors
@@ -1207,11 +1244,9 @@ fn is_ignored_diagnostic<C: Compiler<CompilerContract = Contract>>(
     )
 }
 
-/// Shortens a solc "Source not found" error (6275) to its message and source location.
-///
-/// Solc repeats the message and quotes the import statement for every unresolved import, while
-/// the compilation reporter already lists each import once.
-fn missing_source<E: CompilationError>(error: &E) -> Option<String> {
+/// Extracts the underlying [`SolcError`] if `error` is a plain (non-pre-styled) solc "Source
+/// not found" error (6275).
+fn as_missing_source_error<E: CompilationError>(error: &E) -> Option<&SolcError> {
     let error = error as &dyn Any;
     let error = if let Some(error) = error.downcast_ref::<SolcError>() {
         error
@@ -1229,6 +1264,20 @@ fn missing_source<E: CompilationError>(error: &E) -> Option<String> {
     if formatted.contains('\x1b') || formatted.contains('\u{25b8}') {
         return None;
     }
+    Some(error)
+}
+
+fn is_missing_source<E: CompilationError>(error: &E) -> bool {
+    as_missing_source_error(error).is_some()
+}
+
+/// Shortens a solc "Source not found" error (6275) to its message and source location.
+///
+/// Solc repeats the message and quotes the import statement for every unresolved import, while
+/// the compilation reporter already lists each import once.
+fn missing_source<E: CompilationError>(error: &E) -> Option<String> {
+    let error = as_missing_source_error(error)?;
+    let formatted = error.formatted_message.as_deref().unwrap_or_default();
     let mut short = format!(
         "{}{}",
         format!("{} (6275)", error.severity.as_str()).paint(error.error_style()),

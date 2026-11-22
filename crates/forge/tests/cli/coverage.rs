@@ -4968,6 +4968,11 @@ contract TargetTest {
         require(t.either(true, false));
     }
 
+    function testRightEvaluatedOnly() external view {
+        // `a` is false, so `b` is evaluated, but the short-circuit path stays uncovered.
+        require(t.either(false, true));
+    }
+
     function testBothSides() external view {
         require(t.either(true, false));
         require(t.either(false, true));
@@ -4989,6 +4994,34 @@ Running tests...
 
 Ran 1 test for test/TargetTest.sol:TargetTest
 [PASS] testLeftShortCircuits() ([GAS])
+Suite result: ok. 1 passed; 0 failed; 0 skipped; [ELAPSED]
+
+Ran 1 test suite [ELAPSED]: 1 tests passed, 0 failed, 0 skipped (1 total tests)
+
+╭----------------+---------------+---------------+--------------+---------------╮
+| File           | % Lines       | % Statements  | % Branches   | % Funcs       |
++===============================================================================+
+| src/Target.sol | 100.00% (2/2) | 100.00% (1/1) | 50.00% (1/2) | 100.00% (1/1) |
+|----------------+---------------+---------------+--------------+---------------|
+| Total          | 100.00% (2/2) | 100.00% (1/1) | 50.00% (1/2) | 100.00% (1/1) |
+╰----------------+---------------+---------------+--------------+---------------╯
+
+"#]]);
+
+    // Only the non-short-circuiting path is exercised => short-circuit path stays uncovered (50%).
+    cmd.forge_fuse()
+        .arg("coverage")
+        .args(["--instrumented", "--exclude-tests", "--mt", "testRightEvaluatedOnly"])
+        .assert_success()
+        .stdout_eq(str![[r#"
+[COMPILING_FILES] with [SOLC_VERSION]
+[SOLC_VERSION] [ELAPSED]
+Compiler run successful!
+Analysing contracts...
+Running tests...
+
+Ran 1 test for test/TargetTest.sol:TargetTest
+[PASS] testRightEvaluatedOnly() ([GAS])
 Suite result: ok. 1 passed; 0 failed; 0 skipped; [ELAPSED]
 
 Ran 1 test suite [ELAPSED]: 1 tests passed, 0 failed, 0 skipped (1 total tests)
@@ -5290,9 +5323,9 @@ Ran 1 test suite [ELAPSED]: 1 tests passed, 0 failed, 0 skipped (1 total tests)
 ╭----------------+---------------+---------------+---------------+---------------╮
 | File           | % Lines       | % Statements  | % Branches    | % Funcs       |
 +================================================================================+
-| src/Target.sol | 100.00% (8/8) | 100.00% (3/3) | 100.00% (4/4) | 100.00% (1/1) |
+| src/Target.sol | 100.00% (7/7) | 100.00% (3/3) | 100.00% (4/4) | 100.00% (1/1) |
 |----------------+---------------+---------------+---------------+---------------|
-| Total          | 100.00% (8/8) | 100.00% (3/3) | 100.00% (4/4) | 100.00% (1/1) |
+| Total          | 100.00% (7/7) | 100.00% (3/3) | 100.00% (4/4) | 100.00% (1/1) |
 ╰----------------+---------------+---------------+---------------+---------------╯
 
 "#]]);

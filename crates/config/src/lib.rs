@@ -3364,6 +3364,7 @@ impl Provider for Config {
 impl Default for Config {
     fn default() -> Self {
         let project_paths = project_path_defaults();
+        let cache_dir = Path::new(project_paths.cache_path);
         Self {
             profile: Self::DEFAULT_PROFILE,
             profiles: vec![Self::DEFAULT_PROFILE],
@@ -3412,12 +3413,12 @@ impl Default for Config {
             path_pattern: None,
             path_pattern_inverse: None,
             coverage_pattern_inverse: None,
-            test_failures_file: "cache/test-failures".into(),
-            mutation_dir: "cache/mutation".into(),
+            test_failures_file: cache_dir.join("test-failures"),
+            mutation_dir: cache_dir.join("mutation"),
             threads: None,
             show_progress: false,
-            fuzz: FuzzConfig::new("cache/fuzz".into()),
-            invariant: InvariantConfig::new("cache/invariant".into()),
+            fuzz: FuzzConfig::new(cache_dir.join("fuzz")),
+            invariant: InvariantConfig::new(cache_dir.join("invariant")),
             symbolic: SymbolicConfig::default(),
             coverage: CoverageConfig::default(),
             mutation: MutationConfig::default(),

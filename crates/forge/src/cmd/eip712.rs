@@ -49,7 +49,10 @@ impl Eip712Args {
     pub fn run(self) -> Result<()> {
         let config = self.build.load_config_with_dependencies()?;
         let project = config.solar_project()?;
-        let mut output = ProjectCompiler::new().files([self.target_path]).compile(&project)?;
+        let mut output = ProjectCompiler::new()
+            .compiler_warnings(config.compiler_warnings)
+            .files([self.target_path])
+            .compile(&project)?;
         let compiler = output.parser_mut().solc_mut().compiler_mut();
         // Solc validates the source version; Solar only provides type information.
         compiler.dcx().set_allowed_diagnostic_codes(["5333".into()]);

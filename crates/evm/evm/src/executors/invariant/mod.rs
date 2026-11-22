@@ -1760,6 +1760,16 @@ impl<'a, FEN: FoundryEvmNetwork> InvariantExecutor<'a, FEN> {
             return;
         }
 
+        // Disable per-opcode line coverage while shrinking discarded handler sequences.
+        let mut shrink_executor = None;
+        let shrink_executor = if executor.inspector().line_coverage.is_some() {
+            let mut cloned = executor.clone();
+            cloned.inspector_mut().collect_line_coverage(false);
+            shrink_executor.insert(cloned)
+        } else {
+            executor
+        };
+
         for (idx, error) in result.failures.handler_failures_mut().enumerate() {
             if early_exit.should_stop() {
                 break;
@@ -1779,7 +1789,7 @@ impl<'a, FEN: FoundryEvmNetwork> InvariantExecutor<'a, FEN> {
                 config,
                 &failure.call_sequence,
                 failure.edge_fingerprint,
-                executor,
+                shrink_executor,
                 &shrink_progress,
                 early_exit,
             ) {

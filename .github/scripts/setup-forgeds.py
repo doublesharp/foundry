@@ -3,6 +3,7 @@
 
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
+import http.client
 import json
 import os
 from pathlib import Path
@@ -19,7 +20,7 @@ import urllib.request
 import zipfile
 
 
-PINS = json.loads((Path(__file__).parents[1] / "forgeds-toolchain.json").read_text())
+PINS = json.loads((Path(__file__).parents[1] / "forgeds-toolchain.json").read_text(encoding="utf-8"))
 FORGEDS_URL = "https://github.com/doublesharp/foundry/releases/download/forgeds/"
 SOLAR_URL = "https://github.com/paradigmxyz/solar/releases/download/"
 PLATFORMS = {
@@ -48,7 +49,7 @@ def download(url, destination):
                     digest.update(block)
                     output.write(block)
             return digest.hexdigest()
-        except (OSError, urllib.error.URLError) as error:
+        except (OSError, urllib.error.URLError, http.client.HTTPException) as error:
             if isinstance(error, urllib.error.HTTPError) and error.code < 500 and error.code not in (408, 429):
                 raise
             if attempt == 2:
@@ -56,11 +57,14 @@ def download(url, destination):
             time.sleep(attempt + 1)
 
 
-def read_remote(url):
-    with tempfile.TemporaryDirectory(dir=os.environ.get("RUNNER_TEMP")) as directory:
+def read_remote(url, temp_dir=None):
+    base = temp_dir or os.environ.get("RUNNER_TEMP") or None
+    if base:
+        Path(base).mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=base) as directory:
         path = Path(directory) / "value"
         download(url, path)
-        return path.read_text().strip()
+        return path.read_text(encoding="utf-8").strip()
 
 
 def make_plan(env):
@@ -69,7 +73,7 @@ def make_plan(env):
         raise ValueError(f"No prebuilt forgeds for {platform}; supported: {', '.join(PLATFORMS)}")
     forgeds_version = env.get("FORGEDS_VERSION", "").strip() or PINS["forgeds"]["commit"]
     if forgeds_version == "latest":
-        forgeds_version = read_remote(FORGEDS_URL + "forgeds_latest.txt")
+        forgeds_version = read_remote(FORGEDS_URL + "forgeds_latest.txt", env.get("RUNNER_TEMP"))
     if not re.fullmatch(r"[0-9a-f]{40}", forgeds_version):
         raise ValueError("forgeds-version must be a full 40-character commit SHA or latest")
     solar_version = env.get("SOLAR_VERSION", "").strip()
@@ -97,7 +101,10 @@ def make_plan(env):
     identity = json.dumps({"platform": platform, "tools": tools, "alias": alias}, sort_keys=True)
     key = "setup-forgeds-tools-v1-" + platform + "-" + hashlib.sha256(identity.encode()).hexdigest()[:24]
     root = Path(env.get("RUNNER_TOOL_CACHE") or env["RUNNER_TEMP"]) / "setup-forgeds" / key
-    prefix = "setup-forgeds-compilers-v1-" + namespace + "-" + key.removeprefix("setup-forgeds-tools-v1-") + "-"
+    # Compiler cache contents do not depend on whether `forge` is aliased to `forgeds`.
+    compiler_identity = json.dumps({"platform": platform, "tools": tools}, sort_keys=True)
+    compiler_hash = hashlib.sha256(compiler_identity.encode()).hexdigest()[:24]
+    prefix = "setup-forgeds-compilers-v1-" + namespace + "-" + platform + "-" + compiler_hash + "-"
     return {
         "tools": tools, "platform": platform, "alias": alias,
         "binary-cache": binary_cache, "compiler-cache": compiler_cache,
@@ -160,7 +167,7 @@ def install_tool(name, tool, directory, temp, windows=False):
         if expected is None:
             checksum = Path(work) / "checksum"
             download(tool["url"] + ".sha256", checksum)
-            fields = checksum.read_text().split()
+            fields = checksum.read_text(encoding="utf-8").split()
             if not fields or not re.fullmatch(r"[0-9a-fA-F]{64}", fields[0]):
                 raise ValueError(f"Invalid {name} SHA-256 sidecar")
             expected = fields[0].lower()
@@ -193,8 +200,7 @@ def install(plan, env):
     forgeds = directory / ("forgeds" + extension)
     alias = directory / ("forge" + extension)
     if plan["alias"]:
-        if alias.exists():
-            alias.unlink()
+        alias.unlink(missing_ok=True)
         try:
             os.link(forgeds, alias)
         except OSError:
@@ -219,17 +225,22 @@ def outputs(values, env):
 
 
 def main(args, env):
-    plan_path = Path(env["RUNNER_TEMP"]) / ("setup-forgeds-plan-" + env.get("GITHUB_ACTION", "local") + ".json")
     if args == ["plan"]:
         plan = make_plan(env)
-        plan_path.parent.mkdir(parents=True, exist_ok=True)
-        plan_path.write_text(json.dumps(plan), encoding="utf-8")
+        temp_dir = Path(env["RUNNER_TEMP"])
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        prefix = "setup-forgeds-plan-" + env.get("GITHUB_ACTION", "local") + "-"
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=temp_dir, prefix=prefix, suffix=".json", delete=False
+        ) as handle:
+            json.dump(plan, handle)
+            plan_path = Path(handle.name)
         outputs({key: value for key, value in plan.items() if key != "tools"}, env)
         outputs({"plan-path": str(plan_path)}, env)
     elif args == ["install"]:
         # Each composite invocation has its own plan, including when used twice in a job.
         plan_path = Path(env["PLAN_PATH"])
-        plan = json.loads(plan_path.read_text())
+        plan = json.loads(plan_path.read_text(encoding="utf-8"))
         result = install(plan, env)
         outputs(result, env)
         with Path(env["GITHUB_PATH"]).open("a", encoding="utf-8") as output:
@@ -241,6 +252,6 @@ def main(args, env):
 if __name__ == "__main__":
     try:
         main(sys.argv[1:], os.environ)
-    except (OSError, ValueError, tarfile.TarError, zipfile.BadZipFile) as error:
+    except (OSError, ValueError, http.client.HTTPException, tarfile.TarError, zipfile.BadZipFile) as error:
         print(f"setup-forgeds: {error}", file=sys.stderr)
         sys.exit(1)

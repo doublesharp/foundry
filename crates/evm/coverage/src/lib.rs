@@ -173,25 +173,27 @@ impl CoverageReport {
             .and_modify(|m| m.merge(hit_map))
             .or_insert_with(|| hit_map.clone());
 
-        // Add source level hits.
+        // Add source level hits. Look up the build's analysis once outside both anchor loops.
+        let Some(items) = self.analyses.get_mut(&contract_id.build_id) else {
+            return Ok(());
+        };
+        let all_items = items.all_items_mut();
         if let Some(anchors) = self.anchors.get(contract_id) {
             let anchors = if is_deployed_code { &anchors.1 } else { &anchors.0 };
             for (anchor, hits) in anchors.hits(hit_map) {
-                self.analyses
-                    .get_mut(&contract_id.build_id)
-                    .and_then(|items| items.all_items_mut().get_mut(anchor.item_id as usize))
-                    .expect("Anchor refers to non-existent coverage item")
-                    .hits += hits.get();
+                let item = all_items
+                    .get_mut(anchor.item_id as usize)
+                    .expect("Anchor refers to non-existent coverage item");
+                item.hits = item.hits.saturating_add(hits.get());
             }
         }
         if let Some(anchors) = self.execution_anchors.get(contract_id) {
             for anchor in &anchors.anchors {
                 let hits = anchors.hits(hit_map, anchor.kind, is_deployed_code);
-                self.analyses
-                    .get_mut(&contract_id.build_id)
-                    .and_then(|items| items.all_items_mut().get_mut(anchor.item_id as usize))
-                    .expect("Anchor refers to non-existent coverage item")
-                    .hits += hits;
+                let item = all_items
+                    .get_mut(anchor.item_id as usize)
+                    .expect("Anchor refers to non-existent coverage item");
+                item.hits = item.hits.saturating_add(hits);
             }
         }
 
@@ -205,20 +207,25 @@ impl CoverageReport {
         hit_map: &HitMap,
         is_deployed_code: bool,
     ) -> Vec<(&'a CoverageItem, u32)> {
-        let Some(anchors) = self.anchors.get(contract_id) else { return Vec::new() };
-        let anchors = if is_deployed_code { &anchors.1 } else { &anchors.0 };
-
         let mut hits_by_item = BTreeMap::<u32, u32>::new();
-        for (anchor, hits) in anchors.hits(hit_map) {
-            *hits_by_item.entry(anchor.item_id).or_default() += hits.get();
+        if let Some(anchors) = self.anchors.get(contract_id) {
+            let anchors = if is_deployed_code { &anchors.1 } else { &anchors.0 };
+            for (anchor, hits) in anchors.hits(hit_map) {
+                let entry = hits_by_item.entry(anchor.item_id).or_default();
+                *entry = entry.saturating_add(hits.get());
+            }
         }
         if let Some(anchors) = self.execution_anchors.get(contract_id) {
             for anchor in &anchors.anchors {
                 let hits = anchors.hits(hit_map, anchor.kind, is_deployed_code);
                 if hits > 0 {
-                    *hits_by_item.entry(anchor.item_id).or_default() += hits;
+                    let entry = hits_by_item.entry(anchor.item_id).or_default();
+                    *entry = entry.saturating_add(hits);
                 }
             }
+        }
+        if hits_by_item.is_empty() {
+            return Vec::new();
         }
 
         let Some(items) = self.analyses.get(&contract_id.build_id) else {
@@ -324,19 +331,19 @@ struct CallHits {
 impl CallHits {
     const fn hit(&mut self, with_value: bool) {
         if with_value {
-            self.with_value += 1;
+            self.with_value = self.with_value.saturating_add(1);
         } else {
-            self.without_value += 1;
+            self.without_value = self.without_value.saturating_add(1);
         }
     }
 
     const fn merge(&mut self, other: Self) {
-        self.without_value += other.without_value;
-        self.with_value += other.with_value;
+        self.without_value = self.without_value.saturating_add(other.without_value);
+        self.with_value = self.with_value.saturating_add(other.with_value);
     }
 
     const fn total(self, payable: bool) -> u32 {
-        self.without_value + if payable { self.with_value } else { 0 }
+        self.without_value.saturating_add(if payable { self.with_value } else { 0 })
     }
 }
 
@@ -394,7 +401,8 @@ impl HitMap {
     /// Increase the hit counter by `hits` for the given program counter.
     #[inline]
     pub fn hits(&mut self, pc: u32, hits: u32) {
-        *self.hits.entry(pc).or_default() += hits;
+        let entry = self.hits.entry(pc).or_default();
+        *entry = entry.saturating_add(hits);
     }
 
     /// Records a hit, visible after [`Self::flush`].
@@ -440,7 +448,7 @@ impl HitMap {
     }
 
     const fn creation(&mut self) {
-        self.creations += 1;
+        self.creations = self.creations.saturating_add(1);
     }
 
     /// Reserve space for additional hits.
@@ -455,7 +463,7 @@ impl HitMap {
         for (pc, hits) in other.iter() {
             self.hits(pc, hits);
         }
-        self.creations += other.creations;
+        self.creations = self.creations.saturating_add(other.creations);
         self.empty_calls.merge(other.empty_calls);
         self.short_calls.merge(other.short_calls);
         for (&selector, &hits) in &other.selector_calls {
@@ -976,5 +984,45 @@ mod tests {
         hit_map.record(0);
         hit_map.flush();
         assert_eq!(hit_map.iter().collect::<Vec<_>>(), [(0, u32::MAX)]);
+        // Merging two saturated hit maps must saturate instead of overflowing.
+        let other = hit_map.clone();
+        hit_map.merge(&other);
+        assert_eq!(hit_map.iter().collect::<Vec<_>>(), [(0, u32::MAX)]);
+    }
+
+    #[test]
+    fn hit_items_for_hit_map_includes_execution_anchors_without_bytecode_anchors() {
+        let mut report = CoverageReport::default();
+        report.add_source("b".into(), 0, PathBuf::from("src/Empty.sol"));
+        let item = CoverageItem {
+            kind: CoverageItemKind::Function { name: "constructor".into() },
+            loc: SourceLocation {
+                source_id: 0,
+                contract_name: "Empty".into(),
+                bytes: 0..15,
+                lines: 1..2,
+            },
+            anchor_loc: None,
+            hits: 0,
+        };
+        report.add_analysis("b".into(), SourceAnalysis::from_sourced_items(vec![(0, vec![item])]));
+        let contract_id = ContractId {
+            version: Version::new(0, 8, 25),
+            source_id: 0,
+            contract_name: "Empty".into(),
+            build_id: "b".into(),
+        };
+        report.add_execution_anchors(
+            contract_id.clone(),
+            vec![ExecutionAnchor { item_id: 0, kind: ExecutionAnchorKind::Constructor }],
+            std::iter::empty(),
+            false,
+            false,
+        );
+        let mut hit_map = HitMap::new(Bytes::new());
+        hit_map.creation();
+        let hits = report.hit_items_for_hit_map(&contract_id, &hit_map, false);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].1, 1);
     }
 }

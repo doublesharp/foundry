@@ -81,7 +81,11 @@ impl DocArgs {
         } else {
             let mut compile_project = config.solar_project()?;
             compile_project.no_artifacts = true;
-            Some(ProjectCompiler::new().compile(&compile_project)?)
+            Some(
+                ProjectCompiler::new()
+                    .compiler_warnings(config.compiler_warnings)
+                    .compile(&compile_project)?,
+            )
         };
 
         let mut doc_cfg = config.doc;

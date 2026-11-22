@@ -123,10 +123,11 @@ def main():
             configure(repo, args.root, args.sccache_dir)
             print("Saved local storage settings. Use Cargo and Make normally.")
         else:
-            if not args.command:
+            command = args.command[1:] if args.command[:1] == ["--"] else args.command
+            if not command:
                 parser.error("run requires a command")
             os.environ.update(environment(repo))
-            os.execvp(args.command[0], args.command)
+            os.execvp(command[0], command)
     except (OSError, ValueError, KeyError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 1

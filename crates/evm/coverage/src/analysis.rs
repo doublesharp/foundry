@@ -6,7 +6,7 @@ use rayon::prelude::*;
 use solar::{
     ast::{self, ExprKind, ItemKind, StmtKind, yul},
     data_structures::{Never, map::FxHashMap},
-    interface::{RelativeBytePos, Span},
+    interface::{RelativeBytePos, Span, source_map::SourceFile},
     sema::{Gcx, hir},
 };
 use std::{
@@ -22,6 +22,8 @@ struct SourceVisitor<'gcx> {
     source_id: u32,
     /// The solar session for span resolution.
     gcx: Gcx<'gcx>,
+    /// The source file being visited, avoiding global `SourceMap` lock contention on every node.
+    file: &'gcx SourceFile,
 
     /// The name of the contract being walked.
     contract_name: Arc<str>,
@@ -115,10 +117,11 @@ fn resolve_empty_special_functions(
 }
 
 impl<'gcx> SourceVisitor<'gcx> {
-    fn new(source_id: u32, gcx: Gcx<'gcx>) -> Self {
+    fn new(source_id: u32, gcx: Gcx<'gcx>, file: &'gcx SourceFile) -> Self {
         Self {
             source_id,
             gcx,
+            file,
             contract_name: Arc::default(),
             branch_id: 0,
             ternary_branches: Default::default(),
@@ -241,20 +244,29 @@ impl<'gcx> SourceVisitor<'gcx> {
     }
 
     fn source_location_for(&self, span: Span) -> SourceLocation {
-        let files = self.gcx.sess.source_map().files();
-        let source = files.span_to_source(span).unwrap();
-        let mut bytes = source.data;
+        assert!(!span.is_dummy());
+        let (file_owned, file, mut bytes) =
+            if span.lo() >= self.file.start_pos && span.hi() <= self.file.end_position() {
+                let start = (span.lo() - self.file.start_pos).to_usize();
+                let end = (span.hi() - self.file.start_pos).to_usize();
+                (None, self.file, start..end)
+            } else {
+                let files = self.gcx.sess.source_map().files();
+                let source = files.span_to_source(span).unwrap();
+                let bytes = source.data;
+                (Some(Arc::clone(source.file)), self.file, bytes)
+            };
+        let file: &SourceFile = file_owned.as_deref().map_or(file, |v| v);
         // Statements' ranges in the solc source map do not include the semicolon.
-        if let Some(snippet) = source.file.src.get(bytes.clone())
+        if let Some(snippet) = file.src.get(bytes.clone())
             && let Some(stripped) = snippet.strip_suffix(';')
         {
             bytes.end -= snippet.len() - stripped.trim_end().len();
         }
 
         // Coverage needs line numbers, not the character columns of every spanned line.
-        assert!(!span.is_dummy());
-        let first = source.file.lookup_line(RelativeBytePos::from_usize(bytes.start)).unwrap();
-        let last = source.file.lookup_line(RelativeBytePos::from_usize(bytes.end)).unwrap();
+        let first = file.lookup_line(RelativeBytePos::from_usize(bytes.start)).unwrap();
+        let last = file.lookup_line(RelativeBytePos::from_usize(bytes.end)).unwrap();
         SourceLocation {
             source_id: self.source_id as usize,
             contract_name: self.contract_name.clone(),
@@ -608,7 +620,7 @@ impl SourceAnalysis {
                     let ast = source.ast.as_ref().unwrap();
                     let (hir_source_id, _) = compiler.gcx().get_hir_source(path).unwrap();
 
-                    let mut visitor = SourceVisitor::new(source_id, compiler.gcx());
+                    let mut visitor = SourceVisitor::new(source_id, compiler.gcx(), &source.file);
                     for item in ast.items.iter() {
                         match &item.kind {
                             // Contracts: walk their functions, dropping test contracts.
@@ -693,15 +705,22 @@ impl SourceAnalysis {
         let mut contract_empty_special_functions =
             HashMap::<u32, HashMap<Arc<str>, Vec<u32>>>::default();
         for resolved in resolved_empty_special_functions {
-            let item_ids = all_items
+            let Some(&(start, count)) = map.get(resolved.function_source_id as usize) else {
+                continue;
+            };
+            if start == u32::MAX || count == 0 {
+                continue;
+            }
+            let start = start as usize;
+            let end = start + count as usize;
+            let item_ids = all_items[start..end]
                 .iter()
                 .enumerate()
                 .filter(|(_, item)| {
-                    item.loc.source_id == resolved.function_source_id as usize
-                        && item.loc.contract_name == resolved.function_contract_name
+                    item.loc.contract_name == resolved.function_contract_name
                         && item.loc.bytes == resolved.function_bytes
                 })
-                .map(|(item_id, _)| item_id as u32)
+                .map(|(offset, _)| (start + offset) as u32)
                 .collect::<Vec<_>>();
             empty_special_functions
                 .extend(item_ids.iter().map(|&item_id| (item_id, resolved.kind)));

@@ -135,6 +135,8 @@ pub(crate) fn invariant_preflight_check<FEN: FoundryEvmNetwork>(
         executor,
         calldata,
         invariant_failures,
+        None,
+        None,
     )?;
     Ok(())
 }
@@ -198,6 +200,7 @@ pub fn did_fail_on_assert<FEN: FoundryEvmNetwork>(
 ///
 /// Returns the first newly-broken invariant in declaration order (if any), so callers can
 /// attribute the failure event without re-scanning `invariant_failures.errors` afterwards.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn assert_invariants<'a, FEN: FoundryEvmNetwork>(
     invariant_contract: &InvariantContract<'a>,
     invariant_config: &InvariantConfig,
@@ -205,6 +208,8 @@ pub(crate) fn assert_invariants<'a, FEN: FoundryEvmNetwork>(
     executor: &Executor<FEN>,
     calldata: &[BasicTxDetails],
     invariant_failures: &mut InvariantFailures,
+    mut line_coverage: Option<&mut Option<HitMaps>>,
+    mut instrumented_coverage: Option<&mut Option<InstrumentedHitMaps>>,
 ) -> Result<(Option<&'a Function>, bool)> {
     let mut inner_sequence = None;
     let mut first_broken: Option<&'a Function> = None;
@@ -221,13 +226,19 @@ pub(crate) fn assert_invariants<'a, FEN: FoundryEvmNetwork>(
             continue;
         }
 
-        let (call_result, success) = call_invariant_function(
+        let (mut call_result, success) = call_invariant_function(
             executor,
             invariant_contract.address,
             invariant_contract.invariant_calldata(idx),
         )?;
         if call_result.execution_cancelled {
             return Ok((first_broken, true));
+        }
+        if let Some(cov) = line_coverage.as_deref_mut() {
+            HitMaps::merge_opt(cov, call_result.line_coverage.take());
+        }
+        if let Some(cov) = instrumented_coverage.as_deref_mut() {
+            InstrumentedHitMaps::merge_opt(cov, call_result.instrumented_coverage.take());
         }
         if !success {
             let inner_sequence =
@@ -318,7 +329,7 @@ pub(crate) fn can_continue<'a, FEN: FoundryEvmNetwork>(
 
         if is_optimization {
             // Optimization mode: call invariant and track max value, never fail.
-            let (inv_result, success) = call_invariant_function(
+            let (mut inv_result, success) = call_invariant_function(
                 &invariant_run.executor,
                 invariant_contract.address,
                 invariant_contract.anchor_calldata(),
@@ -326,6 +337,11 @@ pub(crate) fn can_continue<'a, FEN: FoundryEvmNetwork>(
             if inv_result.execution_cancelled {
                 return Ok(ContinueOutcome { continues: true, cancelled: true });
             }
+            HitMaps::merge_opt(&mut invariant_run.line_coverage, inv_result.line_coverage.take());
+            InstrumentedHitMaps::merge_opt(
+                &mut invariant_run.instrumented_coverage,
+                inv_result.instrumented_coverage.take(),
+            );
             if success
                 && inv_result.result.len() >= 32
                 && let Some(value) = I256::try_from_be_slice(&inv_result.result[..32])
@@ -346,6 +362,8 @@ pub(crate) fn can_continue<'a, FEN: FoundryEvmNetwork>(
                 &invariant_run.executor,
                 &invariant_run.inputs,
                 &mut invariant_test.test_data.failures,
+                Some(&mut invariant_run.line_coverage),
+                Some(&mut invariant_run.instrumented_coverage),
             )?;
             if cancelled {
                 return Ok(ContinueOutcome { continues: true, cancelled: true });
@@ -453,14 +471,19 @@ pub(crate) fn can_continue<'a, FEN: FoundryEvmNetwork>(
 pub(crate) fn assert_after_invariant<'a, FEN: FoundryEvmNetwork>(
     invariant_contract: &InvariantContract<'a>,
     invariant_test: &mut InvariantTest,
-    invariant_run: &InvariantTestRun<FEN>,
+    invariant_run: &mut InvariantTestRun<FEN>,
     invariant_config: &InvariantConfig,
 ) -> Result<(Option<&'a Function>, bool)> {
-    let (call_result, success) =
+    let (mut call_result, success) =
         call_after_invariant_function(&invariant_run.executor, invariant_contract.address)?;
     if call_result.execution_cancelled {
         return Ok((None, true));
     }
+    HitMaps::merge_opt(&mut invariant_run.line_coverage, call_result.line_coverage.take());
+    InstrumentedHitMaps::merge_opt(
+        &mut invariant_run.instrumented_coverage,
+        call_result.instrumented_coverage.take(),
+    );
     // Fail the test case if `afterInvariant` doesn't succeed.
     if success {
         return Ok((None, false));
@@ -565,6 +588,8 @@ mod tests {
             &executor,
             &[],
             &mut failures,
+            None,
+            None,
         )
         .unwrap();
 

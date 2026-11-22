@@ -97,7 +97,7 @@ class SetupForgedsTests(unittest.TestCase):
     def test_latest_is_resolved_before_cache_lookup(self):
         with patch.object(MODULE, "read_remote", return_value="b" * 40) as read:
             plan = self.plan(FORGEDS_VERSION="latest")
-        read.assert_called_once_with(MODULE.FORGEDS_URL + "forgeds_latest.txt")
+        read.assert_called_once_with(MODULE.FORGEDS_URL + "forgeds_latest.txt", self.env["RUNNER_TEMP"])
         self.assertEqual(plan["tools"]["forgeds"]["commit"], "b" * 40)
 
     def test_tool_cache_is_stable_across_source_changes(self):
@@ -109,6 +109,34 @@ class SetupForgedsTests(unittest.TestCase):
         for overrides in ({"SOLAR_VERSION": "v0.3.0"}, {"FORGE_ALIAS": "true"},
                           {"RUNNER_ARCH": "ARM64"}, {"FORGEDS_VERSION": "b" * 40}):
             self.assertNotEqual(original["tool-key"], self.plan(**overrides)["tool-key"])
+        # Aliasing `forge` changes the tool bin dir but does not affect compiler cache entries.
+        aliased = self.plan(FORGE_ALIAS="true")
+        self.assertEqual(original["compiler-prefix"], aliased["compiler-prefix"])
+
+    def test_download_retries_incomplete_read(self):
+        class FlakyResponse:
+            def __init__(self, fail):
+                self.fail = fail
+                self.done = False
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                return False
+            def read(self, _size):
+                if self.fail:
+                    raise MODULE.http.client.IncompleteRead(b"partial")
+                if self.done:
+                    return b""
+                self.done = True
+                return b"payload"
+
+        responses = iter([FlakyResponse(True), FlakyResponse(False)])
+        destination = self.root / "artifact.bin"
+        with patch.object(MODULE.urllib.request, "urlopen", side_effect=lambda *a, **kw: next(responses)), \
+             patch.object(MODULE.time, "sleep"):
+            digest = MODULE.download("https://example.invalid/file", destination)
+        self.assertEqual(destination.read_bytes(), b"payload")
+        self.assertEqual(digest, hashlib.sha256(b"payload").hexdigest())
 
     def test_compiler_namespace_does_not_duplicate_binary_cache(self):
         original = self.plan()

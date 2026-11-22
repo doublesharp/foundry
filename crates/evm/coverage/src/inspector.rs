@@ -2,10 +2,10 @@ use crate::{CallData, HitMap, HitMaps};
 use alloy_primitives::{Address, B256, Bytes, address, map::B256HashMap};
 use revm::{
     Inspector,
-    context::{ContextTr, JournalTr},
+    context::{ContextTr, JournalTr, LocalContextTr},
     interpreter::{
-        CallInputs, CallOutcome, CallScheme, CreateInputs, CreateOutcome, Gas, InstructionResult,
-        Interpreter, InterpreterResult, interpreter_types::Jumps,
+        CallInput, CallInputs, CallOutcome, CallScheme, CreateInputs, CreateOutcome, Gas,
+        InstructionResult, Interpreter, InterpreterResult, interpreter_types::Jumps,
     },
 };
 use std::ptr::NonNull;
@@ -199,9 +199,19 @@ impl<CTX: ContextTr> Inspector<CTX> for InstrumentedCoverageCollector {
         }
 
         // The probe forwards exactly the 32-byte tag as calldata; anything else is not ours.
-        let input = inputs.input.bytes(context);
-        if input.len() == 32 {
-            self.hits.hit(B256::from_slice(&input[..32]));
+        if inputs.input.len() == 32 {
+            match &inputs.input {
+                CallInput::SharedBuffer(range) => {
+                    if let Some(slice) = context.local().shared_memory_buffer_slice(range.clone())
+                        && slice.len() == 32
+                    {
+                        self.hits.hit(B256::from_slice(&slice));
+                    }
+                }
+                CallInput::Bytes(bytes) => {
+                    self.hits.hit(B256::from_slice(bytes));
+                }
+            }
         }
 
         Some(CallOutcome {

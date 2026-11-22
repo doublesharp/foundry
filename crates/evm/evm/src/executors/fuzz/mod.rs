@@ -459,6 +459,8 @@ impl<FEN: FoundryEvmNetwork> FuzzedExecutor<FEN> {
                 .map(|reason| reason.to_string())
                 .or_else(|| rd.maybe_decode(&call.result, call.exit_reason));
             result.reason = reason;
+            result.line_coverage = call.line_coverage;
+            result.instrumented_coverage = call.instrumented_coverage;
             let args = tx
                 .call_details
                 .calldata

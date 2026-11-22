@@ -1394,6 +1394,9 @@ impl<FEN: FoundryEvmNetwork> InspectorStackRefMut<'_, FEN> {
         self.locally_created_accounts.clear();
         self.top_level_frame_failed_before_rewrite = false;
         warm_arbitrum_system_contract::<FEN>(ecx);
+        if self.instrumented_coverage.is_some() {
+            warm_coverage_sentinel::<FEN>(ecx);
+        }
         if let Some(cheatcodes) = &mut self.cheatcodes {
             cheatcodes.on_root_frame_start();
         }
@@ -1839,6 +1842,9 @@ impl<FEN: FoundryEvmNetwork> Inspector<FoundryContextFor<'_, FEN>>
         if self.is_inner_context_root(ecx.journal().depth()) {
             self.adjust_evm_data_for_inner_context(ecx);
             warm_arbitrum_system_contract::<FEN>(ecx);
+            if self.instrumented_coverage.is_some() {
+                warm_coverage_sentinel::<FEN>(ecx);
+            }
             // Transaction call inputs use the original target, so resolve function mocks here too.
             if let Some(cheatcodes) = self.cheatcodes.as_deref() {
                 apply_mocked_function(cheatcodes, ecx, call);
@@ -2011,7 +2017,10 @@ impl<FEN: FoundryEvmNetwork> Inspector<FoundryContextFor<'_, FEN>>
                             continue;
                         }
 
-                        if warm_addresses.is_cold(addr) {
+                        if warm_addresses.is_cold(addr)
+                            && !(self.instrumented_coverage.is_some()
+                                && *addr == FOUNDRY_COVERAGE_ADDRESS)
+                        {
                             acc_mut.mark_cold();
                         }
 
@@ -2089,6 +2098,9 @@ impl<FEN: FoundryEvmNetwork> Inspector<FoundryContextFor<'_, FEN>>
         if self.is_inner_context_root(ecx.journal().depth()) {
             self.adjust_evm_data_for_inner_context(ecx);
             warm_arbitrum_system_contract::<FEN>(ecx);
+            if self.instrumented_coverage.is_some() {
+                warm_coverage_sentinel::<FEN>(ecx);
+            }
             return None;
         }
 
@@ -2253,6 +2265,16 @@ fn warm_arbitrum_system_contract<FEN: FoundryEvmNetwork>(ecx: &mut FoundryContex
     let mut access_list = ecx.journal_inner().warm_addresses.access_list().clone();
     access_list.entry(arbitrum::ARB_SYS_ADDRESS).or_default();
     ecx.journal_mut().warm_access_list(access_list);
+}
+
+fn warm_coverage_sentinel<FEN: FoundryEvmNetwork>(ecx: &mut FoundryContextFor<'_, FEN>) {
+    // Keep the coverage probe sentinel warm so injected `STATICCALL`s never pay the 2,600-gas
+    // cold account access penalty (which would otherwise OOG 2,300-gas `transfer`/`send` stipends).
+    if ecx.journal_inner().warm_addresses.is_cold(&FOUNDRY_COVERAGE_ADDRESS) {
+        let mut access_list = ecx.journal_inner().warm_addresses.access_list().clone();
+        access_list.entry(FOUNDRY_COVERAGE_ADDRESS).or_default();
+        ecx.journal_mut().warm_access_list(access_list);
+    }
 }
 
 fn handle_arbitrum_system_call<FEN: FoundryEvmNetwork>(

@@ -8,7 +8,7 @@ use solar::sema::{
     interface::source_map::FileName,
 };
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     path::{Path, PathBuf},
 };
 
@@ -51,7 +51,8 @@ impl ContractData {
         gcx: Gcx<'_>,
         contract_id: ContractId,
         path: &Path,
-        reserved_identifiers: &str,
+        needs_deploy_helper: bool,
+        closures: &mut HashMap<SourceId, Vec<SourceId>>,
         source_units: &[PathBuf],
     ) -> Self {
         let contract = gcx.hir.contract(contract_id);
@@ -59,12 +60,19 @@ impl ContractData {
         let artifact =
             solidity_string_content(&format!("{}:{}", path.to_slash_lossy(), contract.name));
 
-        // Process data for contracts with constructor and parameters.
-        let constructor_data = contract
-            .ctor
-            .map(|ctor_id| gcx.hir.function(ctor_id))
-            .filter(|ctor| !ctor.parameters.is_empty())
+        // Process data only for contracts whose parameterized constructor needs a deploy helper.
+        let constructor_data = needs_deploy_helper
+            .then(|| {
+                contract
+                    .ctor
+                    .map(|ctor_id| gcx.hir.function(ctor_id))
+                    .filter(|ctor| !ctor.parameters.is_empty())
+            })
+            .flatten()
             .map(|ctor| {
+                let closure = closures
+                    .entry(contract.source)
+                    .or_insert_with(|| import_closure(gcx, contract.source));
                 let contract_id = keccak256(format!("{}:{}", path.to_slash_lossy(), contract.name));
                 let mut abi_encode_args = vec![];
                 let mut struct_fields = vec![];
@@ -78,10 +86,7 @@ impl ContractData {
                     } else {
                         // Generate a unique name if the constructor arg does not have one.
                         arg_index += 1;
-                        unique_identifier(
-                            reserved_identifiers,
-                            format!("foundry_pp_ctor_arg{arg_index}"),
-                        )
+                        unique_identifier(gcx, closure, format!("foundry_pp_ctor_arg{arg_index}"))
                     };
                     abi_encode_args.push(format!("args.{name}"));
                     struct_fields.push(format!("{ty} {name}"));
@@ -91,15 +96,18 @@ impl ContractData {
                     abi_encode_args: abi_encode_args.join(", "),
                     struct_fields: struct_fields.join("; "),
                     helper_contract: unique_identifier(
-                        reserved_identifiers,
+                        gcx,
+                        closure,
                         format!("DeployHelper{contract_id:x}"),
                     ),
                     args_struct: unique_identifier(
-                        reserved_identifiers,
+                        gcx,
+                        closure,
                         "FoundryPpConstructorArgs".to_string(),
                     ),
                     encode_function: unique_identifier(
-                        reserved_identifiers,
+                        gcx,
+                        closure,
                         format!("encodeArgs{contract_id:x}"),
                     ),
                     helper_path: deploy_helper_path(&format!("{contract_id:x}"), source_units),
@@ -192,24 +200,29 @@ function {encode_function}({helper_contract}.{args_struct} memory args) pure ret
     }
 }
 
-/// Reserves names only in the source's import closure, which is stable across compiler jobs.
-pub(super) fn reserved_identifiers(gcx: Gcx<'_>, source: SourceId) -> String {
+/// Collects the source IDs in `source`'s transitive import closure, which is stable across
+/// compiler jobs without copying or concatenating source texts.
+pub(super) fn import_closure(gcx: Gcx<'_>, source: SourceId) -> Vec<SourceId> {
     let mut visited = HashSet::new();
     let mut pending = vec![source];
-    let mut identifiers = String::new();
+    let mut closure = Vec::new();
     while let Some(id) = pending.pop() {
         if visited.insert(id) {
+            closure.push(id);
             let source = gcx.hir.source(id);
-            identifiers.push_str(source.file.src.as_str());
-            identifiers.push('\n');
             pending.extend(source.imports.iter().map(|(_, id)| *id));
         }
     }
-    identifiers
+    closure
 }
 
-fn unique_identifier(source: &str, mut identifier: String) -> String {
-    while source.contains(&identifier) {
+/// Returns an identifier that does not appear in any source file within `closure`.
+pub(super) fn unique_identifier(
+    gcx: Gcx<'_>,
+    closure: &[SourceId],
+    mut identifier: String,
+) -> String {
+    while closure.iter().any(|&id| gcx.hir.source(id).file.src.contains(&identifier)) {
         identifier.push('_');
     }
     identifier
@@ -233,10 +246,12 @@ fn solidity_string_content(value: &str) -> String {
 pub(crate) fn collect_preprocessor_data(
     gcx: Gcx<'_>,
     referenced_contracts: &HashSet<ContractId>,
+    deploy_helpers: &HashSet<ContractId>,
     root_dir: &Path,
     source_units: &[PathBuf],
 ) -> PreprocessorData {
     let mut data = PreprocessorData::default();
+    let mut closures = HashMap::new();
     for contract_id in referenced_contracts {
         let contract = gcx.hir.contract(*contract_id);
         let source = gcx.hir.source(contract.source);
@@ -251,7 +266,8 @@ pub(crate) fn collect_preprocessor_data(
             gcx,
             *contract_id,
             path,
-            &reserved_identifiers(gcx, contract.source),
+            deploy_helpers.contains(contract_id),
+            &mut closures,
             source_units,
         );
         data.insert(*contract_id, contract_data);

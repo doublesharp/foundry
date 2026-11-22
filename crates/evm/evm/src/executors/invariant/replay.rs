@@ -89,11 +89,16 @@ pub fn replay_run<FEN: FoundryEvmNetwork>(
     // Checking after each call doesn't add valuable info for passing scenario
     // (invariant call result is always success) nor for failed scenarios
     // (invariant call result is always success until the last call that breaks it).
-    let (invariant_result, invariant_success) = call_invariant_function(
+    let (mut invariant_result, invariant_success) = call_invariant_function(
         &executor,
         invariant_contract.address,
         target_invariant.abi_encode_input(&[])?.into(),
     )?;
+    HitMaps::merge_opt(line_coverage, invariant_result.line_coverage.take());
+    InstrumentedHitMaps::merge_opt(
+        instrumented_coverage,
+        invariant_result.instrumented_coverage.take(),
+    );
     let fork_block_number = invariant_result.fork_block_number;
     debug_bytecodes.extend(invariant_result.debug_bytecodes);
     traces.push((TraceKind::Execution, invariant_result.traces.clone().unwrap()));
@@ -107,8 +112,13 @@ pub fn replay_run<FEN: FoundryEvmNetwork>(
 
     // Collect after invariant logs and traces.
     if invariant_contract.call_after_invariant && invariant_success {
-        let (after_invariant_result, _) =
+        let (mut after_invariant_result, _) =
             call_after_invariant_function(&executor, invariant_contract.address)?;
+        HitMaps::merge_opt(line_coverage, after_invariant_result.line_coverage.take());
+        InstrumentedHitMaps::merge_opt(
+            instrumented_coverage,
+            after_invariant_result.instrumented_coverage.take(),
+        );
         debug_bytecodes.extend(after_invariant_result.debug_bytecodes);
         traces.push((TraceKind::Execution, after_invariant_result.traces.clone().unwrap()));
         logs.extend(after_invariant_result.logs);
@@ -162,9 +172,13 @@ pub fn replay_error<FEN: FoundryEvmNetwork>(
         config.show_solidity,
     );
 
-    // Every shrink attempt would append its steps to the shared step table, so only the replay of
-    // the shrunk sequence records them.
+    // Every shrink attempt would append its steps to the shared step table and pay per-opcode
+    // line coverage collection for discarded runs, so disable both during shrinking.
     let recorder = executor.inspector_mut().debug_recorder.take();
+    let collect_line_coverage = executor.inspector().line_coverage.is_some();
+    if collect_line_coverage {
+        executor.inspector_mut().collect_line_coverage(false);
+    }
     let (calls, check_result, optimization_value) = if let Some(target) = target_value {
         let (calls, value) = shrink_sequence_value(
             &config,
@@ -193,6 +207,9 @@ pub fn replay_error<FEN: FoundryEvmNetwork>(
         (shrunk.calls, shrunk.result, None)
     };
     executor.inspector_mut().debug_recorder = recorder;
+    if collect_line_coverage {
+        executor.inspector_mut().collect_line_coverage(true);
+    }
 
     if let Some(sequence) = inner_sequence {
         set_up_inner_replay(&mut executor, &sequence);

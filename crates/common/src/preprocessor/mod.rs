@@ -179,6 +179,7 @@ impl Preprocessor<SolcCompiler> for DynamicTestLinkingPreprocessor {
             let data = collect_preprocessor_data(
                 gcx,
                 &deps.referenced_contracts,
+                &deps.deploy_helpers,
                 &paths.root,
                 source_units,
             );

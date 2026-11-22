@@ -49,7 +49,7 @@ use foundry_config::{
     CompilerWarnings, Config, CoverageConfig, CoverageReportKind, InlineConfig, parse_lcov_version,
 };
 use foundry_evm::{core::ic::IcPcMap, opts::EvmOpts};
-use globset::{Glob, GlobSetBuilder};
+use globset::{Glob, GlobSet, GlobSetBuilder};
 use rayon::prelude::*;
 use semver::Version;
 use std::{
@@ -283,6 +283,23 @@ impl CoverageArgs {
             .collect::<Vec<_>>();
     }
 
+    fn build_skip_files(&self) -> Result<Option<GlobSet>> {
+        if self.skip_files.is_empty() {
+            return Ok(None);
+        }
+        let mut builder = GlobSetBuilder::new();
+        for pattern in &self.skip_files {
+            let glob = Glob::new(pattern).map_err(|e| {
+                eyre::eyre!("invalid glob in coverage.skip_files: '{pattern}': {e}")
+            })?;
+            builder.add(glob);
+        }
+        let set = builder
+            .build()
+            .map_err(|e| eyre::eyre!("failed to build coverage.skip_files glob set: {e}"))?;
+        Ok(Some(set))
+    }
+
     /// Builds the project.
     fn build(&self, config: &Config, filter: &ProjectPathsAwareFilter) -> Result<CoverageBuild> {
         // Instrumentation rewrites sources deterministically, so the instrumented compiler input
@@ -369,12 +386,14 @@ impl CoverageArgs {
                 .collect::<BTreeSet<_>>()
         });
         if self.instrumented {
+            let skip_files = self.build_skip_files()?;
             let metadata = Arc::new(Mutex::new(InstrumentedCoverageMetadata::default()));
             let output = self
                 .compile_instrumented(
                     &project,
                     metadata.clone(),
                     filter.args().coverage_pattern_inverse.clone(),
+                    skip_files,
                     filtered_sources.as_ref(),
                     config.compiler_warnings,
                 )?
@@ -444,7 +463,7 @@ impl CoverageArgs {
             identity.sort_all_objects();
             let fingerprint = keccak256(serde_json::to_vec(&identity)?).to_string();
             let marker = path.join(Config::COVERAGE_CACHE_MARKER);
-            if fs::read_to_string(&marker).ok().as_deref() != Some(&fingerprint) {
+            if config.force || fs::read_to_string(&marker).ok().as_deref() != Some(&fingerprint) {
                 // Retain ownership even if compilation fails before the new fingerprint is saved.
                 fs::write(&marker, "")?;
                 for entry in fs::read_dir(path)? {
@@ -509,14 +528,21 @@ impl CoverageArgs {
         project: &Project,
         metadata: InstrumentedCoverageMetadataRef,
         excluded_sources: Option<regex::Regex>,
+        skip_files: Option<GlobSet>,
         filtered_sources: Option<&BTreeSet<PathBuf>>,
         warnings: CompilerWarnings,
     ) -> Result<ProjectCompileOutput> {
         let root = project.root().to_path_buf();
         let mut output = with_compilation_reporter(false, Some(root), || {
-            let mut sources = project.paths.read_input_files()?;
-            if let Some(filtered_sources) = filtered_sources {
-                sources.retain(|path, _| filtered_sources.contains(path));
+            let mut sources = if let Some(files) = filtered_sources
+                && !files.is_empty()
+            {
+                Source::read_all(files)?
+            } else {
+                project.paths.read_input_files()?
+            };
+            if let Some(filter) = &project.sparse_output {
+                sources.retain(|path, _| filter.is_match(path));
             }
             let compiler = FoundryProjectCompiler::with_sources(project, sources)?
                 .with_preprocessor(CoverageInstrumentationPreprocessor::new(
@@ -524,6 +550,7 @@ impl CoverageArgs {
                     self.include_libs,
                     self.exclude_tests,
                     excluded_sources,
+                    skip_files,
                 ));
             compiler.compile().map_err(eyre::Report::from)
         })?;
@@ -690,27 +717,41 @@ impl CoverageArgs {
             )
             .await?;
 
-        let known_contracts = outcome.known_contracts.as_ref().unwrap();
-        // Linking removes library references. Match runtime against the compiler artifacts to
-        // retain those offsets, while keeping linked bytecode for creation matching.
-        let runtime_contracts = ContractsByArtifactBuilder::new(
-            output.artifact_ids().map(|(id, artifact)| (id, artifact.into())),
-        )
-        .build();
         let mut resolved_hit_maps = ResolvedHitMaps::default();
-        let mut unresolved_hit_maps = HashSet::<B256>::default();
 
         if let Some(index) = &instrumented_index {
             let mut aggregated_hits = InstrumentedHitMaps::default();
+            // All tests in a contract share the same setup `Arc<InstrumentedHitMaps>`. Count each
+            // unique setup map once and scale its hits rather than iterating it per test.
+            let mut setup_counts =
+                HashMap::<*const InstrumentedHitMaps, (&InstrumentedHitMaps, u64)>::default();
             for suite in outcome.results.values() {
                 for result in suite.test_results.values() {
-                    for hits in result.instrumented_coverage() {
+                    if let Some(setup) = result.setup_instrumented_coverage.as_ref() {
+                        let ptr = Arc::as_ptr(setup);
+                        setup_counts.entry(ptr).or_insert((setup.as_ref(), 0)).1 += 1;
+                    }
+                    if let Some(hits) = result.instrumented_coverage.as_ref() {
                         aggregated_hits.merge_ref(hits);
                     }
                 }
             }
+            for (setup_hits, count) in setup_counts.into_values() {
+                for (tag, hits) in &setup_hits.0 {
+                    let entry = aggregated_hits.0.entry(*tag).or_default();
+                    *entry = entry.saturating_add(hits.saturating_mul(count));
+                }
+            }
             instrumented::add_hits(&mut report, index, &aggregated_hits);
         } else {
+            let known_contracts = outcome.known_contracts.as_ref().unwrap();
+            // Linking removes library references. Match runtime against the compiler artifacts to
+            // retain those offsets, while keeping linked bytecode for creation matching.
+            let runtime_contracts = ContractsByArtifactBuilder::new(
+                output.artifact_ids().map(|(id, artifact)| (id, artifact.into())),
+            )
+            .build();
+            let mut unresolved_hit_maps = HashSet::<B256>::default();
             // Add hit data to the coverage report
             for suite in outcome.results.values() {
                 for result in suite.test_results.values() {
@@ -795,17 +836,7 @@ impl CoverageArgs {
                 !not_re.is_match(&path.to_string_lossy())
             });
         }
-        if !self.skip_files.is_empty() {
-            let mut builder = GlobSetBuilder::new();
-            for pattern in &self.skip_files {
-                let glob = Glob::new(pattern).map_err(|e| {
-                    eyre::eyre!("invalid glob in coverage.skip_files: '{pattern}': {e}")
-                })?;
-                builder.add(glob);
-            }
-            let set = builder
-                .build()
-                .map_err(|e| eyre::eyre!("failed to build coverage.skip_files glob set: {e}"))?;
+        if let Some(set) = self.build_skip_files()? {
             report.retain_sources(|path: &Path| {
                 let path = path.strip_prefix(file_root).unwrap_or(path);
                 !set.is_match(path)

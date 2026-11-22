@@ -40,7 +40,7 @@ use foundry_cli::{
 };
 use foundry_common::{
     ContractsByArtifact, EmptyTestFilter, TestFilter, TestFunctionExt, TestFunctionKind,
-    compile::{ProjectCompiler, compile_abi_project_cached, format_diagnostics},
+    compile::{ProjectCompiler, compile_abi_project_cached},
     external_compiler::is_external_artifact,
     fs,
     fs::canonicalize_path,
@@ -1508,15 +1508,20 @@ impl TestArgs {
         &self,
         config: &Config,
         test_filter: &ProjectPathsAwareFilter,
+        src_files: &[PathBuf],
+        test_files: &[PathBuf],
     ) -> Result<(BTreeSet<PathBuf>, ProjectCompileOutput)> {
         let mut project = config.create_project(config.cache, true)?;
-        let sources = source_files_iter(&config.src, MultiCompilerLanguage::FILE_EXTENSIONS)
+        let sources = src_files
+            .iter()
             .chain(
                 // Preserve path-filter behavior for conventional test files while still
                 // scanning non-test fixtures under the test root.
-                source_files_iter(&config.test, MultiCompilerLanguage::FILE_EXTENSIONS)
+                test_files
+                    .iter()
                     .filter(|path| !path.is_sol_test() || test_filter.matches_path(path)),
             )
+            .cloned()
             .collect::<BTreeSet<_>>();
         // ABI discovery does not need dynamic linking, whose job-specific cache prevents
         // incremental ABI compilation after edits.
@@ -1524,18 +1529,11 @@ impl TestArgs {
             &mut project,
             ProjectCompiler::new()
                 .external_compilers(config)
+                .compiler_warnings(config.compiler_warnings)
                 .files(sources.iter().cloned())
-                .source_order_fallback(
-                    source_files_iter(&config.src, MultiCompilerLanguage::FILE_EXTENSIONS).chain(
-                        source_files_iter(&config.test, MultiCompilerLanguage::FILE_EXTENSIONS),
-                    ),
-                )
+                .source_order_fallback(src_files.iter().chain(test_files.iter()).cloned())
                 .quiet(true),
         )?;
-        if output.has_compiler_errors() {
-            sh_println!("{}", format_diagnostics(&output, &project, config.compiler_warnings))?;
-            bail!("Compilation failed");
-        }
 
         Ok((sources, output))
     }
@@ -1553,28 +1551,44 @@ impl TestArgs {
         config: &Config,
         test_filter: &ProjectPathsAwareFilter,
         symbolic_artifact_replay: Option<&SymbolicArtifactReplayConfig>,
+        src_files: &[PathBuf],
+        test_files: &[PathBuf],
     ) -> Result<(BTreeSet<PathBuf>, Option<Arc<InlineConfig>>)> {
-        let src_files = || source_files_iter(&config.src, MultiCompilerLanguage::FILE_EXTENSIONS);
-        let test_files = || source_files_iter(&config.test, MultiCompilerLanguage::FILE_EXTENSIONS);
-
         // An empty filter doesn't filter out anything.
         // We can still optimize slightly by excluding scripts.
         if test_filter.is_empty() {
-            return Ok((src_files().chain(test_files()).collect(), None));
+            return Ok((src_files.iter().chain(test_files.iter()).cloned().collect(), None));
         }
 
-        let (sources, output) = self.compile_test_abis(config, test_filter)?;
+        let filter_args = test_filter.args();
+        let has_contract_or_test_filter = filter_args.test_pattern.is_some()
+            || filter_args.test_pattern_inverse.is_some()
+            || filter_args.contract_pattern.is_some()
+            || filter_args.contract_pattern_inverse.is_some();
+
+        // For path-only filters where every non-`.t.sol` file under `test/` already matches the
+        // filter (or there are none), we know the exact set of compilation roots without paying
+        // for an extra ABI-only compilation pass.
+        if !has_contract_or_test_filter
+            && symbolic_artifact_replay.is_none()
+            && test_files.iter().all(|path| path.is_sol_test() || test_filter.matches_path(path))
+        {
+            let files = src_files
+                .iter()
+                .chain(test_files.iter().filter(|path| test_filter.matches_path(path)))
+                .cloned()
+                .collect();
+            return Ok((files, None));
+        }
+
+        let (sources, output) =
+            self.compile_test_abis(config, test_filter, src_files, test_files)?;
 
         let inline_config = Arc::new(InlineConfig::new_parsed(&output, config)?);
         let test_matcher =
             TestFunctionMatcher::new(config, &inline_config, symbolic_artifact_replay);
         let paths = config.project_paths::<MultiCompilerLanguage>();
         let empty_filter = EmptyTestFilter::default();
-        let filter_args = test_filter.args();
-        let has_contract_or_test_filter = filter_args.test_pattern.is_some()
-            || filter_args.test_pattern_inverse.is_some()
-            || filter_args.contract_pattern.is_some()
-            || filter_args.contract_pattern_inverse.is_some();
 
         // `MultiContractRunner::build` strips the root prefix from artifact source paths so the
         // identifiers it constructs are project-relative. Match that here for the filter check
@@ -1737,16 +1751,22 @@ impl TestArgs {
             let mut project = config.create_project(config.cache, true)?;
             (compile_abi_project_cached(&mut project, compiler)?, BTreeSet::new(), None)
         } else {
-            let (files, inline_config) =
-                self.get_sources_to_compile(&config, &filter, replay_symbolic_artifact.as_ref())?;
+            let src_files = source_files_iter(&config.src, MultiCompilerLanguage::FILE_EXTENSIONS)
+                .collect::<Vec<_>>();
+            let test_files =
+                source_files_iter(&config.test, MultiCompilerLanguage::FILE_EXTENSIONS)
+                    .collect::<Vec<_>>();
+            let (files, inline_config) = self.get_sources_to_compile(
+                &config,
+                &filter,
+                replay_symbolic_artifact.as_ref(),
+                &src_files,
+                &test_files,
+            )?;
             let compiler = if filter.is_empty() {
                 compiler
             } else {
-                compiler.source_order_fallback(
-                    source_files_iter(&config.src, MultiCompilerLanguage::FILE_EXTENSIONS).chain(
-                        source_files_iter(&config.test, MultiCompilerLanguage::FILE_EXTENSIONS),
-                    ),
-                )
+                compiler.source_order_fallback(src_files.into_iter().chain(test_files))
             };
             let output = compiler.files(files.clone()).compile(&project);
             let output = if should_mutate {
@@ -2328,7 +2348,13 @@ impl TestArgs {
             let discovery = if filter.is_empty() {
                 None
             } else {
-                Some(self.compile_test_abis(&config, filter)?.1)
+                let src_files =
+                    source_files_iter(&config.src, MultiCompilerLanguage::FILE_EXTENSIONS)
+                        .collect::<Vec<_>>();
+                let test_files =
+                    source_files_iter(&config.test, MultiCompilerLanguage::FILE_EXTENSIONS)
+                        .collect::<Vec<_>>();
+                Some(self.compile_test_abis(&config, filter, &src_files, &test_files)?.1)
             };
             let mut candidates =
                 runner.all_test_functions(filter).map(|f| &f.name).collect::<Vec<_>>();

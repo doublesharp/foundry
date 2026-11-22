@@ -1,5 +1,5 @@
 use super::{
-    data::{ContractData, PreprocessorData, deploy_helper_path, reserved_identifiers},
+    data::{ContractData, PreprocessorData, deploy_helper_path, import_closure, unique_identifier},
     span_to_range,
 };
 use crate::fs::{canonicalize_path, normalize_path};
@@ -26,7 +26,7 @@ use solar::{
     },
 };
 use std::{
-    collections::{BTreeMap, BTreeSet, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     ops::{ControlFlow, Range},
     path::{Path, PathBuf},
 };
@@ -889,6 +889,7 @@ pub(crate) fn remove_bytecode_dependencies(
     use_uint160_return: bool,
 ) -> Updates {
     let mut updates = Updates::default();
+    let mut closures = HashMap::<SourceId, Vec<SourceId>>::new();
     for (contract_id, deps) in &deps.preprocessed_contracts {
         let contract = gcx.hir.contract(*contract_id);
         let source = gcx.hir.source(contract.source);
@@ -896,7 +897,8 @@ pub(crate) fn remove_bytecode_dependencies(
             continue;
         };
 
-        let reserved_identifiers = reserved_identifiers(gcx, contract.source);
+        let closure =
+            closures.entry(contract.source).or_insert_with(|| import_closure(gcx, contract.source));
         let identifier = keccak256(format!(
             "{}:{}",
             path.strip_prefix(root_dir).unwrap_or(path).to_slash_lossy(),
@@ -906,7 +908,7 @@ pub(crate) fn remove_bytecode_dependencies(
         let mut used_helpers = BTreeSet::new();
 
         let vm_interface_name =
-            unique_identifier(&reserved_identifiers, format!("VmContractHelper{identifier:x}"));
+            unique_identifier(gcx, closure, format!("VmContractHelper{identifier:x}"));
         // `address(uint160(uint256(keccak256("hevm cheat code"))))`
         let vm = format!("{vm_interface_name}(0x7109709ECfa91a80626fF3989D68f67F5b1DD12D)");
         for dep in deps {
@@ -957,11 +959,13 @@ pub(crate) fn remove_bytecode_dependencies(
                         // Insert our helper.
                         used_helpers.insert(dep.referenced_contract);
                         let helper_contract = unique_identifier(
-                            &reserved_identifiers,
+                            gcx,
+                            closure,
                             constructor_data.helper_contract.clone(),
                         );
                         let encode_function = unique_identifier(
-                            &reserved_identifiers,
+                            gcx,
+                            closure,
                             constructor_data.encode_function.clone(),
                         );
 
@@ -991,10 +995,8 @@ pub(crate) fn remove_bytecode_dependencies(
                 let constructor = data[&id].constructor_data.as_ref().unwrap();
                 let helper_contract = &constructor.helper_contract;
                 let encode_function = &constructor.encode_function;
-                let local_helper =
-                    unique_identifier(&reserved_identifiers, helper_contract.clone());
-                let local_encoder =
-                    unique_identifier(&reserved_identifiers, encode_function.clone());
+                let local_helper = unique_identifier(gcx, closure, helper_contract.clone());
+                let local_encoder = unique_identifier(gcx, closure, encode_function.clone());
                 let helper_import = import_alias(helper_contract, &local_helper);
                 let encoder_import = import_alias(encode_function, &local_encoder);
                 let helper_path = constructor.helper_path.to_slash_lossy();
@@ -1025,14 +1027,6 @@ interface {vm_interface_name} {{
         ));
     }
     updates
-}
-
-/// Returns an identifier that cannot collide with text in the original source.
-fn unique_identifier(source: &str, mut identifier: String) -> String {
-    while source.contains(&identifier) {
-        identifier.push('_');
-    }
-    identifier
 }
 
 fn import_alias(identifier: &str, local: &str) -> String {

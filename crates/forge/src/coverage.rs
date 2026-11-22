@@ -490,6 +490,9 @@ struct AttributionIndex<'a> {
     source_paths: &'a HashMap<&'a Path, String>,
     items: Vec<AttributionItem<'a>>,
     item_ids: HashMap<AttributionItemKey<'a>, usize>,
+    /// Precomputed mapping from `(build_id, analysis_item_index)` to canonical item ID for O(1)
+    /// per-test instrumented attribution lookups.
+    analysis_item_ids: HashMap<&'a str, Vec<Option<usize>>>,
 }
 
 impl<'a> AttributionIndex<'a> {
@@ -521,13 +524,31 @@ impl<'a> AttributionIndex<'a> {
             item_ids.insert(key, items.len());
             items.push(item);
         }
-        Self { report, source_paths, items, item_ids }
+        let mut analysis_item_ids =
+            HashMap::with_capacity_and_hasher(report.analyses.len(), Default::default());
+        for (build_id, analysis) in &report.analyses {
+            let mapped = analysis
+                .all_items()
+                .iter()
+                .map(|item| {
+                    let path = report.get_source_path(build_id, item.loc.source_id)?;
+                    let source = source_paths.get(path)?;
+                    item_ids.get(&AttributionItem::new(source, item).key()).copied()
+                })
+                .collect();
+            analysis_item_ids.insert(build_id.as_str(), mapped);
+        }
+        Self { report, source_paths, items, item_ids, analysis_item_ids }
     }
 
     fn item_id(&self, build_id: &str, item: &CoverageItem) -> Option<usize> {
         let path = self.report.get_source_path(build_id, item.loc.source_id)?;
         let source = self.source_paths.get(path)?;
         self.item_ids.get(&AttributionItem::new(source, item).key()).copied()
+    }
+
+    fn analysis_item_id(&self, build_id: &str, item_id: u32) -> Option<usize> {
+        self.analysis_item_ids.get(build_id)?.get(item_id as usize).copied().flatten()
     }
 }
 
@@ -539,21 +560,17 @@ fn attributed_items<'a>(
 ) -> Vec<AttributionItem<'a>> {
     let report = metadata.report;
     let mut items = BTreeMap::<usize, u32>::new();
-    let mut add_item = |build_id: &str, item: &CoverageItem, hits: u32| {
-        if let Some(id) = metadata.item_id(build_id, item) {
-            let count = items.entry(id).or_default();
-            *count = count.saturating_add(hits);
-        }
+    let mut add_id = |id: usize, hits: u32| {
+        let count = items.entry(id).or_default();
+        *count = count.saturating_add(hits);
     };
 
     if let Some(index) = instrumented_index {
         for ((build_id, item_id), hits) in
             instrumented::item_hits(index, result.instrumented_coverage())
         {
-            if let Some(analysis) = report.analyses.get(build_id)
-                && let Some(item) = analysis.all_items().get(item_id as usize)
-            {
-                add_item(build_id, item, hits);
+            if let Some(id) = metadata.analysis_item_id(build_id, item_id) {
+                add_id(id, hits);
             }
         }
     } else if let Some(hit_maps) = &result.line_coverage {
@@ -562,7 +579,9 @@ fn attributed_items<'a>(
             for (item, hits) in
                 report.hit_items_for_hit_map(&resolved.contract_id, map, resolved.is_deployed_code)
             {
-                add_item(&resolved.contract_id.build_id, item, hits);
+                if let Some(id) = metadata.item_id(&resolved.contract_id.build_id, item) {
+                    add_id(id, hits);
+                }
             }
         }
     }
@@ -733,7 +752,8 @@ impl SourcePositionCache {
             hash_map::Entry::Vacant(v) => {
                 let source_path =
                     if path.is_absolute() { path.to_path_buf() } else { self.root.join(path) };
-                let text = fs::read_to_string(source_path)?;
+                // Match the compiler's CRLF-to-LF normalization so byte offsets align with lines.
+                let text = Source::read(&source_path)?.content;
                 let mut line_offsets = vec![0];
                 for (idx, byte) in text.bytes().enumerate() {
                     if byte == b'\n' {
@@ -910,10 +930,11 @@ impl CoverageReporter for GapsReporter {
                     let function = name.map(str::to_owned).or_else(|| {
                         functions
                             .iter()
-                            .find(|(bytes, _)| {
+                            .filter(|(bytes, _)| {
                                 bytes.start <= item.loc.bytes.start
                                     && item.loc.bytes.end <= bytes.end
                             })
+                            .min_by_key(|(bytes, _)| bytes.end.saturating_sub(bytes.start))
                             .map(|(_, name)| name.to_string())
                     });
                     let snippet = src
