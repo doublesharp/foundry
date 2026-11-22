@@ -1,22 +1,22 @@
 {
   "forgeds": {
-    "commit": "4ca15fcba25aa61a1b436d28b428e30b459f3d56",
+    "commit": "9287d4b46d2bbecb17deb41cd5cb385fc31a503c",
     "assets": {
       "macOS-ARM64": {
-        "name": "forgeds-4ca15fc_darwin_arm64.tar.gz",
-        "sha256": "39c4b0fd5ab8cd7ee2b411a1e0a5ac8519a5566bdd25d50f90ae9bd47ab01f63"
+        "name": "forgeds-9287d4b_darwin_arm64.tar.gz",
+        "sha256": "a6fd32cb6af1b4b893d150e95ee794793d146806273357ff59c0f0ae9951a034"
       },
       "Linux-X64": {
-        "name": "forgeds-4ca15fc_linux_amd64.tar.gz",
-        "sha256": "a1341d56a7fc743b4d87853596baaf0931a6e4348106def1a6994bc793c5b62f"
+        "name": "forgeds-9287d4b_linux_amd64.tar.gz",
+        "sha256": "e9f0a4b2979a9b396d01d575d7007e5daaab625d7ee904b38f5a720154db9e7a"
       },
       "Linux-ARM64": {
-        "name": "forgeds-4ca15fc_linux_arm64.tar.gz",
-        "sha256": "1555c23e95f42d4c0c907181a0ce157d42e40fa8028e9026caaf524ee007d522"
+        "name": "forgeds-9287d4b_linux_arm64.tar.gz",
+        "sha256": "7b4c99a28532805fbfbcdd8598d7e47bb5304c96d8a4c2717fbeca325caeeb69"
       },
       "Windows-X64": {
-        "name": "forgeds-4ca15fc_win32_amd64.tar.gz",
-        "sha256": "b43253bc6fb866df17c8a567ff41ce5ef8d615bc93739317c1f4884ed9566f64"
+        "name": "forgeds-9287d4b_win32_amd64.tar.gz",
+        "sha256": "70adad792656aa07e0f9ce9d4b5f2224ca5c77d81b4e97631913957bd7794ed7"
       }
     }
   },

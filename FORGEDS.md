@@ -21,7 +21,7 @@ build:
 
 Each archive has a `.sha256` file next to it, and `forgeds_latest.txt` holds the commit the links
 currently serve. To pin a version, use the commit-named assets, such as
-`forgeds-4ca15fc_darwin_arm64.tar.gz`.
+`forgeds-9287d4b_darwin_arm64.tar.gz`.
 
 ```sh
 gh release download forgeds -R doublesharp/foundry -p 'forgeds_darwin_arm64.tar.gz*'
@@ -35,7 +35,7 @@ first seven characters of its commit:
 
 ```sh
 cargo install --locked --git https://github.com/doublesharp/foundry \
-  --tag forgeds-4ca15fc forge --bin forgeds --features forgeds
+  --tag forgeds-9287d4b forge --bin forgeds --features forgeds
 ```
 
 For the fastest development builds, also install [Solar](https://github.com/paradigmxyz/solar)

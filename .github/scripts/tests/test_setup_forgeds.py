@@ -54,8 +54,8 @@ class SetupForgedsTests(unittest.TestCase):
     def test_default_selects_pinned_prebuilt_without_solar(self):
         plan = self.plan()
         self.assertEqual(list(plan.get("tools", {})), ["forgeds"])
-        self.assertEqual(plan["tools"]["forgeds"]["commit"], "4ca15fcba25aa61a1b436d28b428e30b459f3d56")
-        self.assertEqual(plan["tools"]["forgeds"]["sha256"], "a1341d56a7fc743b4d87853596baaf0931a6e4348106def1a6994bc793c5b62f")
+        self.assertEqual(plan["tools"]["forgeds"]["commit"], "9287d4b46d2bbecb17deb41cd5cb385fc31a503c")
+        self.assertEqual(plan["tools"]["forgeds"]["sha256"], "e9f0a4b2979a9b396d01d575d7007e5daaab625d7ee904b38f5a720154db9e7a")
 
     def test_plan_needs_no_network_for_pinned_tools(self):
         with patch.object(MODULE, "download", side_effect=AssertionError("network")):

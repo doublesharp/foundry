@@ -11,7 +11,7 @@ It needs no Rust toolchain, source compilation, application launcher, or package
 - run: forgeds test
 ```
 
-Use `@setup-forgeds-v1.0.1` or the release commit SHA to pin the action itself. The moving
+Use `@setup-forgeds-v1.0.2` or the release commit SHA to pin the action itself. The moving
 `@setup-forgeds-v1` tag follows compatible releases. Action release refs contain only the installer,
 metadata, pinned checksums, documentation and licenses, so the runner avoids downloading the full Foundry source tree.
 
@@ -38,7 +38,7 @@ use your production compiler for deployment builds.
 
 | Input | Default | Behavior |
 | --- | --- | --- |
-| `forgeds-version` | Bundled commit `4ca15fcba25aa61a1b436d28b428e30b459f3d56` | Full 40-character commit SHA with published binaries. `latest` explicitly resolves the rolling build before cache lookup. |
+| `forgeds-version` | Bundled commit `9287d4b46d2bbecb17deb41cd5cb385fc31a503c` | Full 40-character commit SHA with published binaries. `latest` explicitly resolves the rolling build before cache lookup. |
 | `solar-version` | Empty | Exact release such as `v0.3.0`; empty skips Solar. |
 | `forge-alias` | `false` | Also expose forgeds as `forge`. |
 | `cache` | `true` | Restore/save executables with an exact key covering platform, pins and alias selection. |
